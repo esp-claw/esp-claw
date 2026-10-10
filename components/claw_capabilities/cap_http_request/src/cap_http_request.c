@@ -870,12 +870,14 @@ static void cap_http_request_finish_prompt(const char *chat_id, int64_t message_
 }
 #endif
 
-static esp_err_t cap_http_request_execute(const char *input_json,
-                                          const claw_cap_call_context_t *ctx,
-                                          char *output,
-                                          size_t output_size)
+/* Performs the request described by `input` (http_request's schema). With `out_status` the
+ * output is the bare response body and the status is returned separately. */
+static esp_err_t cap_http_request_run(const cJSON *input,
+                                      const claw_cap_call_context_t *ctx,
+                                      char *output,
+                                      size_t output_size,
+                                      int *out_status)
 {
-    cJSON *input = NULL;
     cJSON *url_item = NULL;
     cJSON *method_item = NULL;
     cJSON *headers_item = NULL;
@@ -914,16 +916,6 @@ static esp_err_t cap_http_request_execute(const char *input_json,
     char *tmp_save_path = NULL;
     char host[128] = {0};
     char reason[160];
-
-    if (!output || output_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    input = cJSON_Parse(input_json);
-    if (!input) {
-        snprintf(output, output_size, "Error: invalid input JSON");
-        return ESP_ERR_INVALID_ARG;
-    }
 
     url_item = cJSON_GetObjectItem(input, "url");
     method_item = cJSON_GetObjectItem(input, "method");
@@ -1282,6 +1274,9 @@ static esp_err_t cap_http_request_execute(const char *input_json,
                  buf.truncated ? " (file truncated)" : "",
                  save_path_copy,
                  buf.file_bytes);
+    } else if (out_status) {
+        *out_status = status;
+        snprintf(output, output_size, "%s", buf.data ? buf.data : "");
     } else {
         snprintf(output,
                  output_size,
@@ -1318,6 +1313,62 @@ cleanup:
     free(tmp_save_path);
     free(save_path_copy);
     cJSON_Delete(profiles);
+    return err;
+}
+
+static esp_err_t cap_http_request_execute(const char *input_json,
+                                          const claw_cap_call_context_t *ctx,
+                                          char *output,
+                                          size_t output_size)
+{
+    cJSON *input = NULL;
+    esp_err_t err;
+
+    if (!output || output_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    input = cJSON_Parse(input_json);
+    if (!input) {
+        snprintf(output, output_size, "Error: invalid input JSON");
+        return ESP_ERR_INVALID_ARG;
+    }
+    err = cap_http_request_run(input, ctx, output, output_size, NULL);
+    cJSON_Delete(input);
+    return err;
+}
+
+esp_err_t cap_http_request_profile_call(const char *profile, const char *method, const char *path_or_url,
+                                        const char *headers_json, const char *body, size_t max_body,
+                                        const claw_cap_call_context_t *ctx,
+                                        int *out_status, char *output, size_t output_size)
+{
+    cJSON *input = cJSON_CreateObject();
+    cJSON *headers = headers_json && headers_json[0] ? cJSON_Parse(headers_json) : NULL;
+    esp_err_t err;
+
+    if (!profile || !profile[0] || !path_or_url || !out_status || !output || output_size == 0) {
+        cJSON_Delete(input);
+        cJSON_Delete(headers);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!input || (headers_json && headers_json[0] && !cJSON_IsObject(headers))) {
+        snprintf(output, output_size, "Error: %s", input ? "headers must be a JSON object" : "out of memory");
+        cJSON_Delete(input);
+        cJSON_Delete(headers);
+        return input ? ESP_ERR_INVALID_ARG : ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(input, "profile", profile);
+    cJSON_AddStringToObject(input, "method", method && method[0] ? method : "GET");
+    cJSON_AddStringToObject(input, path_or_url[0] == '/' ? "path" : "url", path_or_url);
+    if (headers) {
+        cJSON_AddItemToObject(input, "headers", headers);
+    }
+    if (body && body[0]) {
+        cJSON_AddStringToObject(input, "body", body);
+    }
+    cJSON_AddNumberToObject(input, "max_body_bytes", (double)max_body);
+    err = cap_http_request_run(input, ctx, output, output_size, out_status);
     cJSON_Delete(input);
     return err;
 }
