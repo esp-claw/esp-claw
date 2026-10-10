@@ -30,6 +30,24 @@ If a board-specific file has the same relative path as a base system file, the b
 
 Skill manifests and built-in Lua scripts/docs are synced into `build/system_fs_image/` so they end up on the read-only system partition; the writable storage partition can be reformatted at runtime and re-seeded from `/system` without losing them.
 
+With `CONFIG_EDGE_AGENT_SYSTEM_FS_EMBEDDED` (set by `esp32_S3_DevKitC_1`) there is no system
+partition: `tools/pack_system_fs.py` packs the system staging dir, without `fonts/`, into
+`build/system_fs.bin`, which is embedded in the app and served read-only at `/system` by
+`main/app_romfs.c`. Paths stay the same, and an OTA update replaces these files together with the
+firmware.
+
+## Firmware updates (OTA)
+
+Boards with `partitions_8MB_ota.csv` have two app slots and `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`.
+`/fw` in Telegram (or the `firmware_status` / `firmware_check` / `firmware_update` tools) installs
+signed images. Default source: the latest release of `esp-claw/esp-claw` with the assets
+`edge_agent.bin` (built by `.github/workflows/firmware_release.yml` on a `vX.Y.Z` tag) and
+`edge_agent.bin.sig.json` (made with `tools/fwsign.py sign edge_agent.bin --key <ed25519.pem>` by a
+key listed in `app_trusted_keys`). `/fw update <url>` takes any https `.bin` with `<url>.sig.json`
+next to it. A new image must have WiFi and Telegram working within 5 minutes and run for 60 s,
+otherwise the device rolls back to the previous one. Moving an existing board to this layout
+keeps NVS and `/fatfs`: `tools/migrate_ota_layout.sh -p <port>`.
+
 
 ## Quick Start
 
