@@ -326,6 +326,10 @@ void app_main(void)
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(app_config_init());
     ESP_ERROR_CHECK(app_config_load(s_config));
+    esp_err_t migrate_err = app_config_migrate_search_profiles(s_config);
+    if (migrate_err != ESP_OK) {
+        ESP_LOGW(TAG, "Search key migration failed: %s", esp_err_to_name(migrate_err));
+    }
     app_config_to_claw(s_config, s_claw_config);
     init_timezone(app_config_get_timezone(s_config)); // no need to check error
     ESP_ERROR_CHECK(esp_board_manager_init());

@@ -7,6 +7,7 @@
 
 #include <ctype.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -456,7 +457,13 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
     free(config);
     if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save config");
+        /* Names the key and the error, never the value. */
+        const char *failed_key = app_config_save_failed_key();
+        char msg[96];
+
+        snprintf(msg, sizeof(msg), "Failed to save config: %s%s%s", failed_key ? failed_key : "",
+                 failed_key ? ": " : "", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, msg);
     }
 
     ESP_LOGI(TAG, "Saved %u config field%s", (unsigned)applied_count, applied_count == 1 ? "" : "s");

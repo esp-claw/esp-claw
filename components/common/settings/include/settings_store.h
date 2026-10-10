@@ -26,6 +26,10 @@ esp_err_t settings_store_get_string(const char *key,
 esp_err_t settings_store_has_key(const char *key, bool *exists);
 esp_err_t settings_store_set_string(const char *key, const char *value);
 esp_err_t settings_store_erase_key(const char *key);
+/* Blobs may span NVS pages (strings must fit in one). `*len`: buffer size in, bytes read out;
+ * ESP_ERR_NVS_NOT_FOUND when the key does not exist. */
+esp_err_t settings_store_get_blob(const char *key, void *buf, size_t *len);
+esp_err_t settings_store_set_blob(const char *key, const void *data, size_t len);
 esp_err_t settings_store_commit(void);
 
 #ifdef __cplusplus
