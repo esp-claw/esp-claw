@@ -20,6 +20,8 @@ export const en = {
   navLlm: 'LLM',
   navIm: 'IM',
   navWebReq: 'Network & Search Config',
+  navWebDav: 'WebDAV',
+  navWasmApps: 'WASM Apps',
   navMemory: 'Memory',
   navCapabilities: 'Capabilities',
   navLuaModules: 'Lua Modules',
@@ -330,6 +332,53 @@ export const en = {
   setupRestartBanner:
     'Setup is complete. A device restart is required for all changes to take effect.',
   setupRestartNow: 'Restart Now',
+  webdavDesc:
+    'Mount the device storage as a network drive over HTTPS. Changes apply immediately, no restart needed.',
+  webdavSection: 'WebDAV Access',
+  webdavUser: 'Username',
+  webdavPassword: 'Password',
+  webdavPasswordHint: 'Leave empty to turn WebDAV off.',
+  webdavEnabled: 'WebDAV is on. Mount URL:',
+  webdavDisabled: 'WebDAV is off because no password is set.',
+  webdavMountHint:
+    'Log in with HTTP Basic auth using the credentials above. The device uses a self-signed certificate, so your WebDAV client may ask you to trust it.',
+  webdavSaved: 'WebDAV settings saved and applied',
+
+  wasmDesc: 'Signed, sandboxed apps that add tools to the agent.',
+  wasmNotCompiled: 'WASM apps are not compiled into this firmware.',
+  wasmSectionTrust: 'Signing and Updates',
+  wasmTrustedKeys: 'Trusted signing keys',
+  wasmTrustedKeysHint:
+    'One base64-encoded Ed25519 public key (32 bytes) per line. Apps and firmware updates must be signed by one of them.',
+  wasmAllowUnsigned: 'Allow unsigned apps',
+  wasmAllowUnsignedHint:
+    'Load apps without a valid signature by a trusted key. Only for development.',
+  wasmUpdateCheckTime: 'Daily update check (HH:MM)',
+  wasmUpdateCheckTimeHint:
+    'Local time of the daily check for firmware and app updates; new versions are reported to the allowed Telegram users. Leave empty to turn checks off.',
+  wasmUpdateCheckInvalid: 'The update check time must be HH:MM (00:00-23:59) or empty.',
+  wasmSectionApps: 'Installed Apps',
+  wasmInstallHint:
+    'Install and remove apps in Telegram with /app install <https-url> and /app remove <name>.',
+  wasmNoApps: 'No apps installed.',
+  wasmRefresh: 'Refresh',
+  wasmEnabled: 'Enabled',
+  wasmTools: 'Tools',
+  wasmLastError: 'Last error',
+  wasmTimer: 'Timer',
+  wasmTimerInfo: 'every {interval} s, {state}, {runs} runs',
+  wasmTimerNext: 'next in {next} s',
+  wasmCalls: '{calls} calls',
+  wasmKey: 'key {key}',
+  wasmUnsigned: 'unsigned',
+  wasmSettings: 'Settings',
+  wasmNoSettings: 'This app has no settings.',
+  wasmSettingUnset: 'unset',
+  wasmSettingDefault: 'default',
+  wasmSecretSet: 'Set. Enter a new value to replace it.',
+  wasmSecretUnset: 'Not set.',
+  wasmSettingSave: 'Save',
+  wasmSettingReset: 'Reset',
 };
 
 export type Dict = typeof en;

@@ -9,3 +9,8 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_LUA} == True
       - if: $CONFIG{APP_CLAW_LUA_MODULE_HTTP_SERVER} == True
     path: ../../../../components/lua_modules/lua_module_http_server
+
+  cap_wasm_apps:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_WASM_APPS} == True
+    path: ../../../../components/claw_capabilities/cap_wasm_apps

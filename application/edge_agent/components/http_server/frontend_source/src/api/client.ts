@@ -195,7 +195,7 @@ async function request<T>(
     window.location.reload();
   }
   if (!response.ok) {
-    throw await parseError(response, fallbackError);
+    throw Object.assign(await parseError(response, fallbackError), { status: response.status });
   }
   const contentType = response.headers.get('Content-Type') || '';
   if (contentType.includes('application/json')) {
@@ -486,4 +486,88 @@ export async function sendWebimMessage(chatId: string, text: string, files: stri
     },
     'Failed to send Web IM message',
   );
+}
+
+export type WasmAppTimer = {
+  interval_s: number;
+  state: 'active' | 'inactive' | 'stopped';
+  next_in_s?: number;
+  runs: number;
+  failures: number;
+  last_error?: string;
+};
+
+export type WasmApp = {
+  name: string;
+  version: string;
+  state: string;
+  enabled: boolean;
+  loaded: boolean;
+  key_id: string;
+  description: string;
+  tools: string[];
+  psram_bytes?: number;
+  memory_kb?: number;
+  memory_cap_kb: number;
+  calls: number;
+  last_used_s_ago?: number;
+  failures: number;
+  installed_at?: number;
+  last_error?: string;
+  timer?: WasmAppTimer;
+};
+
+export type WasmAppSetting = {
+  key: string;
+  type: 'string' | 'int' | 'bool';
+  description: string;
+  secret: boolean;
+  set: boolean;
+  /** Omitted for secrets and unset settings. */
+  value?: string;
+  default?: boolean;
+};
+
+type WasmAppResult = { ok?: boolean; message?: string };
+
+/** Installed WASM apps, or null when the firmware is built without WASM apps (404). */
+export async function fetchWasmApps(): Promise<WasmApp[] | null> {
+  try {
+    const data = await request<WasmApp[]>('/api/wasm-apps', undefined, 'Failed to load WASM apps');
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    if ((err as { status?: number }).status === 404) return null;
+    throw err;
+  }
+}
+
+export async function fetchWasmAppSettings(name: string) {
+  const data = await request<{ app: string; settings: WasmAppSetting[] }>(
+    '/api/wasm-apps/settings?name=' + encodeURIComponent(name),
+    undefined,
+    'Failed to load app settings',
+  );
+  return Array.isArray(data.settings) ? data.settings : [];
+}
+
+function postWasmApps(path: string, body: object, fallbackError: string) {
+  return request<WasmAppResult>(
+    '/api/wasm-apps/' + path,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    fallbackError,
+  );
+}
+
+export function setWasmAppEnabled(name: string, enabled: boolean) {
+  return postWasmApps('enabled', { name, enabled }, 'Failed to change the app state');
+}
+
+/** Sets a setting, or resets it to its default when `value` is null. */
+export function setWasmAppSetting(name: string, key: string, value: string | null) {
+  const body = value === null ? { name, key, reset: true } : { name, key, value };
+  return postWasmApps('setting', body, 'Failed to save the app setting');
 }

@@ -64,6 +64,9 @@ esp_err_t http_server_register_files_routes(httpd_handle_t server);
 #if CONFIG_APP_CLAW_LUA_MODULE_HTTP_SERVER
 esp_err_t http_server_register_lua_app_routes(httpd_handle_t server);
 #endif
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+esp_err_t http_server_register_wasm_apps_routes(httpd_handle_t server);
+#endif
 esp_err_t http_server_register_wechat_routes(httpd_handle_t server);
 esp_err_t http_server_register_webim_routes(httpd_handle_t server);
 esp_err_t http_server_register_webdav_routes(httpd_handle_t server);
