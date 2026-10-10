@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/cap_wasm_apps.c"
+        "src/cap_wasm_config.c"
         "src/cap_wasm_fw.c"
         "src/cap_wasm_host.c"
         "src/cap_wasm_install.c"

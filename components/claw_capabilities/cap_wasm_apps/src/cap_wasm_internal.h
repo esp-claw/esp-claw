@@ -72,6 +72,19 @@ typedef struct {
     uint32_t calls;
     uint8_t failures;   /* consecutive traps/timeouts */
     char last_error[128];
+    /* permissions.timer: on_timer() every timer_s seconds (set by claw_timer_set(), kept in NVS). */
+    wasm_function_inst_t fn_timer;
+    uint32_t timer_s;        /* 0: no timer */
+    uint32_t timer_due_s;    /* next run, seconds since boot */
+    uint32_t timer_last;     /* unix time of the last run (persisted for timers >= 1 h), 0 unknown */
+    bool timer_resync;       /* due time still to be derived from timer_last once the clock is set */
+    bool timer_off;          /* stopped after repeated failures, until reload/reboot */
+    uint8_t timer_failures;  /* consecutive */
+    uint32_t timer_runs;
+    char timer_error[96];
+    /* permissions.notify: messages in the current rate-limit hour */
+    uint32_t notify_window_s;
+    uint8_t notify_count;
 } cap_wasm_app_t;
 
 typedef struct {
@@ -110,6 +123,42 @@ int32_t cap_wasm_tool_add(cap_wasm_app_t *app, const char *name, uint32_t name_l
 /* Stops the call budget clock while a host function blocks (HTTP, confirmation). */
 void cap_wasm_budget_pause(bool pause);
 
+/* ---------- Settings (cap_wasm_config.c, WASM thread) ---------- */
+
+/*
+ * Value of setting `s` (stored, else the manifest default) as text in `out`; returns its length,
+ * -CAP_WASM_ENOENT when unset without a default, -CAP_WASM_ENOBUFS or -CAP_WASM_EIO.
+ */
+int32_t cap_wasm_cfg_get(const cap_wasm_app_t *app, const cap_wasm_setting_t *s, char *out, size_t size,
+                         bool *is_default);
+
+/*
+ * "/app config <name> [args]": "" lists the settings (secrets masked), "<key> <value>" sets one,
+ * "<key> --reset" returns it to the default. `json` lists them for the LLM (no secret values).
+ */
+esp_err_t cap_wasm_cfg_command(const cap_wasm_app_t *app, const char *args, bool json, char *out, size_t size);
+
+/* After an update: drops stored settings the manifest no longer declares or whose value no longer fits. */
+void cap_wasm_cfg_prune(const cap_wasm_app_t *app);
+
+/* Deletes every stored setting of the app (on remove). */
+void cap_wasm_cfg_erase(const char *app_name);
+
+/* Timer state in the same namespace: interval (0 = none) and, for long intervals, the last run. */
+uint32_t cap_wasm_timer_load(const char *app_name, uint32_t *last_unix);
+void cap_wasm_timer_store(const char *app_name, uint32_t interval_s);
+void cap_wasm_timer_store_last(const char *app_name, uint32_t last_unix);
+
+/* ---------- Timers (cap_wasm_apps.c, WASM thread) ---------- */
+
+#define CAP_WASM_MAX_TIMERS 4 /* apps with an active timer */
+
+/* claw_timer_set(): 0 cancels; returns 0 or -errno. */
+int32_t cap_wasm_timer_set(cap_wasm_app_t *app, int32_t interval_s);
+
+/* Sends `text` to every allowed Telegram user; ESP_ERR_NOT_SUPPORTED without Telegram. */
+esp_err_t cap_wasm_send_allowed(const char *text);
+
 /* ---------- Runtime <-> installer (cap_wasm_install.c) ---------- */
 
 typedef enum {
@@ -118,6 +167,9 @@ typedef enum {
     CAP_WASM_REQ_STATUS,
     CAP_WASM_REQ_LOAD,
     CAP_WASM_REQ_UNLOAD,
+    CAP_WASM_REQ_CONFIG,      /* `extra`: "/app config" arguments after the name */
+    CAP_WASM_REQ_CONFIG_JSON, /* settings listing for the LLM */
+    CAP_WASM_REQ_TIMER,       /* runs the most overdue on_timer(), if any */
     /* The requests below can change the tool set. */
     CAP_WASM_REQ_RELOAD,
     CAP_WASM_REQ_ENABLE,

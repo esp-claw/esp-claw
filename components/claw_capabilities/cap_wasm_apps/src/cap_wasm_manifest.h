@@ -25,13 +25,40 @@
 #define CAP_WASM_CALL_MS_MIN       100
 #define CAP_WASM_CALL_MS_MAX       30000
 
+#define CAP_WASM_MAX_SETTINGS        8
+#define CAP_WASM_SETTING_KEY_MAX     15  /* NVS key limit; [a-z][a-z0-9_]* */
+#define CAP_WASM_SETTING_VALUE_MAX   256 /* value set with /app config */
+#define CAP_WASM_SETTING_DEFAULT_MAX 64  /* manifest default (normalized text) */
+#define CAP_WASM_SETTING_DESC_MAX    100
+
+#define CAP_WASM_TIMER_MIN_S         60  /* firmware floor of permissions.timer.min_interval_s */
+#define CAP_WASM_TIMER_MAX_S         (7 * 24 * 3600)
+
 typedef enum {
     CAP_WASM_PERM_LOG = 1 << 0,
     CAP_WASM_PERM_KV = 1 << 1,
     CAP_WASM_PERM_HTTP = 1 << 2,
     CAP_WASM_PERM_CONFIRM = 1 << 3,
     CAP_WASM_PERM_PING = 1 << 4,
+    CAP_WASM_PERM_NOTIFY = 1 << 5,
+    CAP_WASM_PERM_TIMER = 1 << 6,
 } cap_wasm_perm_t;
+
+typedef enum {
+    CAP_WASM_SETTING_STRING = 0,
+    CAP_WASM_SETTING_INT,
+    CAP_WASM_SETTING_BOOL,
+} cap_wasm_setting_type_t;
+
+/* One entry of manifest "settings"; values are kept as text ("42", "true"). */
+typedef struct {
+    char key[CAP_WASM_SETTING_KEY_MAX + 1];
+    uint8_t type;      /* cap_wasm_setting_type_t */
+    bool secret;       /* never shown to the LLM, masked in /app config; no default allowed */
+    bool has_default;
+    char def[CAP_WASM_SETTING_DEFAULT_MAX + 1];
+    char description[CAP_WASM_SETTING_DESC_MAX + 1];
+} cap_wasm_setting_t;
 
 typedef struct {
     char name[CAP_WASM_APP_NAME_MAX + 1];
@@ -42,6 +69,9 @@ typedef struct {
     uint32_t http_profile_count;
     uint32_t memory_kb;
     uint32_t call_timeout_ms;
+    uint32_t timer_min_s;  /* permissions.timer.min_interval_s (>= CAP_WASM_TIMER_MIN_S) */
+    cap_wasm_setting_t settings[CAP_WASM_MAX_SETTINGS];
+    uint32_t setting_count;
 } cap_wasm_manifest_t;
 
 /* True for 1..max_len bytes of [a-z0-9_] starting with a letter. */
@@ -81,3 +111,18 @@ void cap_wasm_utf8_sanitize(char *text, size_t len);
  * two forms cannot collide.
  */
 void cap_wasm_nvs_namespace(const char *app_name, char out[CAP_WASM_NVS_NS_LEN]);
+
+/* Namespace of the app's settings and timer state: as above with "wc" instead of "wa". */
+void cap_wasm_cfg_namespace(const char *app_name, char out[CAP_WASM_NVS_NS_LEN]);
+
+/* The declared setting `key` (key_len bytes, not NUL-terminated), or NULL. */
+const cap_wasm_setting_t *cap_wasm_manifest_setting(const cap_wasm_manifest_t *mf, const char *key, size_t key_len);
+
+const char *cap_wasm_setting_type_name(uint8_t type);
+
+/*
+ * Checks `in` against the setting's type and writes its stored form to `out`: strings as given
+ * (1-CAP_WASM_SETTING_VALUE_MAX bytes of valid UTF-8 without control characters), ints as int32
+ * decimal, bools as "true"/"false" (accepts true/false, on/off, yes/no, 1/0). False when invalid.
+ */
+bool cap_wasm_setting_normalize(const cap_wasm_setting_t *s, const char *in, char *out, size_t size);

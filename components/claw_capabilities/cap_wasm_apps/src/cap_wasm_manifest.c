@@ -5,8 +5,11 @@
  */
 #include "cap_wasm_manifest.h"
 
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "cJSON.h"
 
@@ -82,7 +85,8 @@ static bool cap_wasm_parse_int(const cJSON *item, const char *field, uint32_t mi
 
 static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *out, char *err, size_t err_size)
 {
-    static const char *const keys[] = {"log", "kv", "http_profiles", "confirm", "ping"};
+    static const char *const keys[] = {"log", "kv", "http_profiles", "confirm", "ping", "notify", "timer"};
+    static const char *const timer_keys[] = {"min_interval_s"};
     static const struct {
         const char *key;
         uint32_t perm;
@@ -91,8 +95,10 @@ static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *
         {"kv", CAP_WASM_PERM_KV},
         {"confirm", CAP_WASM_PERM_CONFIRM},
         {"ping", CAP_WASM_PERM_PING},
+        {"notify", CAP_WASM_PERM_NOTIFY},
     };
     const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(perms, "http_profiles");
+    const cJSON *timer = cJSON_GetObjectItemCaseSensitive(perms, "timer");
     const cJSON *item = NULL;
 
     if (!perms) {
@@ -114,6 +120,20 @@ static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *
         if (cJSON_IsTrue(item)) {
             out->perms |= flags[i].perm;
         }
+    }
+    if (timer) {
+        out->timer_min_s = CAP_WASM_TIMER_MIN_S;
+        if (!cJSON_IsObject(timer)) {
+            snprintf(err, err_size, "permissions.timer must be an object");
+            return false;
+        }
+        if (!cap_wasm_keys_known(timer, timer_keys, 1, "permissions.timer key", err, err_size) ||
+                !cap_wasm_parse_int(cJSON_GetObjectItemCaseSensitive(timer, "min_interval_s"),
+                                    "permissions.timer.min_interval_s", CAP_WASM_TIMER_MIN_S, CAP_WASM_TIMER_MAX_S,
+                                    &out->timer_min_s, err, err_size)) {
+            return false;
+        }
+        out->perms |= CAP_WASM_PERM_TIMER;
     }
     if (!profiles) {
         return true;
@@ -144,10 +164,103 @@ static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *
     return true;
 }
 
+static bool cap_wasm_parse_setting(const cJSON *item, cap_wasm_manifest_t *out, char *err, size_t err_size)
+{
+    static const char *const keys[] = {"key", "type", "default", "secret", "description"};
+    static const char *const types[] = {"string", "int", "bool"};
+    cap_wasm_setting_t *s = &out->settings[out->setting_count];
+    const cJSON *def = cJSON_GetObjectItemCaseSensitive(item, "default");
+    const cJSON *secret = cJSON_GetObjectItemCaseSensitive(item, "secret");
+    const char *type = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(item, "type"));
+    char text[24];
+    bool ok;
+    size_t t;
+
+    if (!cJSON_IsObject(item)) {
+        snprintf(err, err_size, "settings entries must be objects");
+        return false;
+    }
+    if (!cap_wasm_keys_known(item, keys, sizeof(keys) / sizeof(keys[0]), "settings key", err, err_size) ||
+            !cap_wasm_copy_string(cJSON_GetObjectItemCaseSensitive(item, "key"), "settings[].key", s->key,
+                                  sizeof(s->key), true, err, err_size) ||
+            !cap_wasm_copy_string(cJSON_GetObjectItemCaseSensitive(item, "description"), "settings[].description",
+                                  s->description, sizeof(s->description), false, err, err_size)) {
+        return false;
+    }
+    if (!cap_wasm_name_valid(s->key, strlen(s->key), CAP_WASM_SETTING_KEY_MAX)) {
+        snprintf(err, err_size, "settings key '%s' must be 1-%d chars of [a-z0-9_] starting with a letter", s->key,
+                 CAP_WASM_SETTING_KEY_MAX);
+        return false;
+    }
+    if (cap_wasm_manifest_setting(out, s->key, strlen(s->key))) {
+        snprintf(err, err_size, "settings lists '%s' twice", s->key);
+        return false;
+    }
+    for (t = 0; type && t < sizeof(types) / sizeof(types[0]) && strcmp(type, types[t]) != 0; t++) {
+    }
+    if (!type || t == sizeof(types) / sizeof(types[0])) {
+        snprintf(err, err_size, "settings '%s': type must be string, int or bool", s->key);
+        return false;
+    }
+    s->type = (uint8_t)t;
+    if (secret && !cJSON_IsBool(secret)) {
+        snprintf(err, err_size, "settings '%s': secret must be a boolean", s->key);
+        return false;
+    }
+    s->secret = cJSON_IsTrue(secret);
+    if (def && s->secret) {
+        snprintf(err, err_size, "settings '%s': a secret cannot have a default", s->key);
+        return false;
+    }
+    if (def) {
+        if (s->type == CAP_WASM_SETTING_STRING) {
+            ok = cJSON_IsString(def) && strlen(def->valuestring) <= CAP_WASM_SETTING_DEFAULT_MAX &&
+                 cap_wasm_setting_normalize(s, def->valuestring, s->def, sizeof(s->def));
+        } else if (s->type == CAP_WASM_SETTING_INT) {
+            ok = cJSON_IsNumber(def) && def->valuedouble >= INT32_MIN && def->valuedouble <= INT32_MAX &&
+                 def->valuedouble == (double)(int32_t)def->valuedouble;
+            snprintf(text, sizeof(text), "%ld", ok ? (long)def->valuedouble : 0L);
+            ok = ok && cap_wasm_setting_normalize(s, text, s->def, sizeof(s->def));
+        } else {
+            ok = cJSON_IsBool(def);
+            snprintf(s->def, sizeof(s->def), "%s", cJSON_IsTrue(def) ? "true" : "false");
+        }
+        if (!ok) {
+            snprintf(err, err_size, "settings '%s': default must be %s", s->key,
+                     s->type == CAP_WASM_SETTING_STRING ? "a string of 1-64 bytes" :
+                     s->type == CAP_WASM_SETTING_INT ? "an int32" : "a boolean");
+            return false;
+        }
+        s->has_default = true;
+    }
+    cap_wasm_utf8_sanitize(s->description, strlen(s->description));
+    out->setting_count++;
+    return true;
+}
+
+static bool cap_wasm_parse_settings(const cJSON *settings, cap_wasm_manifest_t *out, char *err, size_t err_size)
+{
+    const cJSON *item = NULL;
+
+    if (!settings) {
+        return true;
+    }
+    if (!cJSON_IsArray(settings) || cJSON_GetArraySize(settings) > CAP_WASM_MAX_SETTINGS) {
+        snprintf(err, err_size, "settings must be an array of at most %d entries", CAP_WASM_MAX_SETTINGS);
+        return false;
+    }
+    cJSON_ArrayForEach(item, settings) {
+        if (!cap_wasm_parse_setting(item, out, err, err_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool cap_wasm_manifest_parse(const char *json, const char *dir_name, cap_wasm_manifest_t *out,
                              char *err, size_t err_size)
 {
-    static const char *const keys[] = {"name", "version", "description", "permissions", "limits"};
+    static const char *const keys[] = {"name", "version", "description", "permissions", "limits", "settings"};
     static const char *const limit_keys[] = {"memory_kb", "call_timeout_ms"};
     cJSON *root = cJSON_Parse(json);
     const cJSON *limits = NULL;
@@ -185,7 +298,8 @@ bool cap_wasm_manifest_parse(const char *json, const char *dir_name, cap_wasm_ma
         snprintf(err, err_size, "version may only contain [A-Za-z0-9.+-]");
         goto done;
     }
-    if (!cap_wasm_parse_permissions(cJSON_GetObjectItemCaseSensitive(root, "permissions"), out, err, err_size)) {
+    if (!cap_wasm_parse_permissions(cJSON_GetObjectItemCaseSensitive(root, "permissions"), out, err, err_size) ||
+            !cap_wasm_parse_settings(cJSON_GetObjectItemCaseSensitive(root, "settings"), out, err, err_size)) {
         goto done;
     }
 
@@ -232,6 +346,8 @@ static const struct {
     {CAP_WASM_PERM_KV, "kv"},
     {CAP_WASM_PERM_CONFIRM, "confirm"},
     {CAP_WASM_PERM_PING, "ping"},
+    {CAP_WASM_PERM_NOTIFY, "notify"},
+    {CAP_WASM_PERM_TIMER, "timer"},
 };
 #define PERM_NAME_COUNT (sizeof(s_perm_names) / sizeof(s_perm_names[0]))
 
@@ -314,16 +430,82 @@ void cap_wasm_utf8_sanitize(char *text, size_t len)
     }
 }
 
-void cap_wasm_nvs_namespace(const char *app_name, char out[CAP_WASM_NVS_NS_LEN])
+static void cap_wasm_namespace(const char *prefix, const char *app_name, char out[CAP_WASM_NVS_NS_LEN])
 {
     uint32_t hash = 2166136261u;
 
     if (strlen(app_name) <= CAP_WASM_NVS_NS_LEN - 4) {
-        snprintf(out, CAP_WASM_NVS_NS_LEN, "wa_%s", app_name);
+        snprintf(out, CAP_WASM_NVS_NS_LEN, "%s_%s", prefix, app_name);
         return;
     }
     for (const char *p = app_name; *p; p++) {
         hash = (hash ^ (uint8_t)*p) * 16777619u;
     }
-    snprintf(out, CAP_WASM_NVS_NS_LEN, "wa-%.4s%08x", app_name, (unsigned)hash);
+    snprintf(out, CAP_WASM_NVS_NS_LEN, "%s-%.4s%08x", prefix, app_name, (unsigned)hash);
+}
+
+void cap_wasm_nvs_namespace(const char *app_name, char out[CAP_WASM_NVS_NS_LEN])
+{
+    cap_wasm_namespace("wa", app_name, out);
+}
+
+void cap_wasm_cfg_namespace(const char *app_name, char out[CAP_WASM_NVS_NS_LEN])
+{
+    cap_wasm_namespace("wc", app_name, out);
+}
+
+const cap_wasm_setting_t *cap_wasm_manifest_setting(const cap_wasm_manifest_t *mf, const char *key, size_t key_len)
+{
+    for (uint32_t i = 0; i < mf->setting_count; i++) {
+        if (strlen(mf->settings[i].key) == key_len && memcmp(mf->settings[i].key, key, key_len) == 0) {
+            return &mf->settings[i];
+        }
+    }
+    return NULL;
+}
+
+const char *cap_wasm_setting_type_name(uint8_t type)
+{
+    return type == CAP_WASM_SETTING_INT ? "int" : type == CAP_WASM_SETTING_BOOL ? "bool" : "string";
+}
+
+bool cap_wasm_setting_normalize(const cap_wasm_setting_t *s, const char *in, char *out, size_t size)
+{
+    static const char *const yes[] = {"true", "on", "yes", "1"};
+    static const char *const no[] = {"false", "off", "no", "0"};
+    size_t len = strlen(in);
+
+    if (s->type == CAP_WASM_SETTING_INT) {
+        char *end = NULL;
+        long long v;
+
+        if (!len || len > 11 || strspn(in, "-0123456789") != len) {
+            return false;
+        }
+        errno = 0;
+        v = strtoll(in, &end, 10);
+        if (*end || errno || v < INT32_MIN || v > INT32_MAX) {
+            return false;
+        }
+        return snprintf(out, size, "%lld", v) < (int)size;
+    }
+    if (s->type == CAP_WASM_SETTING_BOOL) {
+        for (size_t i = 0; i < sizeof(yes) / sizeof(yes[0]); i++) {
+            if (strcasecmp(in, yes[i]) == 0 || strcasecmp(in, no[i]) == 0) {
+                return snprintf(out, size, "%s", strcasecmp(in, yes[i]) == 0 ? "true" : "false") < (int)size;
+            }
+        }
+        return false;
+    }
+    if (!len || len > CAP_WASM_SETTING_VALUE_MAX || len >= size) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if ((unsigned char)in[i] < 0x20 || in[i] == 0x7F) {
+            return false;
+        }
+    }
+    memcpy(out, in, len + 1);
+    cap_wasm_utf8_sanitize(out, len);
+    return memcmp(out, in, len) == 0;
 }

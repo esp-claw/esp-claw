@@ -19,6 +19,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "lwip/inet.h"
@@ -46,6 +47,8 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_PING_TIMEOUT_MS    1000
 #define CAP_WASM_PING_INTERVAL_MS   200
 #define CAP_WASM_HOST_NAME_MAX      253
+#define CAP_WASM_NOTIFY_MAX         1000
+#define CAP_WASM_NOTIFY_PER_HOUR    10
 
 cap_wasm_call_t g_cap_wasm_call;
 
@@ -244,6 +247,30 @@ static int32_t cap_wasm_kv_del(wasm_exec_env_t env, const char *key, uint32_t ke
     return cap_wasm_kv_write(cap_wasm_env_app(env), key, key_len, NULL, 0, true);
 }
 
+/* ---------- Settings declared in the manifest, set by the user with /app config ---------- */
+
+static int32_t cap_wasm_config_get(wasm_exec_env_t env, const char *key, uint32_t key_len,
+                                   char *out, uint32_t out_cap)
+{
+    cap_wasm_app_t *app = cap_wasm_env_app(env);
+    const cap_wasm_setting_t *s = cap_wasm_manifest_setting(&app->mf, key, key_len);
+    char value[CAP_WASM_SETTING_VALUE_MAX + 1];
+    bool is_default;
+    int32_t len;
+
+    if (!s) {
+        return -CAP_WASM_EPERM; /* not declared in this app's manifest */
+    }
+    len = cap_wasm_cfg_get(app, s, value, sizeof(value), &is_default);
+    if (len >= 0 && (uint32_t)len > out_cap) {
+        return -CAP_WASM_ENOBUFS;
+    }
+    if (len >= 0) {
+        memcpy(out, value, len);
+    }
+    return len;
+}
+
 /* ---------- HTTP through cap_http_request credential profiles ---------- */
 
 static int32_t cap_wasm_http_errno(esp_err_t err)
@@ -393,6 +420,72 @@ static int32_t cap_wasm_confirm(wasm_exec_env_t env, const char *text, uint32_t 
 #else
     return -CAP_WASM_ENOTSUP;
 #endif
+}
+
+/* ---------- Timer and Telegram notifications ---------- */
+
+static int32_t cap_wasm_timer_set_native(wasm_exec_env_t env, int32_t interval_s)
+{
+    return cap_wasm_timer_set(cap_wasm_env_app(env), interval_s);
+}
+
+esp_err_t cap_wasm_send_allowed(const char *text)
+{
+#if CONFIG_APP_CLAW_CAP_IM_TG
+    return cap_im_tg_send_text_to_allowed(text);
+#else
+    (void)text;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+/* Sends "📣 <app>: <text>" to the allowed Telegram users, at most CAP_WASM_NOTIFY_PER_HOUR per app. */
+static int32_t cap_wasm_notify(wasm_exec_env_t env, const char *text, uint32_t text_len)
+{
+    cap_wasm_app_t *app = cap_wasm_env_app(env);
+    uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000);
+    const size_t size = CAP_WASM_NOTIFY_MAX + CAP_WASM_APP_NAME_MAX + 16;
+    char *msg;
+    size_t len;
+    esp_err_t err;
+
+    if (g_cap_wasm_call.app != app) {
+        return -CAP_WASM_EPERM; /* only in tool_call and on_timer, not app_init */
+    }
+    if (text_len == 0) {
+        return -CAP_WASM_EINVAL;
+    }
+    if (text_len > CAP_WASM_NOTIFY_MAX) {
+        return -CAP_WASM_E2BIG;
+    }
+    if (!app->notify_count || now_s - app->notify_window_s >= 3600) {
+        app->notify_window_s = now_s;
+        app->notify_count = 0;
+    }
+    if (app->notify_count >= CAP_WASM_NOTIFY_PER_HOUR) {
+        ESP_LOGW(TAG, "[%s] notify: limit of %d messages per hour reached", app->name, CAP_WASM_NOTIFY_PER_HOUR);
+        return -CAP_WASM_ENOSPC;
+    }
+    msg = heap_caps_malloc(size, CAP_WASM_PSRAM_CAPS);
+    if (!msg) {
+        return -CAP_WASM_ENOMEM;
+    }
+    /* The app name always leads, so an app cannot pass its text off as a system message. */
+    len = (size_t)snprintf(msg, size, "📣 App `%s`:\n", app->name);
+    memcpy(msg + len, text, text_len);
+    msg[len + text_len] = '\0';
+    cap_wasm_utf8_sanitize(msg + len, text_len);
+    app->notify_count++;
+    cap_wasm_budget_pause(true);
+    err = cap_wasm_send_allowed(msg);
+    cap_wasm_budget_pause(false);
+    heap_caps_free(msg);
+    ESP_LOGI(TAG, "[%s] notify (%u bytes) -> %s", app->name, (unsigned)text_len, esp_err_to_name(err));
+    if (err == ESP_OK) {
+        return 0;
+    }
+    return err == ESP_ERR_NOT_SUPPORTED || err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_STATE ?
+           -CAP_WASM_ENOTSUP : -CAP_WASM_EIO;
 }
 
 /* ---------- ICMP echo ---------- */
@@ -549,10 +642,13 @@ NativeSymbol g_cap_wasm_natives[] = {
     { "kv_get", cap_wasm_kv_get, "(*~*~)i", NULL },
     { "kv_set", cap_wasm_kv_set, "(*~*~)i", NULL },
     { "kv_del", cap_wasm_kv_del, "(*~)i", NULL },
+    { "config_get", cap_wasm_config_get, "(*~*~)i", NULL },
     { "http_profile_request", cap_wasm_http_profile_request, "(*~*~*~*~*~)i", NULL },
     { "http_response_read", cap_wasm_http_response_read, "(*~)i", NULL },
     { "confirm", cap_wasm_confirm, "(*~)i", NULL },
     { "ping", cap_wasm_ping, "(*~i*~)i", NULL },
+    { "timer_set", cap_wasm_timer_set_native, "(i)i", NULL },
+    { "notify", cap_wasm_notify, "(*~)i", NULL },
     { "now_ms", cap_wasm_now_ms, "()I", NULL },
     { "random", cap_wasm_random, "(*~)i", NULL },
 };
@@ -572,6 +668,8 @@ bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm)
         { "http_response_read", CAP_WASM_PERM_HTTP },
         { "confirm", CAP_WASM_PERM_CONFIRM },
         { "ping", CAP_WASM_PERM_PING },
+        { "timer_set", CAP_WASM_PERM_TIMER },
+        { "notify", CAP_WASM_PERM_NOTIFY },
     };
 
     for (size_t i = 0; i < g_cap_wasm_native_count; i++) {
