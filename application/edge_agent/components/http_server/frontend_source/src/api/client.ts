@@ -41,6 +41,9 @@ export type AppConfig = {
   stt_base_url: string;
   stt_api_key: string;
   stt_model: string;
+  embed_base_url: string;
+  embed_api_key: string;
+  embed_model: string;
   enabled_cap_groups: string;
   llm_visible_cap_groups: string;
   enabled_lua_modules: string;
@@ -57,6 +60,7 @@ export type ConfigGroup =
   | 'im'
   | 'search'
   | 'stt'
+  | 'embed'
   | 'capabilities'
   | 'skills'
   | 'time'
@@ -93,6 +97,7 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   ],
   search: ['search_brave_key', 'search_tavily_key', 'search_http_allowlist'],
   stt: ['stt_base_url', 'stt_api_key', 'stt_model'],
+  embed: ['embed_base_url', 'embed_api_key', 'embed_model'],
   capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups', 'ssh_hosts', 'wol_targets'],
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],

@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "claw_memory_internal.h"
-#include "claw_task.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -14,57 +13,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "freertos/idf_additions.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
 
 static const char *TAG = "claw_memory";
-
-#define CLAW_MEMORY_ASYNC_EXTRACT_QUEUE_LEN 4
-#define CLAW_MEMORY_ASYNC_EXTRACT_STACK_SIZE (6 * 1024)
-#define CLAW_MEMORY_ASYNC_EXTRACT_PRIORITY 5
-#define CLAW_MEMORY_ASYNC_EXTRACT_SWEEP_TICKS pdMS_TO_TICKS(60000)
 
 typedef struct claw_memory_pending_summary {
     char *session_id;
     char *summary_list;
     struct claw_memory_pending_summary *next;
 } claw_memory_pending_summary_t;
-
-typedef struct claw_memory_async_extract_job {
-    uint32_t request_id;
-    char *session_id;
-    char *user_text;
-    char *llm_text;
-    claw_memory_message_intent_t message_intent;
-    TickType_t created_ticks;
-    TickType_t completed_ticks;
-    esp_err_t result;
-    bool completed;
-    SemaphoreHandle_t done_sem;
-    struct claw_memory_async_extract_job *next;
-} claw_memory_async_extract_job_t;
-
-typedef struct claw_memory_request_state {
-    uint32_t request_id;
-    bool manual_write;
-    struct claw_memory_request_state *next;
-} claw_memory_request_state_t;
-
-typedef struct {
-    bool enabled;
-    QueueHandle_t queue;
-    SemaphoreHandle_t lock;
-    TaskHandle_t task_handle;
-    claw_llm_runtime_t *runtime;
-    claw_memory_async_extract_job_t *jobs;
-} claw_memory_async_extract_state_t;
-
-static claw_memory_pending_summary_t *s_pending_summaries = NULL;
-static claw_memory_async_extract_state_t s_async_extract = {0};
-static claw_memory_request_state_t *s_request_states = NULL;
 
 typedef struct {
     uint32_t offset;
@@ -103,6 +61,8 @@ _Static_assert(sizeof(claw_memory_session_index_header_t) == 8,
                "session history index header size must remain fixed");
 _Static_assert(sizeof(claw_memory_session_index_entry_t) == 10,
                "session history index entry must contain only offset, length, type, and backend format");
+
+static claw_memory_pending_summary_t *s_pending_summaries = NULL;
 
 static claw_memory_pending_summary_t *claw_memory_find_pending_summary(const char *session_id)
 {
@@ -149,419 +109,6 @@ static char *claw_memory_pending_summary_take_summary_list(const char *session_i
     free(node->session_id);
     free(node);
     return summary_list;
-}
-
-static claw_memory_request_state_t *claw_memory_find_request_state(uint32_t request_id)
-{
-    claw_memory_request_state_t *node = s_request_states;
-
-    while (node) {
-        if (node->request_id == request_id) {
-            return node;
-        }
-        node = node->next;
-    }
-
-    return NULL;
-}
-
-esp_err_t claw_memory_request_mark_manual_write(uint32_t request_id)
-{
-    claw_memory_request_state_t *node = NULL;
-
-    if (request_id == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    node = claw_memory_find_request_state(request_id);
-    if (!node) {
-        node = calloc(1, sizeof(*node));
-        if (!node) {
-            return ESP_ERR_NO_MEM;
-        }
-        node->request_id = request_id;
-        node->next = s_request_states;
-        s_request_states = node;
-    }
-
-    node->manual_write = true;
-    return ESP_OK;
-}
-
-static bool claw_memory_request_take_manual_write(uint32_t request_id)
-{
-    claw_memory_request_state_t *node = s_request_states;
-    claw_memory_request_state_t *prev = NULL;
-    bool manual_write = false;
-
-    if (request_id == 0) {
-        return false;
-    }
-
-    while (node) {
-        if (node->request_id == request_id) {
-            break;
-        }
-        prev = node;
-        node = node->next;
-    }
-    if (!node) {
-        return false;
-    }
-
-    manual_write = node->manual_write;
-    if (prev) {
-        prev->next = node->next;
-    } else {
-        s_request_states = node->next;
-    }
-    free(node);
-    return manual_write;
-}
-
-static claw_memory_async_extract_job_t *claw_memory_async_extract_find_job_locked(uint32_t request_id)
-{
-    claw_memory_async_extract_job_t *job = s_async_extract.jobs;
-
-    while (job) {
-        if (job->request_id == request_id) {
-            return job;
-        }
-        job = job->next;
-    }
-    return NULL;
-}
-
-static void claw_memory_async_extract_free_job(claw_memory_async_extract_job_t *job)
-{
-    if (!job) {
-        return;
-    }
-    if (job->done_sem) {
-        vSemaphoreDelete(job->done_sem);
-    }
-    free(job->session_id);
-    free(job->user_text);
-    free(job->llm_text);
-    free(job);
-}
-
-static void claw_memory_async_extract_sweep_locked(TickType_t now_ticks)
-{
-    claw_memory_async_extract_job_t *job = s_async_extract.jobs;
-    claw_memory_async_extract_job_t *prev = NULL;
-
-    while (job) {
-        claw_memory_async_extract_job_t *next = job->next;
-        bool expired = job->completed &&
-                       (now_ticks - job->completed_ticks) >= CLAW_MEMORY_ASYNC_EXTRACT_SWEEP_TICKS;
-
-        if (expired) {
-            if (prev) {
-                prev->next = next;
-            } else {
-                s_async_extract.jobs = next;
-            }
-            claw_memory_async_extract_free_job(job);
-        } else {
-            prev = job;
-        }
-        job = next;
-    }
-}
-
-static void claw_memory_async_extract_task(void *arg)
-{
-    (void)arg;
-
-    while (true) {
-        claw_memory_async_extract_job_t *job = NULL;
-        char *llm_text = NULL;
-        claw_memory_message_intent_t message_intent = CLAW_MEMORY_MESSAGE_INTENT_NONE;
-        esp_err_t err;
-
-        if (xQueueReceive(s_async_extract.queue, &job, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-        if (!job) {
-            continue;
-        }
-
-        err = claw_memory_auto_extract_prepare_with_runtime(s_async_extract.runtime,
-                                                            job->user_text,
-                                                            &message_intent,
-                                                            &llm_text);
-
-        if (s_async_extract.lock && xSemaphoreTake(s_async_extract.lock, portMAX_DELAY) == pdTRUE) {
-            if (job->llm_text) {
-                free(job->llm_text);
-            }
-            job->llm_text = llm_text;
-            job->message_intent = message_intent;
-            job->result = err;
-            job->completed = true;
-            job->completed_ticks = xTaskGetTickCount();
-            /* Signal completion while still holding the lock. Once `completed`
-             * is visible, the consumer (take_summary_list) may detach and free
-             * this job; doing the give after releasing the lock would be a
-             * use-after-free on `job`/`job->done_sem`. Holding the lock across
-             * the give keeps the consumer's free serialized after us. */
-            if (job->done_sem) {
-                xSemaphoreGive(job->done_sem);
-            }
-            xSemaphoreGive(s_async_extract.lock);
-        } else {
-            free(llm_text);
-        }
-    }
-}
-
-static char *claw_memory_async_extract_take_summary_list(const claw_core_request_t *request,
-                                                        bool apply_result)
-{
-    claw_memory_async_extract_job_t *job = NULL;
-    claw_memory_async_extract_job_t *prev = NULL;
-    SemaphoreHandle_t done_sem = NULL;
-    char *llm_text = NULL;
-    char *summary_list = NULL;
-    claw_memory_message_intent_t message_intent = CLAW_MEMORY_MESSAGE_INTENT_NONE;
-
-    if (!request || !request->request_id || !s_async_extract.enabled || !s_async_extract.lock) {
-        return NULL;
-    }
-
-    while (true) {
-        if (xSemaphoreTake(s_async_extract.lock, portMAX_DELAY) != pdTRUE) {
-            return NULL;
-        }
-
-        prev = NULL;
-        job = s_async_extract.jobs;
-        while (job) {
-            if (job->request_id == request->request_id) {
-                break;
-            }
-            prev = job;
-            job = job->next;
-        }
-
-        if (!job) {
-            claw_memory_async_extract_sweep_locked(xTaskGetTickCount());
-            xSemaphoreGive(s_async_extract.lock);
-            return NULL;
-        }
-
-        if (job->completed) {
-            llm_text = job->llm_text;
-            job->llm_text = NULL;
-            message_intent = job->message_intent;
-            if (prev) {
-                prev->next = job->next;
-            } else {
-                s_async_extract.jobs = job->next;
-            }
-            xSemaphoreGive(s_async_extract.lock);
-            claw_memory_async_extract_free_job(job);
-            if (!apply_result) {
-                free(llm_text);
-                return NULL;
-            }
-            if (claw_memory_auto_extract_apply_result(llm_text,
-                                                      message_intent,
-                                                      &summary_list) != ESP_OK) {
-                free(llm_text);
-                free(summary_list);
-                return NULL;
-            }
-            free(llm_text);
-            return summary_list;
-        }
-
-        done_sem = job->done_sem;
-        xSemaphoreGive(s_async_extract.lock);
-        ESP_LOGI(TAG, "stage note provider waiting request=%" PRIu32, request->request_id);
-        if (!done_sem || xSemaphoreTake(done_sem, portMAX_DELAY) != pdTRUE) {
-            return NULL;
-        }
-    }
-}
-
-static void claw_memory_async_extract_deinit(void)
-{
-    claw_memory_async_extract_job_t *job = s_async_extract.jobs;
-
-    s_async_extract.jobs = NULL;
-    while (job) {
-        claw_memory_async_extract_job_t *next = job->next;
-
-        claw_memory_async_extract_free_job(job);
-        job = next;
-    }
-    if (s_async_extract.task_handle) {
-        claw_task_delete(s_async_extract.task_handle);
-        s_async_extract.task_handle = NULL;
-    }
-    if (s_async_extract.queue) {
-        vQueueDelete(s_async_extract.queue);
-        s_async_extract.queue = NULL;
-    }
-    if (s_async_extract.lock) {
-        vSemaphoreDelete(s_async_extract.lock);
-        s_async_extract.lock = NULL;
-    }
-    if (s_async_extract.runtime) {
-        claw_llm_runtime_deinit(s_async_extract.runtime);
-        s_async_extract.runtime = NULL;
-    }
-    s_async_extract.enabled = false;
-}
-
-esp_err_t claw_memory_async_extract_init(const claw_memory_config_t *config)
-{
-    BaseType_t task_result;
-    const claw_memory_llm_config_t *llm = NULL;
-    char *error_message = NULL;
-    esp_err_t err;
-
-    claw_memory_async_extract_deinit();
-
-    if (!config || !config->enable_async_extract_stage_note) {
-        return ESP_OK;
-    }
-    llm = &config->llm;
-
-    if (!llm->api_key || !llm->api_key[0] ||
-        !llm->model || !llm->model[0] ||
-        !llm->backend_type || !llm->backend_type[0]) {
-        ESP_LOGI(TAG, "Async memory extract disabled: LLM config incomplete");
-        return ESP_OK;
-    }
-
-    err = claw_llm_runtime_init(&s_async_extract.runtime,
-                                &(claw_llm_runtime_config_t) {
-                                    .api_key = llm->api_key,
-                                    .backend_type = llm->backend_type,
-                                    .model = llm->model,
-                                    .base_url = llm->base_url,
-                                    .auth_type = llm->auth_type,
-                                    .max_tokens_field = llm->max_tokens_field,
-                                    .timeout_ms = llm->timeout_ms,
-                                    .max_tokens = llm->max_tokens,
-                                    .image_max_bytes = llm->image_max_bytes,
-                                    .supports_tools = llm->supports_tools,
-                                    .supports_vision = llm->supports_vision,
-                                    .image_remote_url_only = llm->image_remote_url_only,
-                                },
-                                &error_message);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Failed to init async memory extract runtime: %s",
-                 error_message ? error_message : esp_err_to_name(err));
-        free(error_message);
-        claw_memory_async_extract_deinit();
-        return err;
-    }
-    free(error_message);
-
-    s_async_extract.lock = xSemaphoreCreateMutex();
-    s_async_extract.queue = xQueueCreate(CLAW_MEMORY_ASYNC_EXTRACT_QUEUE_LEN,
-                                         sizeof(claw_memory_async_extract_job_t *));
-    if (!s_async_extract.lock || !s_async_extract.queue) {
-        claw_memory_async_extract_deinit();
-        return ESP_ERR_NO_MEM;
-    }
-
-    task_result = claw_task_create(&(claw_task_config_t){
-                                        .name = "claw_mem_extract",
-                                        .stack_size = CLAW_MEMORY_ASYNC_EXTRACT_STACK_SIZE,
-                                        .priority = CLAW_MEMORY_ASYNC_EXTRACT_PRIORITY,
-                                        .core_id = tskNO_AFFINITY,
-                                        .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
-                                    },
-                                    claw_memory_async_extract_task,
-                                    NULL,
-                                    &s_async_extract.task_handle);
-    if (task_result != pdPASS) {
-        claw_memory_async_extract_deinit();
-        return ESP_FAIL;
-    }
-
-    s_async_extract.enabled = true;
-    ESP_LOGI(TAG, "Async memory extract worker ready");
-    return ESP_OK;
-}
-
-esp_err_t claw_memory_async_extract_ensure_started(const claw_core_request_t *request)
-{
-    claw_memory_async_extract_job_t *job = NULL;
-
-    if (!request || !request->request_id || !request->session_id || !request->session_id[0] ||
-        !request->user_text || !request->user_text[0] || !s_async_extract.enabled) {
-        return ESP_OK;
-    }
-    if (!s_async_extract.lock || !s_async_extract.queue) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (xSemaphoreTake(s_async_extract.lock, portMAX_DELAY) != pdTRUE) {
-        return ESP_FAIL;
-    }
-
-    claw_memory_async_extract_sweep_locked(xTaskGetTickCount());
-    if (claw_memory_async_extract_find_job_locked(request->request_id)) {
-        xSemaphoreGive(s_async_extract.lock);
-        return ESP_OK;
-    }
-
-    job = calloc(1, sizeof(*job));
-    if (!job) {
-        xSemaphoreGive(s_async_extract.lock);
-        return ESP_ERR_NO_MEM;
-    }
-
-    job->request_id = request->request_id;
-    job->session_id = dup_printf("%s", request->session_id);
-    job->user_text = dup_printf("%s", request->user_text);
-    job->done_sem = xSemaphoreCreateBinary();
-    job->created_ticks = xTaskGetTickCount();
-    if (!job->session_id || !job->user_text || !job->done_sem) {
-        xSemaphoreGive(s_async_extract.lock);
-        claw_memory_async_extract_free_job(job);
-        return ESP_ERR_NO_MEM;
-    }
-
-    job->next = s_async_extract.jobs;
-    s_async_extract.jobs = job;
-    xSemaphoreGive(s_async_extract.lock);
-
-    if (xQueueSend(s_async_extract.queue, &job, 0) != pdTRUE) {
-        if (xSemaphoreTake(s_async_extract.lock, portMAX_DELAY) == pdTRUE) {
-            claw_memory_async_extract_job_t *node = s_async_extract.jobs;
-            claw_memory_async_extract_job_t *prev = NULL;
-
-            while (node) {
-                if (node == job) {
-                    if (prev) {
-                        prev->next = node->next;
-                    } else {
-                        s_async_extract.jobs = node->next;
-                    }
-                    break;
-                }
-                prev = node;
-                node = node->next;
-            }
-            xSemaphoreGive(s_async_extract.lock);
-        }
-        claw_memory_async_extract_free_job(job);
-        return ESP_ERR_TIMEOUT;
-    }
-
-    ESP_LOGI(TAG,
-             "async extract job created request=%" PRIu32 " session=%s",
-             request->request_id,
-             request->session_id);
-    return ESP_OK;
 }
 
 static bool session_history_record_type_valid(uint8_t record_type)
@@ -1856,15 +1403,13 @@ esp_err_t claw_memory_persist_context_callback(const claw_core_context_persist_b
         return ESP_ERR_INVALID_STATE;
     }
 
+    claw_memory_lock();
     data_path = claw_memory_session_path_dup(batch->session_id);
-    if (!data_path) {
+    idx_path = data_path ? session_history_idx_path_dup(data_path) : NULL;
+    if (!data_path || !idx_path) {
         ESP_LOGE(TAG, "allocate session history path failed");
-        return ESP_ERR_NO_MEM;
-    }
-    idx_path = session_history_idx_path_dup(data_path);
-    if (!idx_path) {
-        free(data_path);
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
     }
     if (ensure_parent_dir(data_path) != ESP_OK) {
         err = ESP_FAIL;
@@ -1912,8 +1457,53 @@ cleanup:
     if (err == ESP_OK && batch->turn_completed) {
         err = session_history_compact_if_needed(batch->session_id, batch->request, data_path, idx_path);
     }
+    if (err == ESP_OK) {
+        claw_memory_pipeline_note_persist(batch->session_id, data_path);
+    }
+    claw_memory_unlock();
     free(data_path);
     free(idx_path);
+    return err;
+}
+
+esp_err_t claw_memory_session_delete_files(const char *data_path,
+                                          bool *out_deleted_any,
+                                          size_t *out_freed)
+{
+    char *paths[3] = {0};
+    bool deleted_any = false;
+    size_t freed = 0;
+    esp_err_t err = ESP_OK;
+    size_t i;
+
+    if (!data_path || !data_path[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    paths[0] = dup_printf("%s", data_path);
+    paths[1] = session_history_idx_path_dup(data_path);
+    paths[2] = session_history_blocked_path_dup(data_path);
+    for (i = 0; i < 3 && err == ESP_OK; i++) {
+        size_t size;
+
+        if (!paths[i]) {
+            err = ESP_ERR_NO_MEM;
+            break;
+        }
+        size = file_size_bytes(paths[i]);
+        err = session_history_unlink_path(paths[i], &deleted_any);
+        if (err == ESP_OK && !session_history_path_exists(paths[i])) {
+            freed += size;
+        }
+    }
+    for (i = 0; i < 3; i++) {
+        free(paths[i]);
+    }
+    if (out_deleted_any) {
+        *out_deleted_any = deleted_any;
+    }
+    if (out_freed) {
+        *out_freed = freed;
+    }
     return err;
 }
 
@@ -1921,10 +1511,7 @@ esp_err_t claw_memory_delete_session_history(const char *session_id,
                                              bool *out_deleted_any)
 {
     char *data_path = NULL;
-    char *idx_path = NULL;
-    char *blocked_path = NULL;
-    bool deleted_any = false;
-    esp_err_t err = ESP_OK;
+    esp_err_t err;
 
     if (!session_id || !session_id[0] || !out_deleted_any) {
         return ESP_ERR_INVALID_ARG;
@@ -1939,33 +1526,340 @@ esp_err_t claw_memory_delete_session_history(const char *session_id,
         ESP_LOGE(TAG, "allocate session history path failed");
         return ESP_ERR_NO_MEM;
     }
+    claw_memory_lock();
+    err = claw_memory_session_delete_files(data_path, out_deleted_any, NULL);
+    claw_memory_unlock();
+    free(data_path);
+    return err;
+}
+
+#define CLAW_MEMORY_TRANSCRIPT_MSG_MAX  1500
+#define CLAW_MEMORY_TRANSCRIPT_TOOL_MAX 200
+
+static void transcript_append_utf8(char *buf, size_t size, size_t *off, const char *text)
+{
+    size_t len;
+
+    if (!text || !text[0] || *off + 2 >= size) {
+        return;
+    }
+    if (*off > 0 && buf[*off - 1] != ' ') {
+        buf[(*off)++] = ' ';
+    }
+    len = strlen(text);
+    if (len > size - *off - 1) {
+        len = size - *off - 1;
+        while (len > 0 && ((unsigned char)text[len] & 0xC0) == 0x80) {
+            len--;
+        }
+    }
+    memcpy(buf + *off, text, len);
+    *off += len;
+    buf[*off] = '\0';
+}
+
+/* Collects the human-readable text of a stored chat record regardless of the
+ * backend format: plain strings, content blocks and tool outputs. */
+static void transcript_collect_text(const cJSON *node, char *buf, size_t size, size_t *off, int depth)
+{
+    static const char *const keys[] = {"text", "content", "output"};
+    const cJSON *child;
+    size_t i;
+
+    if (!node || depth > 4) {
+        return;
+    }
+    if (cJSON_IsString(node)) {
+        transcript_append_utf8(buf, size, off, node->valuestring);
+    } else if (cJSON_IsArray(node)) {
+        cJSON_ArrayForEach(child, node) {
+            transcript_collect_text(child, buf, size, off, depth + 1);
+        }
+    } else if (cJSON_IsObject(node)) {
+        for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+            transcript_collect_text(cJSON_GetObjectItemCaseSensitive(node, keys[i]), buf, size, off, depth + 1);
+        }
+    }
+}
+
+static bool session_history_is_turn_record(uint8_t record_type)
+{
+    return record_type == CLAW_CORE_CONTEXT_RECORD_USER ||
+           record_type == CLAW_CORE_CONTEXT_RECORD_ASSISTANT_FINAL;
+}
+
+esp_err_t claw_memory_session_read_transcript(const char *data_path,
+                                              uint32_t from_turn,
+                                              size_t max_bytes,
+                                              char **out_text,
+                                              uint32_t *out_turn_count)
+{
+    static const char truncated_note[] = "[earlier part of the conversation truncated]\n";
+    claw_memory_session_index_t index = {0};
+    char *idx_path = NULL;
+    char *buf = NULL;
+    char *line = NULL;
+    FILE *file = NULL;
+    size_t cap = max_bytes * 2;
+    size_t len = 0;
+    size_t start;
+    uint32_t turns = 0;
+    bool truncated = false;
+    size_t i;
+    esp_err_t err;
+
+    if (!data_path || !out_text || !out_turn_count || max_bytes <= sizeof(truncated_note)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_text = NULL;
+    *out_turn_count = 0;
+
     idx_path = session_history_idx_path_dup(data_path);
-    blocked_path = session_history_blocked_path_dup(data_path);
-    if (!idx_path || !blocked_path) {
+    if (!idx_path) {
+        return ESP_ERR_NO_MEM;
+    }
+    /* Read-only: unlike the context loader this never resets a broken pair. */
+    err = session_history_validate_pair(data_path, idx_path, &index);
+    free(idx_path);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    buf = heap_caps_malloc(cap + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    line = heap_caps_malloc(CLAW_MEMORY_TRANSCRIPT_MSG_MAX + 32, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    file = fopen(data_path, "rb");
+    if (!buf || !line || !file) {
+        err = file ? ESP_ERR_NO_MEM : ESP_FAIL;
+        goto cleanup;
+    }
+    buf[0] = '\0';
+
+    for (i = 0; i < index.count; i++) {
+        uint8_t type = index.entries[i].record_type;
+        const char *prefix;
+        char *record_text = NULL;
+        cJSON *record;
+        size_t line_len;
+        size_t limit;
+        size_t j;
+
+        if (session_history_is_turn_record(type)) {
+            turns++;
+        }
+        if (turns <= from_turn || type == CLAW_CORE_CONTEXT_RECORD_ASSISTANT_TOOL) {
+            continue;
+        }
+        if (session_history_read_record_text(file, &index.entries[i], &record_text) != ESP_OK) {
+            continue;
+        }
+        record = cJSON_Parse(record_text);
+        free(record_text);
+        prefix = type == CLAW_CORE_CONTEXT_RECORD_USER ? "User: " :
+                 (type == CLAW_CORE_CONTEXT_RECORD_ASSISTANT_FINAL ? "Assistant: " : "Tool result: ");
+        limit = type == CLAW_CORE_CONTEXT_RECORD_TOOL_RESULT ?
+                CLAW_MEMORY_TRANSCRIPT_TOOL_MAX : CLAW_MEMORY_TRANSCRIPT_MSG_MAX;
+        line_len = 0;
+        line[0] = '\0';
+        transcript_collect_text(record, line, limit + 1, &line_len, 0);
+        cJSON_Delete(record);
+        if (line_len == 0) {
+            continue;
+        }
+        for (j = 0; j < line_len; j++) {
+            if (line[j] == '\n' || line[j] == '\r' || line[j] == '\t') {
+                line[j] = ' ';
+            }
+        }
+
+        /* Keep only the most recent part: drop whole lines from the front. */
+        if (len + strlen(prefix) + line_len + 2 > cap) {
+            size_t need = len + strlen(prefix) + line_len + 2 - cap;
+            char *nl = need < len ? memchr(buf + need, '\n', len - need) : NULL;
+            size_t drop = nl ? (size_t)(nl - buf) + 1 : len;
+
+            memmove(buf, buf + drop, len - drop);
+            len -= drop;
+            truncated = true;
+        }
+        len += (size_t)snprintf(buf + len, cap + 1 - len, "%s%s\n", prefix, line);
+    }
+
+    start = claw_memory_tail_offset(buf, len, max_bytes - sizeof(truncated_note));
+    truncated |= start > 0;
+    *out_text = dup_printf("%s%.*s", truncated ? truncated_note : "", (int)(len - start), buf + start);
+    *out_turn_count = turns;
+    err = *out_text ? ESP_OK : ESP_ERR_NO_MEM;
+
+cleanup:
+    if (file) {
+        fclose(file);
+    }
+    heap_caps_free(buf);
+    heap_caps_free(line);
+    session_history_index_free(&index);
+    return err;
+}
+
+esp_err_t claw_memory_session_turn_count(const char *data_path, uint32_t *out_turn_count)
+{
+    claw_memory_session_index_t index = {0};
+    char *idx_path = session_history_idx_path_dup(data_path);
+    uint32_t turns = 0;
+    size_t i;
+    esp_err_t err;
+
+    if (!idx_path || !out_turn_count) {
+        free(idx_path);
+        return ESP_ERR_INVALID_ARG;
+    }
+    err = session_history_validate_pair(data_path, idx_path, &index);
+    free(idx_path);
+    for (i = 0; err == ESP_OK && i < index.count; i++) {
+        turns += session_history_is_turn_record(index.entries[i].record_type) ? 1 : 0;
+    }
+    session_history_index_free(&index);
+    *out_turn_count = turns;
+    return err;
+}
+
+static esp_err_t session_history_replace_file(const char *src, const char *dst)
+{
+    if (unlink(dst) != 0 && errno != ENOENT) {
+        return ESP_FAIL;
+    }
+    return rename(src, dst) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t claw_memory_session_compact_with_summary(const char *data_path,
+                                                   size_t keep_bytes,
+                                                   const char *summary,
+                                                   uint32_t max_drop_turns,
+                                                   uint32_t *out_dropped_turns)
+{
+    claw_memory_session_index_t index = {0};
+    char *idx_path = NULL;
+    char *data_tmp = NULL;
+    char *idx_tmp = NULL;
+    char *summary_text = NULL;
+    FILE *src = NULL;
+    FILE *data_file = NULL;
+    FILE *idx_file = NULL;
+    size_t kept = 0;
+    size_t cut = 0;
+    uint32_t dropped_turns = 0;
+    size_t i;
+    esp_err_t err;
+
+    if (!data_path || !out_dropped_turns) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_dropped_turns = 0;
+
+    idx_path = session_history_idx_path_dup(data_path);
+    data_tmp = dup_printf("%s.tmp", data_path);
+    idx_tmp = idx_path ? dup_printf("%s.tmp", idx_path) : NULL;
+    summary_text = dup_printf("[Summary of the earlier conversation; older messages were removed to save storage]\n%s",
+                              summary && summary[0] ? summary : "(no summary available)");
+    if (!idx_path || !data_tmp || !idx_tmp || !summary_text) {
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
+    err = session_history_validate_pair(data_path, idx_path, &index);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
 
-    err = session_history_unlink_path(data_path, &deleted_any);
-    if (err != ESP_OK) {
+    /* Keep the newest whole turns that fit into keep_bytes (at least the last turn). */
+    for (i = index.count; i > 0; i--) {
+        kept += index.entries[i - 1].length;
+        if (index.entries[i - 1].record_type == CLAW_CORE_CONTEXT_RECORD_USER) {
+            if (kept > keep_bytes && cut != 0) {
+                break;
+            }
+            cut = i - 1;
+        }
+    }
+    for (i = 0; i < cut; i++) {
+        dropped_turns += session_history_is_turn_record(index.entries[i].record_type) ? 1 : 0;
+    }
+    if (cut == 0) {
         goto cleanup;
     }
-    err = session_history_unlink_path(idx_path, &deleted_any);
-    if (err != ESP_OK) {
+    if (dropped_turns > max_drop_turns) {
+        err = ESP_ERR_INVALID_STATE;
         goto cleanup;
     }
-    err = session_history_unlink_path(blocked_path, &deleted_any);
-    if (err != ESP_OK) {
-        goto cleanup;
+
+    err = session_history_recreate_file(data_tmp, idx_tmp);
+    if (err == ESP_OK) {
+        src = fopen(data_path, "rb");
+        data_file = fopen(data_tmp, "ab");
+        idx_file = fopen(idx_tmp, "ab");
+        err = (src && data_file && idx_file) ? ESP_OK : ESP_FAIL;
+    }
+    if (err == ESP_OK) {
+        err = session_history_append_indexed_record(data_file, idx_file, CLAW_CORE_CONTEXT_RECORD_USER,
+                                                    NULL, "user", summary_text);
+    }
+    if (err == ESP_OK) {
+        err = session_history_append_indexed_record(data_file, idx_file, CLAW_CORE_CONTEXT_RECORD_ASSISTANT_FINAL,
+                                                    NULL, "assistant", "Understood.");
+    }
+    for (i = cut; err == ESP_OK && i < index.count; i++) {
+        claw_memory_session_index_entry_t entry = index.entries[i];
+        uint32_t offset = 0;
+        uint32_t length = 0;
+        char *record_text = NULL;
+
+        err = session_history_read_record_text(src, &index.entries[i], &record_text);
+        if (err == ESP_OK && fseek(data_file, 0, SEEK_END) != 0) {
+            err = ESP_FAIL;
+        }
+        if (err == ESP_OK) {
+            err = claw_memory_write_session_raw_record(data_file, record_text, &offset, &length);
+            entry.offset = offset;
+            entry.length = length;
+        }
+        if (err == ESP_OK && fwrite(&entry, 1, sizeof(entry), idx_file) != sizeof(entry)) {
+            err = ESP_FAIL;
+        }
+        free(record_text);
+    }
+    if (src) {
+        fclose(src);
+    }
+    if (data_file && session_history_close_file(data_file) != ESP_OK && err == ESP_OK) {
+        err = ESP_FAIL;
+    }
+    if (idx_file && session_history_close_file(idx_file) != ESP_OK && err == ESP_OK) {
+        err = ESP_FAIL;
+    }
+    /* FAT cannot rename over an existing file: drop the old pair, then move the new one in. */
+    if (err == ESP_OK) {
+        err = session_history_replace_file(data_tmp, data_path);
+    }
+    if (err == ESP_OK) {
+        err = session_history_replace_file(idx_tmp, idx_path);
+    }
+    if (err == ESP_OK) {
+        char *blocked_path = session_history_blocked_path_dup(data_path);
+
+        if (blocked_path) {
+            unlink(blocked_path);
+            free(blocked_path);
+        }
+        *out_dropped_turns = dropped_turns;
+    } else {
+        unlink(data_tmp);
+        unlink(idx_tmp);
     }
 
 cleanup:
-    free(data_path);
+    session_history_index_free(&index);
     free(idx_path);
-    free(blocked_path);
-    if (err == ESP_OK) {
-        *out_deleted_any = deleted_any;
-    }
+    free(data_tmp);
+    free(idx_tmp);
+    free(summary_text);
     return err;
 }
 
@@ -2023,7 +1917,12 @@ esp_err_t claw_memory_request_start_callback(const claw_core_request_t *request,
                                              void *user_ctx)
 {
     (void)user_ctx;
-    return claw_memory_async_extract_ensure_started(request);
+    if (request && request->session_id && request->session_id[0]) {
+        claw_memory_lock();
+        claw_memory_pipeline_note_request(request->session_id);
+        claw_memory_unlock();
+    }
+    return ESP_OK;
 }
 
 esp_err_t claw_memory_stage_note_callback(const claw_core_request_t *request,
@@ -2031,8 +1930,6 @@ esp_err_t claw_memory_stage_note_callback(const claw_core_request_t *request,
                                           void *user_ctx)
 {
     char *summary_list = NULL;
-    char *async_summary = NULL;
-    bool manual_write = false;
 
     (void)user_ctx;
 
@@ -2044,13 +1941,7 @@ esp_err_t claw_memory_stage_note_callback(const claw_core_request_t *request,
         return ESP_OK;
     }
 
-    manual_write = claw_memory_request_take_manual_write(request->request_id);
     summary_list = claw_memory_pending_summary_take_summary_list(request->session_id);
-    async_summary = claw_memory_async_extract_take_summary_list(request, !manual_write);
-    if (line_list_merge_unique(&summary_list, async_summary) != ESP_OK) {
-        ESP_LOGW(TAG, "merge async extract summary failed for request=%" PRIu32, request->request_id);
-    }
-    free(async_summary);
     *out_note = claw_memory_format_update_stage_note(summary_list);
     free(summary_list);
     return ESP_OK;
@@ -2071,7 +1962,9 @@ static esp_err_t claw_memory_session_history_collect(const claw_core_request_t *
 
     memset(out_context, 0, sizeof(*out_context));
 
+    claw_memory_lock();
     err = claw_memory_session_load_json_alloc(request->session_id, &content);
+    claw_memory_unlock();
     if (err != ESP_OK) {
         return err;
     }
