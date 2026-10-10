@@ -250,6 +250,9 @@ static void cap_ssh_run(cap_ssh_job_t *job)
     bool process_config = false;
     int64_t deadline_us = esp_timer_get_time() + (int64_t)CAP_SSH_TOTAL_TIMEOUT_MS * 1000;
 
+    /* ssh_options_apply() expands "%d" in default paths via getpwuid_r(), which fails on
+     * ESP-IDF; libssh then falls back to $HOME. No files are read from it. */
+    setenv("HOME", "/ssh", 0);
     session = ssh_new();
     if (!session) {
         snprintf(job->error, sizeof(job->error), "out of memory");
