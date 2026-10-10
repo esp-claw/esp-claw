@@ -24,11 +24,13 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
@@ -50,6 +52,7 @@ static const char *TAG = "cap_wasm_fw";
 #define FW_REPORT_WAIT_S   600  /* how long the boot report waits for Telegram */
 #define FW_REBOOT_DELAY_US (5 * 1000 * 1000)
 #define FW_TASK_STACK      (6 * 1024)
+#define FW_OTA_STACK       (6 * 1024) /* internal RAM, only while one esp_ota call runs */
 
 typedef struct {
     esp_ota_handle_t ota;
@@ -61,6 +64,94 @@ typedef struct {
     int64_t msg_id;
     const char *version;
 } fw_write_t;
+
+/*
+ * esp_ota calls that read otadata or verify an image map flash with esp_mmu_map(), which freezes
+ * the cache and asserts unless the calling task's stack is in internal RAM. The job, agent and
+ * Telegram tasks have PSRAM stacks, so these calls run on a short-lived internal-stack task.
+ * Plain flash reads/writes (esp_ota_write, esp_partition_read, NVS, FATFS) need no such care:
+ * with XIP from PSRAM, esp_flash keeps the cache enabled (SPI_FLASH_CACHE_NO_DISABLE).
+ */
+typedef enum {
+    FW_OTA_BEGIN,
+    FW_OTA_END,
+    FW_OTA_SET_BOOT,
+    FW_OTA_STATE,
+    FW_OTA_MARK_VALID,
+    FW_OTA_MARK_INVALID, /* reboots */
+} fw_ota_op_t;
+
+typedef struct {
+    fw_ota_op_t op;
+    const esp_partition_t *part;
+    esp_ota_handle_t *handle;
+    esp_ota_img_states_t *state;
+    esp_err_t ret;
+    SemaphoreHandle_t done;
+    StaticSemaphore_t done_buf;
+} fw_ota_call_t;
+
+static void fw_ota_run(fw_ota_call_t *c)
+{
+    switch (c->op) {
+    case FW_OTA_BEGIN:
+        c->ret = esp_ota_begin(c->part, OTA_WITH_SEQUENTIAL_WRITES, c->handle);
+        break;
+    case FW_OTA_END:
+        c->ret = esp_ota_end(*c->handle);
+        break;
+    case FW_OTA_SET_BOOT:
+        c->ret = esp_ota_set_boot_partition(c->part);
+        break;
+    case FW_OTA_STATE:
+        c->ret = esp_ota_get_state_partition(esp_ota_get_running_partition(), c->state);
+        break;
+    case FW_OTA_MARK_VALID:
+        c->ret = esp_ota_mark_app_valid_cancel_rollback();
+        break;
+    case FW_OTA_MARK_INVALID:
+        c->ret = esp_ota_mark_app_invalid_rollback_and_reboot();
+        break;
+    }
+}
+
+static void fw_ota_task(void *arg)
+{
+    fw_ota_call_t *c = arg;
+
+    fw_ota_run(c);
+    xSemaphoreGive(c->done);
+    vTaskDeleteWithCaps(NULL);
+}
+
+static esp_err_t fw_ota(fw_ota_op_t op, const esp_partition_t *part, esp_ota_handle_t *handle,
+                        esp_ota_img_states_t *state)
+{
+    fw_ota_call_t c = { .op = op, .part = part, .handle = handle, .state = state };
+
+    if (esp_ptr_in_dram(&c)) { /* already on an internal stack */
+        fw_ota_run(&c);
+        return c.ret;
+    }
+    c.done = xSemaphoreCreateBinaryStatic(&c.done_buf);
+    if (xTaskCreateWithCaps(fw_ota_task, "fw_ota", FW_OTA_STACK, &c, uxTaskPriorityGet(NULL), NULL,
+                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTake(c.done, portMAX_DELAY);
+    return c.ret;
+}
+
+/* State of the running image, ESP_OTA_IMG_UNDEFINED when unknown. */
+static esp_ota_img_states_t fw_running_state(void)
+{
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+
+    if (fw_ota(FW_OTA_STATE, NULL, NULL, &state) != ESP_OK) {
+        state = ESP_OTA_IMG_UNDEFINED;
+    }
+    return state;
+}
 
 static void fw_nvs_get(const char *key, char *out, size_t size)
 {
@@ -117,12 +208,11 @@ static esp_err_t fw_status(char *output, size_t output_size)
     const esp_app_desc_t *desc = esp_app_get_description();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = fw_next_slot();
-    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_ota_img_states_t state = fw_running_state();
     esp_app_desc_t other;
     char last[192];
     int len;
 
-    esp_ota_get_state_partition(running, &state);
     fw_nvs_get("last", last, sizeof(last));
     len = snprintf(output, output_size, "Firmware %s %s (IDF %s, built %s %s)\nRunning: %s%s\n", desc->project_name,
                    desc->version, desc->idf_ver, desc->date, desc->time, running->label,
@@ -285,7 +375,7 @@ static esp_err_t fw_write(const char *bin, const cap_wasm_fw_sig_t *sig, const c
     uint8_t hash[32];
     char hex[CAP_WASM_SHA_HEX_LEN + 1];
     esp_app_desc_t desc;
-    esp_err_t ret = esp_ota_begin(next, OTA_WITH_SEQUENTIAL_WRITES, &w.ota);
+    esp_err_t ret = fw_ota(FW_OTA_BEGIN, next, &w.ota, NULL);
 
     if (ret != ESP_OK) {
         snprintf(err, err_size, "cannot start writing %s: %s", next->label, esp_err_to_name(ret));
@@ -314,7 +404,7 @@ static esp_err_t fw_write(const char *bin, const cap_wasm_fw_sig_t *sig, const c
         esp_ota_abort(w.ota);
         return ret;
     }
-    ret = esp_ota_end(w.ota);
+    ret = fw_ota(FW_OTA_END, NULL, &w.ota, NULL);
     if (ret == ESP_OK && (esp_ota_get_partition_description(next, &desc) != ESP_OK ||
                           strcmp(desc.project_name, sig->project) != 0 || strcmp(desc.version, sig->version) != 0)) {
         ret = ESP_ERR_INVALID_VERSION;
@@ -323,7 +413,7 @@ static esp_err_t fw_write(const char *bin, const cap_wasm_fw_sig_t *sig, const c
         snprintf(err, err_size, "the written image is not valid: %s", esp_err_to_name(ret));
         return ret;
     }
-    ret = esp_ota_set_boot_partition(next);
+    ret = fw_ota(FW_OTA_SET_BOOT, next, NULL, NULL);
     if (ret != ESP_OK) {
         snprintf(err, err_size, "cannot select %s for boot: %s", next->label, esp_err_to_name(ret));
     }
@@ -450,7 +540,7 @@ static bool fw_healthy(void)
 static void fw_boot_task(void *arg)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
-    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_ota_img_states_t state = fw_running_state();
     char chat[32];
     char from[CAP_WASM_FW_TEXT_MAX + 1];
     char to[CAP_WASM_FW_TEXT_MAX + 1];
@@ -458,7 +548,6 @@ static void fw_boot_task(void *arg)
     char text[320];
 
     (void)arg;
-    esp_ota_get_state_partition(esp_ota_get_running_partition(), &state);
     fw_nvs_get("chat", chat, sizeof(chat));
     fw_nvs_get("from", from, sizeof(from));
     fw_nvs_get("to", to, sizeof(to));
@@ -472,11 +561,11 @@ static void fw_boot_task(void *arg)
                          FW_HEALTH_MAX_S);
                 fw_nvs_set("last", last);
                 ESP_LOGE(TAG, "%s", last);
-                esp_ota_mark_app_invalid_rollback_and_reboot();
+                fw_ota(FW_OTA_MARK_INVALID, NULL, NULL, NULL);
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        esp_ota_mark_app_valid_cancel_rollback();
+        fw_ota(FW_OTA_MARK_VALID, NULL, NULL, NULL);
         snprintf(last, sizeof(last), "updated %s -> %s", from[0] ? from : "?", desc->version);
         snprintf(text, sizeof(text), "✅ Firmware aktualisiert auf %s (vorher %s)", desc->version, from[0] ? from : "?");
     } else if (strcmp(desc->version, to) == 0) {
@@ -506,10 +595,9 @@ static void fw_boot_task(void *arg)
 
 void cap_wasm_fw_boot(void)
 {
-    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_ota_img_states_t state = fw_running_state();
     char to[CAP_WASM_FW_TEXT_MAX + 1];
 
-    esp_ota_get_state_partition(esp_ota_get_running_partition(), &state);
     fw_nvs_get("to", to, sizeof(to));
     if ((state == ESP_OTA_IMG_PENDING_VERIFY || to[0]) &&
             xTaskCreateWithCaps(fw_boot_task, "fw_boot", FW_TASK_STACK, NULL, 4, NULL, CAP_WASM_PSRAM_CAPS) != pdPASS) {
