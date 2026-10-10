@@ -62,6 +62,18 @@ esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
 /* Deletes the oldest files under root_dir/<platform>/<chat>/ until the shared inbox budget is met.
  * keep_path (may be NULL) is never deleted. */
 void cap_im_attachment_prune_inbox(const char *log_tag, const char *root_dir, const char *keep_path);
+/* Uploads the audio file at path to an OpenAI-compatible <base_url>/audio/transcriptions endpoint.
+ * On success *out_text is a heap string the caller frees. On failure a short reason is written to
+ * err_buf. */
+esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
+                                            const char *base_url,
+                                            const char *api_key,
+                                            const char *model,
+                                            const char *path,
+                                            const char *mime,
+                                            char **out_text,
+                                            char *err_buf,
+                                            size_t err_buf_size);
 char *cap_im_attachment_build_payload_json(
     const cap_im_attachment_payload_config_t *config);
 

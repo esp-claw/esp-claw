@@ -522,6 +522,11 @@ static esp_err_t app_cap_register_im_tg(const app_claw_config_t *config,
                             TAG, "Failed to set Telegram bot token");
     }
 
+    ESP_RETURN_ON_ERROR(cap_im_tg_set_stt_config(config->stt_base_url,
+                                                 config->stt_api_key,
+                                                 config->stt_model),
+                        TAG, "Failed to set Telegram STT config");
+
     return ESP_OK;
 }
 #endif

@@ -32,6 +32,11 @@
 #define CAP_IM_ATTACHMENT_MIN_VALID_EPOCH 1577836800
 /* Inbox layout is <root>/<platform>/<chat>/<file>: two directory levels above the files. */
 #define CAP_IM_ATTACHMENT_INBOX_DIR_DEPTH 2
+#define CAP_IM_ATTACHMENT_STT_BOUNDARY "----cap_im_stt_boundary"
+#define CAP_IM_ATTACHMENT_STT_TIMEOUT_MS 60000
+#define CAP_IM_ATTACHMENT_STT_CHUNK_BYTES 4096
+/* Upload chunks and the JSON response share one buffer; it bounds the accepted response size. */
+#define CAP_IM_ATTACHMENT_STT_BUF_BYTES (32 * 1024)
 
 typedef struct {
     FILE *file;
@@ -672,6 +677,201 @@ void cap_im_attachment_prune_inbox(const char *log_tag, const char *root_dir, co
         return;
     }
     cap_im_attachment_gc(log_tag, root_dir, keep_path, false);
+}
+
+static esp_err_t cap_im_attachment_http_write_all(esp_http_client_handle_t client,
+                                                  const char *data,
+                                                  size_t len)
+{
+    size_t total = 0;
+
+    while (total < len) {
+        int written = esp_http_client_write(client, data + total, (int)(len - total));
+
+        if (written <= 0) {
+            return ESP_FAIL;
+        }
+        total += (size_t)written;
+    }
+    return ESP_OK;
+}
+
+/* Streams the multipart body: head (model part + file part header), file in chunks, tail. */
+static esp_err_t cap_im_attachment_stt_upload(esp_http_client_handle_t client,
+                                              const char *head,
+                                              size_t head_len,
+                                              const char *tail,
+                                              size_t tail_len,
+                                              FILE *file,
+                                              size_t file_size,
+                                              char *chunk)
+{
+    esp_err_t err;
+
+    err = esp_http_client_open(client, (int)(head_len + file_size + tail_len));
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = cap_im_attachment_http_write_all(client, head, head_len);
+    while (err == ESP_OK) {
+        size_t nread = fread(chunk, 1, CAP_IM_ATTACHMENT_STT_CHUNK_BYTES, file);
+
+        if (nread == 0) {
+            err = ferror(file) ? ESP_FAIL : ESP_OK;
+            break;
+        }
+        err = cap_im_attachment_http_write_all(client, chunk, nread);
+    }
+    if (err == ESP_OK) {
+        err = cap_im_attachment_http_write_all(client, tail, tail_len);
+    }
+    if (err == ESP_OK && esp_http_client_fetch_headers(client) < 0) {
+        err = ESP_FAIL;
+    }
+    return err;
+}
+
+esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
+                                            const char *base_url,
+                                            const char *api_key,
+                                            const char *model,
+                                            const char *path,
+                                            const char *mime,
+                                            char **out_text,
+                                            char *err_buf,
+                                            size_t err_buf_size)
+{
+    static const char tail[] = "\r\n--" CAP_IM_ATTACHMENT_STT_BOUNDARY "--\r\n";
+    struct stat st = {0};
+    esp_http_client_config_t config = {0};
+    esp_http_client_handle_t client = NULL;
+    FILE *file = NULL;
+    char *buf = NULL;
+    char *auth = NULL;
+    char url[384];
+    char head[512];
+    cJSON *root = NULL;
+    const char *text = NULL;
+    size_t base_len;
+    int written;
+    int head_len;
+    int status = 0;
+    int resp_len = 0;
+    esp_err_t err;
+
+    if (!log_tag || !base_url || !base_url[0] || !api_key || !api_key[0] || !model || !model[0] ||
+            !path || !out_text || !err_buf || err_buf_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_text = NULL;
+    err_buf[0] = '\0';
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        snprintf(err_buf, err_buf_size, "Audiodatei nicht lesbar");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    base_len = strlen(base_url);
+    while (base_len > 0 && base_url[base_len - 1] == '/') {
+        base_len--;
+    }
+    written = snprintf(url, sizeof(url), "%.*s/audio/transcriptions", (int)base_len, base_url);
+    if (written < 0 || (size_t)written >= sizeof(url)) {
+        snprintf(err_buf, err_buf_size, "stt_base_url zu lang");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    head_len = snprintf(head, sizeof(head),
+                        "--" CAP_IM_ATTACHMENT_STT_BOUNDARY "\r\n"
+                        "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+                        "%s\r\n"
+                        "--" CAP_IM_ATTACHMENT_STT_BOUNDARY "\r\n"
+                        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+                        "Content-Type: %s\r\n\r\n",
+                        model,
+                        cap_im_attachment_basename(path),
+                        mime && mime[0] ? mime : "application/octet-stream");
+    if (head_len < 0 || (size_t)head_len >= sizeof(head)) {
+        snprintf(err_buf, err_buf_size, "Multipart-Header zu lang");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    buf = malloc(CAP_IM_ATTACHMENT_STT_BUF_BYTES);
+    if (!buf || asprintf(&auth, "Bearer %s", api_key) < 0) {
+        free(buf);
+        snprintf(err_buf, err_buf_size, "kein Speicher");
+        return ESP_ERR_NO_MEM;
+    }
+
+    file = fopen(path, "rb");
+    if (!file) {
+        free(auth);
+        free(buf);
+        snprintf(err_buf, err_buf_size, "Audiodatei nicht lesbar");
+        return ESP_FAIL;
+    }
+
+    config.url = url;
+    config.method = HTTP_METHOD_POST;
+    config.timeout_ms = CAP_IM_ATTACHMENT_STT_TIMEOUT_MS;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 2048;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    client = esp_http_client_init(&config);
+    if (!client) {
+        fclose(file);
+        free(auth);
+        free(buf);
+        snprintf(err_buf, err_buf_size, "HTTP-Client-Init fehlgeschlagen");
+        return ESP_FAIL;
+    }
+    esp_http_client_set_header(client, "Content-Type",
+                               "multipart/form-data; boundary=" CAP_IM_ATTACHMENT_STT_BOUNDARY);
+    esp_http_client_set_header(client, "Authorization", auth);
+
+    err = cap_im_attachment_stt_upload(client, head, (size_t)head_len, tail, sizeof(tail) - 1,
+                                       file, (size_t)st.st_size, buf);
+    if (err == ESP_OK) {
+        status = esp_http_client_get_status_code(client);
+        resp_len = esp_http_client_read_response(client, buf, CAP_IM_ATTACHMENT_STT_BUF_BYTES - 1);
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    fclose(file);
+    free(auth);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(log_tag, "STT request failed: url=%s err=%s", url, esp_err_to_name(err));
+        snprintf(err_buf, err_buf_size, "Verbindung fehlgeschlagen (%s)", esp_err_to_name(err));
+        free(buf);
+        return err;
+    }
+    buf[resp_len > 0 ? resp_len : 0] = '\0';
+
+    root = cJSON_Parse(buf);
+    if (status < 200 || status >= 300) {
+        cJSON *error_json = cJSON_GetObjectItem(root, "error");
+        const char *api_msg = cJSON_GetStringValue(cJSON_GetObjectItem(error_json, "message"));
+
+        ESP_LOGW(log_tag, "STT HTTP %d: %.256s", status, buf);
+        snprintf(err_buf, err_buf_size, "HTTP %d%s%s", status, api_msg ? ": " : "", api_msg ? api_msg : "");
+        err = ESP_FAIL;
+    } else {
+        text = cJSON_GetStringValue(cJSON_GetObjectItem(root, "text"));
+        if (!text) {
+            ESP_LOGW(log_tag, "STT response without text: %.256s", buf);
+            snprintf(err_buf, err_buf_size, "ungültige Antwort");
+            err = ESP_ERR_INVALID_RESPONSE;
+        } else if (!(*out_text = strdup(text))) {
+            snprintf(err_buf, err_buf_size, "kein Speicher");
+            err = ESP_ERR_NO_MEM;
+        }
+    }
+
+    cJSON_Delete(root);
+    free(buf);
+    return err;
 }
 
 char *cap_im_attachment_build_payload_json(

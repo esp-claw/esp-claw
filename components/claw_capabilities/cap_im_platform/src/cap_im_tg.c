@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -48,6 +49,8 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_MEDIA_GROUP_ID_LEN     32
 #define CAP_IM_TG_MEDIA_KIND_LEN         16
 #define CAP_IM_TG_MEDIA_CAPTION_LEN      256
+#define CAP_IM_TG_STT_MAX_BYTES          (2 * 1024 * 1024)
+#define CAP_IM_TG_VOICE_PREFIX           "[Sprachnachricht]"
 
 typedef struct {
     char *buf;
@@ -95,6 +98,9 @@ typedef struct {
 typedef struct {
     char bot_token[192];
     char attachment_root_dir[128];
+    char stt_base_url[320];
+    char stt_api_key[320];
+    char stt_model[64];
     size_t max_inbound_file_bytes;
     bool enable_inbound_attachments;
     TaskHandle_t poll_task;
@@ -586,6 +592,73 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     return copy;
 }
 
+static void cap_im_tg_send_typing(const char *chat_id);
+
+/* Publishes a voice/audio message to the agent as text: optional caption line, then the prefixed body. */
+static void cap_im_tg_publish_voice_text(const char *chat_id,
+                                         const char *sender_id,
+                                         const char *message_id,
+                                         const char *caption,
+                                         const char *body)
+{
+    bool has_caption = caption && caption[0];
+    size_t content_len = (has_caption ? strlen(caption) + 1 : 0) + sizeof(CAP_IM_TG_VOICE_PREFIX) + 1 +
+                         strlen(body);
+    char *content = malloc(content_len);
+    esp_err_t err;
+
+    if (!content) {
+        ESP_LOGW(TAG, "Telegram voice text alloc failed: message=%s", message_id);
+        return;
+    }
+    snprintf(content, content_len, "%s%s" CAP_IM_TG_VOICE_PREFIX " %s",
+             has_caption ? caption : "", has_caption ? "\n" : "", body);
+    err = cap_im_tg_publish_inbound_text(chat_id, sender_id, message_id, content);
+    free(content);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Telegram voice text publish failed: message=%s err=%s",
+                 message_id, esp_err_to_name(err));
+        return;
+    }
+    cap_im_tg_send_typing(chat_id);
+}
+
+static void cap_im_tg_transcribe_and_publish(const char *chat_id,
+                                             const char *sender_id,
+                                             const char *message_id,
+                                             const char *caption,
+                                             const char *mime,
+                                             const char *path)
+{
+    char reason[192];
+    char body[256];
+    char *text = NULL;
+    esp_err_t err;
+
+    cap_im_tg_send_typing(chat_id);
+    err = cap_im_attachment_transcribe_file(TAG,
+                                            s_tg.stt_base_url,
+                                            s_tg.stt_api_key,
+                                            s_tg.stt_model,
+                                            path,
+                                            mime,
+                                            &text,
+                                            reason,
+                                            sizeof(reason));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Telegram voice transcription failed: message=%s err=%s reason=%s",
+                 message_id, esp_err_to_name(err), reason);
+        snprintf(body, sizeof(body), "(konnte nicht transkribiert werden: %s)", reason);
+        cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption, body);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Telegram voice transcribed: message=%s chars=%u", message_id, (unsigned int)strlen(text));
+    cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
+                                 text[0] ? text : "(leere Transkription)");
+    free(text);
+}
+
 static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                            const char *sender_id,
                                            const char *message_id,
@@ -642,6 +715,8 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                                  s_tg.attachment_root_dir,
                                                  download_url,
                                                  saved_path,
+                                                 strcmp(content_type, "audio") == 0 ?
+                                                 MIN(s_tg.max_inbound_file_bytes, CAP_IM_TG_STT_MAX_BYTES) :
                                                  s_tg.max_inbound_file_bytes,
                                                  &bytes);
     if (err != ESP_OK) {
@@ -658,7 +733,9 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                         attachment_kind,
                                         saved_path,
                                         caption);
-    if (!grouped && caption && caption[0]) {
+    if (strcmp(content_type, "audio") == 0) {
+        cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, saved_path);
+    } else if (!grouped && caption && caption[0]) {
         size_t content_len = strlen(caption) + strlen(saved_path) + 64;
         char *content = malloc(content_len);
 
@@ -748,6 +825,14 @@ static void cap_im_tg_attachment_task(void *arg)
                              job->attachment_kind,
                              job->message_id,
                              esp_err_to_name(err));
+                    if (strcmp(job->content_type, "audio") == 0) {
+                        char body[96];
+
+                        snprintf(body, sizeof(body), "(konnte nicht heruntergeladen werden: %s)",
+                                 esp_err_to_name(err));
+                        cap_im_tg_publish_voice_text(job->chat_id, job->sender_id, job->message_id,
+                                                     job->caption, body);
+                    }
                 }
                 cap_im_tg_free_attachment_job(job);
                 cap_im_tg_log_stack_watermark("tg_attachment");
@@ -847,6 +932,8 @@ static void cap_im_tg_handle_update(cJSON *update_json)
     cJSON *text_json;
     cJSON *document_json;
     cJSON *photo_json;
+    cJSON *voice_json;
+    bool is_voice;
     const char *caption = NULL;
     const char *media_group_id = NULL;
     char update_key[32];
@@ -941,6 +1028,40 @@ static void cap_im_tg_handle_update(cJSON *update_json)
                                        caption,
                                        "file",
                                        media_group_id);
+        }
+    }
+
+    voice_json = cJSON_GetObjectItem(message_json, "voice");
+    is_voice = cJSON_IsObject(voice_json);
+    if (!is_voice) {
+        voice_json = cJSON_GetObjectItem(message_json, "audio");
+    }
+    if (s_tg.enable_inbound_attachments && cJSON_IsObject(voice_json)) {
+        const char *file_id = cJSON_GetStringValue(cJSON_GetObjectItem(voice_json, "file_id"));
+        const char *file_name = cJSON_GetStringValue(cJSON_GetObjectItem(voice_json, "file_name"));
+        const char *mime = cJSON_GetStringValue(cJSON_GetObjectItem(voice_json, "mime_type"));
+        cJSON *file_size_json = cJSON_GetObjectItem(voice_json, "file_size");
+
+        ESP_LOGI(TAG, "Telegram %s message=%s chat=%s", is_voice ? "voice" : "audio", message_id, chat_id);
+
+        if (!s_tg.stt_api_key[0]) {
+            cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
+                                         "Sprachnachrichten sind nicht konfiguriert (stt_api_key fehlt)");
+        } else if (cJSON_IsNumber(file_size_json) && file_size_json->valuedouble > CAP_IM_TG_STT_MAX_BYTES) {
+            cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
+                                         "(zu groß für die Transkription, maximal 2 MB)");
+        } else if (file_id && file_id[0]) {
+            /* Telegram voice is OGG/Opus stored as .oga; STT APIs accept it only as .ogg. */
+            cap_im_tg_queue_attachment(chat_id,
+                                       sender_id,
+                                       message_id,
+                                       is_voice ? "voice" : "audio",
+                                       file_id,
+                                       is_voice ? "voice.ogg" : file_name,
+                                       is_voice ? "audio/ogg" : mime,
+                                       caption,
+                                       "audio",
+                                       NULL);
         }
     }
 
@@ -1723,7 +1844,7 @@ static esp_err_t cap_im_tg_gateway_start(void)
     }
     ok = claw_task_create(&(claw_task_config_t){
                               .name = "tg_attach",
-                              .stack_size = 8192,
+                              .stack_size = 10240,
                               .priority = 5,
                               .core_id = tskNO_AFFINITY,
                               .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
@@ -1998,6 +2119,22 @@ esp_err_t cap_im_tg_set_token(const char *bot_token)
     s_tg.next_update_id = 0;
     memset(s_tg.seen_update_keys, 0, sizeof(s_tg.seen_update_keys));
     s_tg.seen_update_idx = 0;
+    return ESP_OK;
+}
+
+esp_err_t cap_im_tg_set_stt_config(const char *base_url, const char *api_key, const char *model)
+{
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!base_url || !api_key || !model) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    strlcpy(s_tg.stt_base_url, base_url, sizeof(s_tg.stt_base_url));
+    strlcpy(s_tg.stt_api_key, api_key, sizeof(s_tg.stt_api_key));
+    strlcpy(s_tg.stt_model, model, sizeof(s_tg.stt_model));
     return ESP_OK;
 }
 
