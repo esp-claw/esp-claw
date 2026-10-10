@@ -28,6 +28,7 @@ export type AppConfig = {
   feishu_app_id: string;
   feishu_app_secret: string;
   tg_bot_token: string;
+  tg_allowed_user_ids: string;
   wechat_token: string;
   wechat_base_url: string;
   wechat_cdn_base_url: string;
@@ -35,15 +36,31 @@ export type AppConfig = {
   search_brave_key: string;
   search_tavily_key: string;
   search_http_allowlist: string;
+  ssh_hosts: string;
+  wol_targets: string;
+  stt_base_url: string;
+  stt_api_key: string;
+  stt_model: string;
   enabled_cap_groups: string;
   llm_visible_cap_groups: string;
   enabled_lua_modules: string;
   time_timezone: string;
+  webdav_user: string;
+  webdav_password: string;
 };
 
 /** Server-side configuration groups (must stay in sync with
  * CONFIG_FIELDS in http_server_config_api.c). */
-export type ConfigGroup = 'wifi' | 'llm' | 'im' | 'search' | 'capabilities' | 'skills' | 'time';
+export type ConfigGroup =
+  | 'wifi'
+  | 'llm'
+  | 'im'
+  | 'search'
+  | 'stt'
+  | 'capabilities'
+  | 'skills'
+  | 'time'
+  | 'webdav';
 
 export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   wifi: ['wifi_ssid', 'wifi_password', 'ap_ssid', 'ap_password', 'ap_behavior'],
@@ -68,15 +85,18 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
     'feishu_app_id',
     'feishu_app_secret',
     'tg_bot_token',
+    'tg_allowed_user_ids',
     'wechat_token',
     'wechat_base_url',
     'wechat_cdn_base_url',
     'wechat_account_id',
   ],
   search: ['search_brave_key', 'search_tavily_key', 'search_http_allowlist'],
-  capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups'],
+  stt: ['stt_base_url', 'stt_api_key', 'stt_model'],
+  capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups', 'ssh_hosts', 'wol_targets'],
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],
+  webdav: ['webdav_user', 'webdav_password'],
 };
 
 export function blankConfig(): Partial<AppConfig> {

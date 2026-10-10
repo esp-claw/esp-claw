@@ -348,7 +348,8 @@ function isHttpUrl(value: string): boolean {
 }
 
 function isTelegramToken(value: string): boolean {
-  return /^\d+:[A-Za-z0-9_-]{20,}$/.test(value);
+  /* GET /api/config returns stored secrets masked; posting the mask keeps them. */
+  return value === '********' || /^\d+:[A-Za-z0-9_-]{20,}$/.test(value);
 }
 
 const WechatWizardPanel: Component<{

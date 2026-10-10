@@ -1,0 +1,3 @@
+dependencies:
+  david-cermak/libssh:
+    version: "0.12.2"

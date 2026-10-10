@@ -43,6 +43,7 @@ typedef struct {
     char feishu_app_id[64];
     char feishu_app_secret[APP_CONFIG_STR_LEN];
     char tg_bot_token[APP_CONFIG_STR_LEN];
+    char tg_allowed_user_ids[APP_CONFIG_STR_LEN];
     char wechat_token[APP_CONFIG_STR_LEN];
     char wechat_base_url[APP_CONFIG_STR_LEN];
     char wechat_cdn_base_url[APP_CONFIG_STR_LEN];
@@ -50,10 +51,17 @@ typedef struct {
     char search_brave_key[APP_CONFIG_STR_LEN];
     char search_tavily_key[APP_CONFIG_STR_LEN];
     char search_http_allowlist[APP_CONFIG_STR_LEN];
+    char ssh_hosts[APP_CLAW_SSH_HOSTS_LEN];
+    char wol_targets[APP_CLAW_WOL_TARGETS_LEN];
+    char stt_base_url[APP_CONFIG_STR_LEN];
+    char stt_api_key[APP_CONFIG_STR_LEN];
+    char stt_model[64];
     char enabled_cap_groups[APP_CONFIG_STR_LEN];
     char llm_visible_cap_groups[APP_CONFIG_STR_LEN];
     char enabled_lua_modules[APP_CONFIG_STR_LEN];
     char time_timezone[APP_CONFIG_TIMEZONE_LEN];
+    char webdav_user[64];
+    char webdav_password[64];
 } app_config_t;
 
 esp_err_t app_config_init(void);

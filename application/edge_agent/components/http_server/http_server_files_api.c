@@ -188,62 +188,29 @@ static esp_err_t files_upload_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Parent directory not found");
     }
 
-    FILE *file = fopen(full_path, "wb");
-    if (!file) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create file");
+    if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Path is a directory");
     }
 
-    char *scratch = http_server_alloc_scratch_buffer();
-    if (!scratch) {
-        fclose(file);
-        unlink(full_path);
-        httpd_resp_send_500(req);
-        return ESP_ERR_NO_MEM;
+    /* Receive into a temp file and swap it in afterwards, so a failed upload
+     * never truncates or deletes an existing file. */
+    char tmp_path[HTTP_SERVER_PATH_MAX];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s" HTTP_SERVER_TMP_SUFFIX, full_path) >= (int)sizeof(tmp_path)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Path too long");
+    }
+    int rc = http_server_recv_to_file(req, tmp_path);
+    if (rc != 0) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   rc == ENOSPC ? "Upload failed: not enough space" : "Upload failed");
+    }
+    if (http_server_replace_file(tmp_path, full_path) != 0) {
+        unlink(tmp_path);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to replace file");
     }
 
-    int remaining = req->content_len;
-    while (remaining > 0) {
-        int chunk = remaining > HTTP_SERVER_SCRATCH_SIZE ? HTTP_SERVER_SCRATCH_SIZE : remaining;
-        int received = httpd_req_recv(req, scratch, chunk);
-        if (received <= 0 || fwrite(scratch, 1, received, file) != (size_t)received) {
-            free(scratch);
-            fclose(file);
-            unlink(full_path);
-            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
-        }
-        remaining -= received;
-    }
-
-    free(scratch);
-    fclose(file);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
-}
-
-static int rmdir_recursive(const char *path)
-{
-    DIR *dir = opendir(path);
-    if (!dir) return -1;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        char child[HTTP_SERVER_PATH_MAX];
-        strlcpy(child, path, sizeof(child));
-        strlcat(child, "/", sizeof(child));
-        strlcat(child, entry->d_name, sizeof(child));
-
-        struct stat st = {0};
-        if (stat(child, &st) != 0) { closedir(dir); return -1; }
-
-        int rc = S_ISDIR(st.st_mode) ? rmdir_recursive(child) : unlink(child);
-        if (rc != 0) { closedir(dir); return -1; }
-    }
-    closedir(dir);
-    return rmdir(path);
 }
 
 static esp_err_t files_delete_handler(httpd_req_t *req)
@@ -269,7 +236,7 @@ static esp_err_t files_delete_handler(httpd_req_t *req)
 
     if (S_ISDIR(st.st_mode)) {
         if (recursive) {
-            if (rmdir_recursive(full_path) != 0) {
+            if (http_server_rmdir_recursive(full_path) != 0) {
                 return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Recursive delete failed");
             }
         } else {

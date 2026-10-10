@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "src/cap_wol.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        claw_cap
+    PRIV_REQUIRES
+        esp_netif
+        freertos
+        lwip
+)

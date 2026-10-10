@@ -14,20 +14,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #include "cJSON.h"
+#include "claw_core.h"
 #include "claw_task.h"
 #include "claw_event_publisher.h"
 #include "esp_crt_bundle.h"
 #include "esp_attr.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "cap_im_tg";
@@ -35,6 +39,9 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_API_BASE            "https://api.telegram.org"
 #define CAP_IM_TG_HTTP_RESP_INIT      2048
 #define CAP_IM_TG_MAX_MSG_LEN         4096
+/* Rich messages allow 32768 characters and 500 blocks; stay well below both. */
+#define CAP_IM_TG_RICH_MAX_BYTES      30000
+#define CAP_IM_TG_RICH_MAX_LINES      400
 #define CAP_IM_TG_POLL_TIMEOUT_S      20
 #define CAP_IM_TG_RETRY_DELAY_MS      3000
 #define CAP_IM_TG_ATTACHMENT_QUEUE_LEN 8
@@ -48,6 +55,16 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_MEDIA_GROUP_ID_LEN     32
 #define CAP_IM_TG_MEDIA_KIND_LEN         16
 #define CAP_IM_TG_MEDIA_CAPTION_LEN      256
+#define CAP_IM_TG_MAX_ALLOWED_USERS      16
+#define CAP_IM_TG_STT_MAX_BYTES          (2 * 1024 * 1024)
+#define CAP_IM_TG_VOICE_PREFIX           "[Sprachnachricht]"
+#define CAP_IM_TG_CONFIRM_PREFIX         "cf:"
+#define CAP_IM_TG_CONFIRM_NONCE_LEN      16
+#define CAP_IM_TG_BUSY_LABEL_LEN         128
+#define CAP_IM_TG_BUSY_LABEL_MAX         120
+#define CAP_IM_TG_DRAFT_INTERVAL_MS      20000
+#define CAP_IM_TG_TYPING_INTERVAL_MS     4000
+#define CAP_IM_TG_BUSY_EXPIRY_MS         (5 * 60 * 1000)
 
 typedef struct {
     char *buf;
@@ -95,20 +112,55 @@ typedef struct {
 typedef struct {
     char bot_token[192];
     char attachment_root_dir[128];
+    char stt_base_url[320];
+    char stt_api_key[320];
+    char stt_model[64];
     size_t max_inbound_file_bytes;
     bool enable_inbound_attachments;
     TaskHandle_t poll_task;
     TaskHandle_t attachment_task;
+    TaskHandle_t busy_task;
     QueueHandle_t attachment_queue;
     volatile bool stop_requested;
     int64_t next_update_id;
     uint64_t seen_update_keys[CAP_IM_TG_DEDUP_CACHE_SIZE];
     size_t seen_update_idx;
     cap_im_tg_media_group_t media_groups[CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS];
+    int64_t allowed_user_ids[CAP_IM_TG_MAX_ALLOWED_USERS];
+    size_t allowed_user_count;
 } cap_im_tg_state_t;
+
+/* The pending inline-button confirmation; nonce is empty when none is pending or it was answered. */
+typedef struct {
+    SemaphoreHandle_t lock;
+    SemaphoreHandle_t answered;
+    char nonce[CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
+    char chat_id[32];
+    int choice_count;
+    int choice;
+} cap_im_tg_confirm_t;
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
 static bool s_tg_initialized;
+static bool s_tg_rich_unsupported;
+static cap_im_tg_confirm_t s_confirm;
+static portMUX_TYPE s_confirm_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* What the agent is doing for chat_id (empty when idle), shown as a draft bubble or typing dots.
+ * request_id 0 marks work before the agent request exists (voice transcription). */
+typedef struct {
+    char chat_id[32];
+    char label[CAP_IM_TG_BUSY_LABEL_LEN];
+    uint32_t request_id;
+    int64_t draft_id;
+    int64_t expires_ms;
+    int64_t sent_ms;
+    bool dirty;
+} cap_im_tg_busy_t;
+
+static cap_im_tg_busy_t s_busy;
+static portMUX_TYPE s_busy_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_tg_draft_unsupported;
 
 static void cap_im_tg_init_defaults(void)
 {
@@ -119,6 +171,8 @@ static void cap_im_tg_init_defaults(void)
     s_tg.max_inbound_file_bytes = 2 * 1024 * 1024;
     s_tg.enable_inbound_attachments = false;
     s_tg.next_update_id = 0;
+    s_confirm.lock = xSemaphoreCreateMutex();
+    s_confirm.answered = xSemaphoreCreateBinary();
     s_tg_initialized = true;
 }
 
@@ -195,9 +249,10 @@ static esp_err_t cap_im_tg_http_event_handler(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
-static esp_err_t cap_im_tg_api_call(const char *method,
-                                    const char *body_json,
-                                    char **out_response)
+static esp_err_t cap_im_tg_api_call_status(const char *method,
+                                           const char *body_json,
+                                           char **out_response,
+                                           int *out_status)
 {
     cap_im_tg_http_resp_t resp = {0};
     esp_http_client_config_t config = {0};
@@ -258,6 +313,9 @@ static esp_err_t cap_im_tg_api_call(const char *method,
     status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     free(url);
+    if (out_status) {
+        *out_status = status;
+    }
 
     if (err != ESP_OK) {
         free(resp.buf);
@@ -272,6 +330,13 @@ static esp_err_t cap_im_tg_api_call(const char *method,
 
     *out_response = resp.buf;
     return ESP_OK;
+}
+
+static esp_err_t cap_im_tg_api_call(const char *method,
+                                    const char *body_json,
+                                    char **out_response)
+{
+    return cap_im_tg_api_call_status(method, body_json, out_response, NULL);
 }
 
 static esp_err_t cap_im_tg_publish_inbound_text(const char *chat_id,
@@ -586,6 +651,71 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     return copy;
 }
 
+static void cap_im_tg_busy_show(const char *chat_id, bool start, uint32_t request_id, const char *label);
+
+/* Publishes a voice/audio message to the agent as text: optional caption line, then the prefixed body. */
+static void cap_im_tg_publish_voice_text(const char *chat_id,
+                                         const char *sender_id,
+                                         const char *message_id,
+                                         const char *caption,
+                                         const char *body)
+{
+    bool has_caption = caption && caption[0];
+    size_t content_len = (has_caption ? strlen(caption) + 1 : 0) + sizeof(CAP_IM_TG_VOICE_PREFIX) + 1 +
+                         strlen(body);
+    char *content = malloc(content_len);
+    esp_err_t err;
+
+    if (!content) {
+        ESP_LOGW(TAG, "Telegram voice text alloc failed: message=%s", message_id);
+        return;
+    }
+    snprintf(content, content_len, "%s%s" CAP_IM_TG_VOICE_PREFIX " %s",
+             has_caption ? caption : "", has_caption ? "\n" : "", body);
+    err = cap_im_tg_publish_inbound_text(chat_id, sender_id, message_id, content);
+    free(content);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Telegram voice text publish failed: message=%s err=%s",
+                 message_id, esp_err_to_name(err));
+    }
+}
+
+static void cap_im_tg_transcribe_and_publish(const char *chat_id,
+                                             const char *sender_id,
+                                             const char *message_id,
+                                             const char *caption,
+                                             const char *mime,
+                                             const char *path)
+{
+    char reason[192];
+    char body[256];
+    char *text = NULL;
+    esp_err_t err;
+
+    cap_im_tg_busy_show(chat_id, true, 0, "🎙 Transkribiere Sprachnachricht…");
+    err = cap_im_attachment_transcribe_file(TAG,
+                                            s_tg.stt_base_url,
+                                            s_tg.stt_api_key,
+                                            s_tg.stt_model,
+                                            path,
+                                            mime,
+                                            &text,
+                                            reason,
+                                            sizeof(reason));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Telegram voice transcription failed: message=%s err=%s reason=%s",
+                 message_id, esp_err_to_name(err), reason);
+        snprintf(body, sizeof(body), "(konnte nicht transkribiert werden: %s)", reason);
+        cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption, body);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Telegram voice transcribed: message=%s chars=%u", message_id, (unsigned int)strlen(text));
+    cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
+                                 text[0] ? text : "(leere Transkription)");
+    free(text);
+}
+
 static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                            const char *sender_id,
                                            const char *message_id,
@@ -642,6 +772,8 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                                  s_tg.attachment_root_dir,
                                                  download_url,
                                                  saved_path,
+                                                 strcmp(content_type, "audio") == 0 ?
+                                                 MIN(s_tg.max_inbound_file_bytes, CAP_IM_TG_STT_MAX_BYTES) :
                                                  s_tg.max_inbound_file_bytes,
                                                  &bytes);
     if (err != ESP_OK) {
@@ -658,7 +790,9 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                         attachment_kind,
                                         saved_path,
                                         caption);
-    if (!grouped && caption && caption[0]) {
+    if (strcmp(content_type, "audio") == 0) {
+        cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, saved_path);
+    } else if (!grouped && caption && caption[0]) {
         size_t content_len = strlen(caption) + strlen(saved_path) + 64;
         char *content = malloc(content_len);
 
@@ -748,6 +882,14 @@ static void cap_im_tg_attachment_task(void *arg)
                              job->attachment_kind,
                              job->message_id,
                              esp_err_to_name(err));
+                    if (strcmp(job->content_type, "audio") == 0) {
+                        char body[96];
+
+                        snprintf(body, sizeof(body), "(konnte nicht heruntergeladen werden: %s)",
+                                 esp_err_to_name(err));
+                        cap_im_tg_publish_voice_text(job->chat_id, job->sender_id, job->message_id,
+                                                     job->caption, body);
+                    }
                 }
                 cap_im_tg_free_attachment_job(job);
                 cap_im_tg_log_stack_watermark("tg_attachment");
@@ -835,9 +977,128 @@ static void cap_im_tg_send_typing(const char *chat_id)
     }
 }
 
+static bool cap_im_tg_user_allowed(int64_t user_id)
+{
+    for (size_t i = 0; i < s_tg.allowed_user_count; i++) {
+        if (s_tg.allowed_user_ids[i] == user_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cap_im_tg_answer_callback(const char *query_id, const char *text)
+{
+    cJSON *body = cJSON_CreateObject();
+    char *body_json = NULL;
+    char *resp = NULL;
+
+    cJSON_AddStringToObject(body, "callback_query_id", query_id);
+    cJSON_AddStringToObject(body, "text", text);
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json || cap_im_tg_api_call("answerCallbackQuery", body_json, &resp) != ESP_OK) {
+        ESP_LOGW(TAG, "Telegram answerCallbackQuery failed");
+    }
+    free(body_json);
+    free(resp);
+}
+
+/* Inline button press on a cap_im_tg_confirm() prompt: "cf:<nonce>:<button index>". */
+static void cap_im_tg_handle_callback_query(cJSON *query_json)
+{
+    const char *query_id = cJSON_GetStringValue(cJSON_GetObjectItem(query_json, "id"));
+    const char *data = cJSON_GetStringValue(cJSON_GetObjectItem(query_json, "data"));
+    cJSON *from_id_json = cJSON_GetObjectItem(cJSON_GetObjectItem(query_json, "from"), "id");
+    cJSON *chat_id_json = cJSON_GetObjectItem(
+                              cJSON_GetObjectItem(cJSON_GetObjectItem(query_json, "message"), "chat"), "id");
+    const size_t prefix_len = strlen(CAP_IM_TG_CONFIRM_PREFIX);
+    char chat_id[32] = "";
+    char decision = '\0';
+    bool matched = false;
+    bool rejected = false;
+
+    if (!query_id) {
+        return;
+    }
+    if (!cJSON_IsNumber(from_id_json) || !cap_im_tg_user_allowed((int64_t)from_id_json->valuedouble)) {
+        ESP_LOGW(TAG, "Telegram callback dropped, sender not allowed: user=%" PRId64,
+                 cJSON_IsNumber(from_id_json) ? (int64_t)from_id_json->valuedouble : 0);
+        return;
+    }
+    if (cJSON_IsNumber(chat_id_json)) {
+        snprintf(chat_id, sizeof(chat_id), "%" PRId64, (int64_t)chat_id_json->valuedouble);
+    }
+    if (data && strlen(data) == prefix_len + CAP_IM_TG_CONFIRM_NONCE_LEN + 2 &&
+            strncmp(data, CAP_IM_TG_CONFIRM_PREFIX, prefix_len) == 0 &&
+            data[prefix_len + CAP_IM_TG_CONFIRM_NONCE_LEN] == ':') {
+        decision = data[prefix_len + CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
+    }
+
+    if (decision >= '0' && decision <= '9') {
+        taskENTER_CRITICAL(&s_confirm_mux);
+        if (s_confirm.nonce[0] && decision - '0' < s_confirm.choice_count &&
+                strncmp(data + prefix_len, s_confirm.nonce, CAP_IM_TG_CONFIRM_NONCE_LEN) == 0 &&
+                strcmp(chat_id, s_confirm.chat_id) == 0) {
+            s_confirm.choice = decision - '0';
+            s_confirm.nonce[0] = '\0';
+            matched = true;
+            rejected = s_confirm.choice == s_confirm.choice_count - 1;
+        }
+        taskEXIT_CRITICAL(&s_confirm_mux);
+    }
+
+    if (matched) {
+        xSemaphoreGive(s_confirm.answered);
+        ESP_LOGI(TAG, "Telegram confirmation button %c by user=%" PRId64 " chat=%s",
+                 decision, (int64_t)from_id_json->valuedouble, chat_id);
+    }
+    cap_im_tg_answer_callback(query_id, !matched ? "Abgelaufen" : rejected ? "Abgebrochen" : "Wird ausgeführt");
+}
+
+/* /ssh is answered here instead of by a router rule so it also works on devices whose
+ * router_rules.json was seeded before the command existed. */
+static void cap_im_tg_handle_ssh_command(const char *chat_id, const char *text)
+{
+    const size_t output_size = 4096;
+    const char *args = text + strlen("/ssh");
+    cJSON *input = NULL;
+    char *input_json = NULL;
+    char *output = NULL;
+
+    if (*args == '@') {
+        args += strcspn(args, " ");
+    }
+    while (*args == ' ') {
+        args++;
+    }
+
+    input = cJSON_CreateObject();
+    cJSON_AddStringToObject(input, "command", args);
+    input_json = cJSON_PrintUnformatted(input);
+    cJSON_Delete(input);
+    output = calloc(1, output_size);
+    if (input_json && output) {
+        claw_cap_call("ssh_command", input_json,
+                      &(claw_cap_call_context_t) {
+                          .channel = "telegram",
+                          .chat_id = chat_id,
+                          .source_cap = "tg_gateway",
+                          .caller = CLAW_CAP_CALLER_SYSTEM,
+                      },
+                      output, output_size);
+        if (cap_im_tg_send_text(chat_id, output) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send /ssh reply");
+        }
+    }
+    free(input_json);
+    free(output);
+}
+
 static void cap_im_tg_handle_update(cJSON *update_json)
 {
     cJSON *update_id_json;
+    cJSON *callback_query_json;
     cJSON *message_json;
     cJSON *chat_json;
     cJSON *chat_id_json;
@@ -847,6 +1108,8 @@ static void cap_im_tg_handle_update(cJSON *update_json)
     cJSON *text_json;
     cJSON *document_json;
     cJSON *photo_json;
+    cJSON *voice_json;
+    bool is_voice;
     const char *caption = NULL;
     const char *media_group_id = NULL;
     char update_key[32];
@@ -860,8 +1123,7 @@ static void cap_im_tg_handle_update(cJSON *update_json)
     }
 
     update_id_json = cJSON_GetObjectItem(update_json, "update_id");
-    message_json = cJSON_GetObjectItem(update_json, "message");
-    if (!cJSON_IsNumber(update_id_json) || !cJSON_IsObject(message_json)) {
+    if (!cJSON_IsNumber(update_id_json)) {
         return;
     }
 
@@ -872,6 +1134,16 @@ static void cap_im_tg_handle_update(cJSON *update_json)
 
     snprintf(update_key, sizeof(update_key), "%" PRId64, update_id);
     if (cap_im_tg_dedup_check_and_record(update_key)) {
+        return;
+    }
+
+    callback_query_json = cJSON_GetObjectItem(update_json, "callback_query");
+    if (cJSON_IsObject(callback_query_json)) {
+        cap_im_tg_handle_callback_query(callback_query_json);
+        return;
+    }
+    message_json = cJSON_GetObjectItem(update_json, "message");
+    if (!cJSON_IsObject(message_json)) {
         return;
     }
 
@@ -893,6 +1165,13 @@ static void cap_im_tg_handle_update(cJSON *update_json)
         snprintf(sender_id, sizeof(sender_id), "%" PRId64, (int64_t)from_id_json->valuedouble);
     } else {
         sender_id[0] = '\0';
+    }
+    /* Gate before any download, typing indicator or publish. */
+    if (!cJSON_IsNumber(from_id_json) ||
+            !cap_im_tg_user_allowed((int64_t)from_id_json->valuedouble)) {
+        ESP_LOGW(TAG, "Telegram update dropped, sender not allowed: user=%s chat=%s",
+                 sender_id[0] ? sender_id : "(none)", chat_id);
+        return;
     }
     snprintf(message_id, sizeof(message_id), "%" PRId64, (int64_t)message_id_json->valuedouble);
 
@@ -944,13 +1223,51 @@ static void cap_im_tg_handle_update(cJSON *update_json)
         }
     }
 
+    voice_json = cJSON_GetObjectItem(message_json, "voice");
+    is_voice = cJSON_IsObject(voice_json);
+    if (!is_voice) {
+        voice_json = cJSON_GetObjectItem(message_json, "audio");
+    }
+    if (s_tg.enable_inbound_attachments && cJSON_IsObject(voice_json)) {
+        const char *file_id = cJSON_GetStringValue(cJSON_GetObjectItem(voice_json, "file_id"));
+        const char *file_name = cJSON_GetStringValue(cJSON_GetObjectItem(voice_json, "file_name"));
+        const char *mime = cJSON_GetStringValue(cJSON_GetObjectItem(voice_json, "mime_type"));
+        cJSON *file_size_json = cJSON_GetObjectItem(voice_json, "file_size");
+
+        ESP_LOGI(TAG, "Telegram %s message=%s chat=%s", is_voice ? "voice" : "audio", message_id, chat_id);
+
+        if (!s_tg.stt_api_key[0]) {
+            cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
+                                         "Sprachnachrichten sind nicht konfiguriert (stt_api_key fehlt)");
+        } else if (cJSON_IsNumber(file_size_json) && file_size_json->valuedouble > CAP_IM_TG_STT_MAX_BYTES) {
+            cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
+                                         "(zu groß für die Transkription, maximal 2 MB)");
+        } else if (file_id && file_id[0]) {
+            /* Telegram voice is OGG/Opus stored as .oga; STT APIs accept it only as .ogg. */
+            cap_im_tg_queue_attachment(chat_id,
+                                       sender_id,
+                                       message_id,
+                                       is_voice ? "voice" : "audio",
+                                       file_id,
+                                       is_voice ? "voice.ogg" : file_name,
+                                       is_voice ? "audio/ogg" : mime,
+                                       caption,
+                                       "audio",
+                                       NULL);
+        }
+    }
+
     text_json = cJSON_GetObjectItem(message_json, "text");
-    if (cJSON_IsString(text_json) && text_json->valuestring && text_json->valuestring[0]) {
+    if (cJSON_IsString(text_json) && text_json->valuestring &&
+            strncmp(text_json->valuestring, "/ssh", 4) == 0 &&
+            (text_json->valuestring[4] == '\0' || text_json->valuestring[4] == ' ' ||
+             text_json->valuestring[4] == '@')) {
+        cap_im_tg_handle_ssh_command(chat_id, text_json->valuestring);
+    } else if (cJSON_IsString(text_json) && text_json->valuestring && text_json->valuestring[0]) {
         if (cap_im_tg_publish_inbound_text(chat_id,
                                            sender_id,
                                            message_id,
                                            text_json->valuestring) == ESP_OK) {
-            cap_im_tg_send_typing(chat_id);
             ESP_LOGI(TAG, "Telegram inbound %s: %.48s%s",
                      chat_id,
                      text_json->valuestring,
@@ -978,6 +1295,8 @@ static esp_err_t cap_im_tg_poll_once(void)
     }
 
     cJSON_AddNumberToObject(body, "timeout", CAP_IM_TG_POLL_TIMEOUT_S);
+    cJSON_AddItemToObject(body, "allowed_updates",
+                          cJSON_CreateStringArray((const char *const[]) { "message", "callback_query" }, 2));
     if (s_tg.next_update_id > 0) {
         cJSON_AddNumberToObject(body, "offset", (double)s_tg.next_update_id);
     }
@@ -1312,6 +1631,113 @@ static esp_err_t cap_im_tg_send_text_chunk(const char *chat_id, const char *mess
     return err;
 }
 
+static esp_err_t cap_im_tg_send_rich_chunk(const char *chat_id, const char *markdown, int *out_status)
+{
+    cJSON *body = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err;
+
+    body = cJSON_CreateObject();
+    if (!body) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(body, "chat_id", chat_id);
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "rich_message"), "markdown", markdown);
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = cap_im_tg_api_call_status("sendRichMessage", body_json, &resp, out_status);
+    free(body_json);
+    free(resp);
+    return err;
+}
+
+/* GFM joins single newlines into one paragraph: end every non-blank line that is followed by
+ * another line with two spaces (hard break), except inside ```/~~~ fences and on table rows.
+ * Trailing spaces at the end of a block are ignored, so this leaves no artifacts. */
+static char *cap_im_tg_md_hard_breaks(const char *text)
+{
+    const char *line = text;
+    const char *p;
+    size_t lines = 1;
+    size_t off = 0;
+    char fence = 0;
+    char *out;
+
+    for (p = text; *p; p++) {
+        lines += *p == '\n';
+    }
+    out = malloc((size_t)(p - text) + 2 * lines + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    while (*line) {
+        const char *nl = strchr(line, '\n');
+        size_t line_len = nl ? (size_t)(nl - line) + 1 : strlen(line);
+
+        p = line + strspn(line, " ");
+        memcpy(out + off, line, line_len);
+        off += line_len;
+        if ((*p == '`' || *p == '~') && p[1] == *p && p[2] == *p) {
+            if (!fence) {
+                fence = *p;
+            } else if (*p == fence) {
+                fence = 0;
+            }
+        } else if (!fence && nl && nl[1] && p < nl && *p != '|') {
+            memcpy(out + off - 1, "  \n", 3);
+            off += 2;
+        }
+        line += line_len;
+    }
+    out[off] = '\0';
+    return out;
+}
+
+/* Length of the next rich chunk: all of it if it fits, else the last paragraph break (or line
+ * break) outside a ``` fence before the limits, else any line break, else a UTF-8 safe cut. */
+static size_t cap_im_tg_rich_chunk_len(const char *text, size_t len)
+{
+    size_t i;
+    size_t lines = 0;
+    size_t para = 0;
+    size_t line = 0;
+    size_t any = 0;
+    bool fence = false;
+
+    for (i = 0; i < len && i < CAP_IM_TG_RICH_MAX_BYTES; i++) {
+        if ((i == 0 || text[i - 1] == '\n') && strncmp(text + i + strspn(text + i, " "), "```", 3) == 0) {
+            fence = !fence;
+        }
+        if (text[i] != '\n') {
+            continue;
+        }
+        if (++lines > CAP_IM_TG_RICH_MAX_LINES) {
+            break;
+        }
+        any = i + 1;
+        if (!fence) {
+            line = i + 1;
+            if (i > 0 && text[i - 1] == '\n') {
+                para = i + 1;
+            }
+        }
+    }
+    if (i == len) {
+        return len;
+    }
+    if (para > i / 2) {
+        return para;
+    }
+    return line ? line : any ? any : claw_utils_utf8_prefix_len(text, CAP_IM_TG_RICH_MAX_BYTES);
+}
+
 static const char *cap_im_tg_basename(const char *path)
 {
     const char *slash = NULL;
@@ -1322,6 +1748,195 @@ static const char *cap_im_tg_basename(const char *path)
 
     slash = strrchr(path, '/');
     return slash ? slash + 1 : path;
+}
+
+/* The plain-text draft label for a tool call, cut UTF-8 safe to CAP_IM_TG_BUSY_LABEL_MAX bytes. */
+static void cap_im_tg_busy_tool_label(const char *tool, const char *args_json, char *out, size_t out_size)
+{
+    cJSON *args = args_json ? cJSON_Parse(args_json) : NULL;
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+    const char *arg = NULL;
+    const char *host = NULL;
+    char buf[256];
+    size_t len;
+
+    if (strcmp(tool, "web_search") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "query"));
+        snprintf(buf, sizeof(buf), "🔍 Websuche: „%s“", arg ? arg : "");
+    } else if (strcmp(tool, "http_request") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "url"));
+        arg = arg ? (strstr(arg, "://") ? strstr(arg, "://") + 3 : arg) : "";
+        snprintf(buf, sizeof(buf), "🌐 Rufe %.*s ab", (int)strcspn(arg, "/?#"), arg);
+    } else if (strcmp(tool, "ssh_exec") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "command"));
+        host = cJSON_GetStringValue(cJSON_GetObjectItem(args, "host"));
+        snprintf(buf, sizeof(buf), "🖥 SSH auf %s: %s", host ? host : "", arg ? arg : "");
+    } else if (strcmp(tool, "inspect_image") == 0) {
+        strlcpy(buf, "🖼 Analysiere Bild…", sizeof(buf));
+    } else if (strncmp(tool, "lua_run_script", 14) == 0) {
+        snprintf(buf, sizeof(buf), "⚙️ Lua: %s", cap_im_tg_basename(path));
+    } else if (strcmp(tool, "activate_skill") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "skill_id"));
+        snprintf(buf, sizeof(buf), "📚 Skill: %s", arg ? arg : "");
+    } else if (strcmp(tool, "wol_wake") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "target"));
+        snprintf(buf, sizeof(buf), "⏰ Wecke %s", arg ? arg : "");
+    } else if (strcmp(tool, "write_file") == 0 || strcmp(tool, "read_file") == 0) {
+        snprintf(buf, sizeof(buf), "📄 %s", cap_im_tg_basename(path));
+    } else if (strcmp(tool, "spawn_agent") == 0) {
+        strlcpy(buf, "🤖 Starte Subagent", sizeof(buf));
+    } else {
+        snprintf(buf, sizeof(buf), "🛠 %s", tool);
+    }
+    cJSON_Delete(args);
+
+    len = claw_utils_utf8_prefix_len(buf, CAP_IM_TG_BUSY_LABEL_MAX);
+    snprintf(out, out_size, "%.*s%s", (int)len, buf, buf[len] ? "…" : "");
+}
+
+static void cap_im_tg_busy_show(const char *chat_id, bool start, uint32_t request_id, const char *label)
+{
+    bool notify = false;
+    bool idle;
+    bool same_chat;
+
+    taskENTER_CRITICAL(&s_busy_mux);
+    idle = !s_busy.chat_id[0] || cap_im_tg_now_ms() >= s_busy.expires_ms;
+    same_chat = !idle && strcmp(s_busy.chat_id, chat_id) == 0;
+    /* A start never takes over from a running request; an update only touches the busy chat. */
+    if (start ? (idle || s_busy.request_id == 0) : same_chat) {
+        if (start) {
+            /* Keep the transcription draft id so Telegram animates into the request's draft. */
+            if (!same_chat || s_busy.request_id != 0 || request_id == 0) {
+                s_busy.draft_id = (int64_t)(esp_random() & 0x7fffffff) | 1;
+            }
+            s_busy.request_id = request_id;
+            strlcpy(s_busy.chat_id, chat_id, sizeof(s_busy.chat_id));
+        }
+        strlcpy(s_busy.label, label, sizeof(s_busy.label));
+        s_busy.expires_ms = cap_im_tg_now_ms() + CAP_IM_TG_BUSY_EXPIRY_MS;
+        s_busy.dirty = true;
+        notify = true;
+    }
+    taskEXIT_CRITICAL(&s_busy_mux);
+    if (notify && s_tg.busy_task) {
+        xTaskNotifyGive(s_tg.busy_task);
+    }
+}
+
+/* claw_core progress observer: runs on the agent task, so it only updates s_busy. */
+static void cap_im_tg_busy_progress(claw_core_progress_event_t event,
+                                    const claw_core_request_t *request,
+                                    const char *tool_name,
+                                    const char *args_json)
+{
+    bool targeted = request->target_channel && request->target_channel[0];
+    const char *channel = targeted ? request->target_channel : request->source_channel;
+    const char *chat_id = targeted ? request->target_chat_id : request->source_chat_id;
+    char label[CAP_IM_TG_BUSY_LABEL_LEN];
+
+    if (!channel || strcmp(channel, "telegram") != 0 || !chat_id || !chat_id[0]) {
+        return;
+    }
+    if (event == CLAW_CORE_PROGRESS_REQUEST_END) {
+        taskENTER_CRITICAL(&s_busy_mux);
+        if (s_busy.request_id == request->request_id) {
+            s_busy.chat_id[0] = '\0';
+        }
+        taskEXIT_CRITICAL(&s_busy_mux);
+        return;
+    }
+    if (event == CLAW_CORE_PROGRESS_TOOL_CALL && tool_name) {
+        cap_im_tg_busy_tool_label(tool_name, args_json, label, sizeof(label));
+    } else {
+        strlcpy(label, "💭 Denke nach…", sizeof(label));
+    }
+    cap_im_tg_busy_show(chat_id, event == CLAW_CORE_PROGRESS_REQUEST_START, request->request_id, label);
+}
+
+/* sendRichMessageDraft works in private chats only; the first rejection (other than rate
+ * limiting) switches to typing dots. */
+static void cap_im_tg_send_busy(const char *chat_id, int64_t draft_id, const char *label)
+{
+    cap_im_tg_html_buf_t html = {.buf = malloc(256), .cap = 256};
+    cJSON *body = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err = ESP_ERR_NO_MEM;
+    int status = 0;
+
+    if (!s_tg_draft_unsupported && html.buf &&
+            cap_im_tg_html_put(&html, "<tg-thinking>", strlen("<tg-thinking>")) &&
+            cap_im_tg_html_put_escaped(&html, label, strlen(label), false) &&
+            cap_im_tg_html_put(&html, "</tg-thinking>", strlen("</tg-thinking>")) &&
+            (body = cJSON_CreateObject()) != NULL) {
+        cJSON_AddNumberToObject(body, "chat_id", strtod(chat_id, NULL));
+        cJSON_AddNumberToObject(body, "draft_id", (double)draft_id);
+        cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "rich_message"), "html", html.buf);
+        body_json = cJSON_PrintUnformatted(body);
+        cJSON_Delete(body);
+        if (body_json) {
+            err = cap_im_tg_api_call_status("sendRichMessageDraft", body_json, &resp, &status);
+        }
+        free(body_json);
+        free(resp);
+        if (err == ESP_FAIL && status != 429) {
+            s_tg_draft_unsupported = true;
+            ESP_LOGI(TAG, "sendRichMessageDraft rejected, using typing dots until reboot");
+        }
+    }
+    free(html.buf);
+    if (s_tg_draft_unsupported) {
+        cap_im_tg_send_typing(chat_id);
+    }
+}
+
+static void cap_im_tg_busy_task(void *arg)
+{
+    char chat_id[sizeof(s_busy.chat_id)];
+    char label[CAP_IM_TG_BUSY_LABEL_LEN];
+    int64_t draft_id = 0;
+
+    (void)arg;
+
+    while (!s_tg.stop_requested) {
+        int64_t now;
+        bool confirm_pending;
+        bool due = false;
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        taskENTER_CRITICAL(&s_confirm_mux);
+        confirm_pending = s_confirm.nonce[0] != '\0';
+        taskEXIT_CRITICAL(&s_confirm_mux);
+
+        now = cap_im_tg_now_ms();
+        taskENTER_CRITICAL(&s_busy_mux);
+        if (s_busy.chat_id[0] && now >= s_busy.expires_ms) {
+            s_busy.chat_id[0] = '\0';
+        }
+        if (s_busy.chat_id[0] && confirm_pending) {
+            /* Sending the prompt removed the draft: show it again right after the answer. */
+            s_busy.dirty = true;
+        } else if (s_busy.chat_id[0] &&
+                   (s_busy.dirty || now - s_busy.sent_ms >= (s_tg_draft_unsupported ?
+                                                             CAP_IM_TG_TYPING_INTERVAL_MS :
+                                                             CAP_IM_TG_DRAFT_INTERVAL_MS))) {
+            strlcpy(chat_id, s_busy.chat_id, sizeof(chat_id));
+            strlcpy(label, s_busy.label, sizeof(label));
+            draft_id = s_busy.draft_id;
+            s_busy.sent_ms = now;
+            s_busy.dirty = false;
+            due = true;
+        }
+        taskEXIT_CRITICAL(&s_busy_mux);
+
+        if (due) {
+            cap_im_tg_send_busy(chat_id, draft_id, label);
+        }
+    }
+
+    s_tg.busy_task = NULL;
+    claw_task_delete(NULL);
 }
 
 static const char *cap_im_tg_guess_mime_type(const char *path, bool is_image)
@@ -1632,6 +2247,7 @@ static void cap_im_tg_set_commands(void)
     } commands[] = {
         {"session", "Manage chat sessions (new, list, switch, delete)"},
         {"llm", "Configure the LLM model and endpoint"},
+        {"ssh", "SSH client (pubkey, allowed, allow, revoke)"},
     };
     cJSON *body = NULL;
     cJSON *list = NULL;
@@ -1712,6 +2328,11 @@ static esp_err_t cap_im_tg_gateway_start(void)
     if (s_tg.poll_task) {
         return ESP_OK;
     }
+    if (s_tg.allowed_user_count == 0) {
+        ESP_LOGW(TAG, "tg_allowed_user_ids empty: all Telegram messages will be ignored");
+    } else {
+        ESP_LOGI(TAG, "Telegram allowlist: %u user(s)", (unsigned)s_tg.allowed_user_count);
+    }
 
     s_tg.stop_requested = false;
     if (!s_tg.attachment_queue) {
@@ -1723,7 +2344,7 @@ static esp_err_t cap_im_tg_gateway_start(void)
     }
     ok = claw_task_create(&(claw_task_config_t){
                               .name = "tg_attach",
-                              .stack_size = 8192,
+                              .stack_size = 10240,
                               .priority = 5,
                               .core_id = tskNO_AFFINITY,
                               .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
@@ -1757,6 +2378,23 @@ static esp_err_t cap_im_tg_gateway_start(void)
         s_tg.attachment_queue = NULL;
         return ESP_FAIL;
     }
+    /* The busy indicator is cosmetic: run without it if the task cannot be created. */
+    ok = claw_task_create(&(claw_task_config_t){
+                              .name = "tg_busy",
+                              .stack_size = 6144,
+                              .priority = 4,
+                              .core_id = tskNO_AFFINITY,
+                              .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
+                          },
+                          cap_im_tg_busy_task,
+                          NULL,
+                          &s_tg.busy_task);
+    if (ok == pdPASS) {
+        claw_core_set_progress_observer(cap_im_tg_busy_progress);
+    } else {
+        s_tg.busy_task = NULL;
+        ESP_LOGW(TAG, "Telegram busy indicator task not started");
+    }
 
     return ESP_OK;
 }
@@ -1769,6 +2407,7 @@ static esp_err_t cap_im_tg_gateway_stop(void)
         return ESP_OK;
     }
 
+    claw_core_set_progress_observer(NULL);
     s_tg.stop_requested = true;
     while (s_tg.poll_task && xTaskGetTickCount() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -1783,6 +2422,14 @@ static esp_err_t cap_im_tg_gateway_stop(void)
     }
 
     if (s_tg.attachment_task) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    while (s_tg.busy_task && xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    if (s_tg.busy_task) {
         return ESP_ERR_TIMEOUT;
     }
 
@@ -2001,6 +2648,66 @@ esp_err_t cap_im_tg_set_token(const char *bot_token)
     return ESP_OK;
 }
 
+esp_err_t cap_im_tg_set_allowed_user_ids(const char *user_ids_csv)
+{
+    const char *cursor = user_ids_csv;
+
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!user_ids_csv) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_tg.allowed_user_count = 0;
+    while (*cursor) {
+        char *end = NULL;
+        long long id;
+
+        while (*cursor == ',' || isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+
+        errno = 0;
+        id = strtoll(cursor, &end, 10);
+        if (end == cursor || errno == ERANGE || id <= 0 ||
+                (*end && *end != ',' && !isspace((unsigned char)*end))) {
+            ESP_LOGW(TAG, "Ignoring invalid entry in tg_allowed_user_ids");
+            cursor += strcspn(cursor, ",");
+            continue;
+        }
+        if (s_tg.allowed_user_count >= CAP_IM_TG_MAX_ALLOWED_USERS) {
+            ESP_LOGW(TAG, "tg_allowed_user_ids exceeds %d entries, ignoring the rest",
+                     CAP_IM_TG_MAX_ALLOWED_USERS);
+            break;
+        }
+        s_tg.allowed_user_ids[s_tg.allowed_user_count++] = (int64_t)id;
+        cursor = end;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t cap_im_tg_set_stt_config(const char *base_url, const char *api_key, const char *model)
+{
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!base_url || !api_key || !model) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    strlcpy(s_tg.stt_base_url, base_url, sizeof(s_tg.stt_base_url));
+    strlcpy(s_tg.stt_api_key, api_key, sizeof(s_tg.stt_api_key));
+    strlcpy(s_tg.stt_model, model, sizeof(s_tg.stt_model));
+    return ESP_OK;
+}
+
 esp_err_t cap_im_tg_set_attachment_config(
     const cap_im_tg_attachment_config_t *config)
 {
@@ -2044,22 +2751,11 @@ esp_err_t cap_im_tg_stop(void)
     return cap_im_tg_gateway_stop();
 }
 
-esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
+static esp_err_t cap_im_tg_send_text_legacy(const char *chat_id, const char *text)
 {
-    if (!s_tg_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
     size_t text_len;
     size_t offset = 0;
     esp_err_t last_err = ESP_OK;
-
-    if (!chat_id || !text || text[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_tg.bot_token[0] == '\0') {
-        return ESP_ERR_INVALID_STATE;
-    }
 
     text_len = strlen(text);
     while (offset < text_len) {
@@ -2092,6 +2788,68 @@ esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
     return last_err;
 }
 
+esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
+{
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t text_len;
+    size_t offset = 0;
+    esp_err_t last_err = ESP_OK;
+
+    if (!chat_id || !text || text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_tg.bot_token[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    text_len = strlen(text);
+    while (offset < text_len) {
+        size_t chunk_len = cap_im_tg_rich_chunk_len(text + offset, text_len - offset);
+        char *chunk = NULL;
+        esp_err_t err = ESP_FAIL;
+        int status = 0;
+
+        if (chunk_len == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        chunk = calloc(1, chunk_len + 1);
+        if (!chunk) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        memcpy(chunk, text + offset, chunk_len);
+        if (!s_tg_rich_unsupported) {
+            /* Adds at most 2 bytes per line: still within the rich limits after chunking. */
+            char *md = cap_im_tg_md_hard_breaks(chunk);
+
+            err = cap_im_tg_send_rich_chunk(chat_id, md ? md : chunk, &status);
+            free(md);
+        }
+        /* Fall back on Telegram rejecting the rich message (parse/feature error, unknown method).
+         * Transport errors are not retried: Telegram may already have accepted the message. */
+        if (s_tg_rich_unsupported || (err == ESP_FAIL && (status == 400 || status == 404))) {
+            if (status == 404 && !s_tg_rich_unsupported) {
+                s_tg_rich_unsupported = true;
+                ESP_LOGW(TAG, "sendRichMessage not available, using sendMessage until reboot");
+            } else if (status == 400) {
+                ESP_LOGW(TAG, "sendRichMessage rejected, falling back to sendMessage for this chunk");
+            }
+            err = cap_im_tg_send_text_legacy(chat_id, chunk);
+        }
+        free(chunk);
+        if (err != ESP_OK) {
+            last_err = err;
+        }
+
+        offset += chunk_len;
+    }
+
+    return last_err;
+}
+
 esp_err_t cap_im_tg_send_image(const char *chat_id, const char *path, const char *caption)
 {
     if (!s_tg_initialized) {
@@ -2106,4 +2864,139 @@ esp_err_t cap_im_tg_send_file(const char *chat_id, const char *path, const char 
         return ESP_ERR_INVALID_STATE;
     }
     return cap_im_tg_send_media(chat_id, path, caption, false);
+}
+
+/* Sends `html` with optional inline keyboard rows (ownership passes here) and returns its message id. */
+static esp_err_t cap_im_tg_send_html_markup(const char *chat_id, const char *html, cJSON *rows,
+                                            int64_t *out_message_id)
+{
+    cJSON *body = cJSON_CreateObject();
+    cJSON *root = NULL;
+    cJSON *message_id_json = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err;
+
+    cJSON_AddStringToObject(body, "chat_id", chat_id);
+    cJSON_AddStringToObject(body, "text", html);
+    cJSON_AddStringToObject(body, "parse_mode", "HTML");
+    if (rows) {
+        cJSON_AddItemToObject(cJSON_AddObjectToObject(body, "reply_markup"), "inline_keyboard", rows);
+    }
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = cap_im_tg_api_call("sendMessage", body_json, &resp);
+    free(body_json);
+    if (err == ESP_OK) {
+        root = cJSON_Parse(resp);
+        message_id_json = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "result"), "message_id");
+        if (cJSON_IsNumber(message_id_json)) {
+            *out_message_id = (int64_t)message_id_json->valuedouble;
+        } else {
+            err = ESP_FAIL;
+        }
+        cJSON_Delete(root);
+    }
+    free(resp);
+    return err;
+}
+
+esp_err_t cap_im_tg_send_html(const char *chat_id, const char *html, int64_t *out_message_id)
+{
+    if (!chat_id || !chat_id[0] || !html || !out_message_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return cap_im_tg_send_html_markup(chat_id, html, NULL, out_message_id);
+}
+
+esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *const *labels, size_t label_count,
+                            uint32_t timeout_ms, int *out_choice, int64_t *out_message_id)
+{
+    char nonce[CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
+    char data[32];
+    cJSON *rows = NULL;
+    esp_err_t err;
+
+    if (!chat_id || !chat_id[0] || !html || !labels || label_count < 1 || label_count > 10 || !out_choice ||
+            !out_message_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_tg_initialized || !s_confirm.lock || !s_confirm.answered) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xTaskGetCurrentTaskHandle() == s_tg.poll_task) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(nonce, sizeof(nonce), "%08" PRIx32 "%08" PRIx32, esp_random(), esp_random());
+    /* One button per row so long labels stay readable. */
+    rows = cJSON_CreateArray();
+    for (size_t i = 0; i < label_count; i++) {
+        cJSON *button = cJSON_CreateObject();
+        cJSON *row = cJSON_CreateArray();
+
+        snprintf(data, sizeof(data), CAP_IM_TG_CONFIRM_PREFIX "%s:%u", nonce, (unsigned)i);
+        cJSON_AddStringToObject(button, "text", labels[i]);
+        cJSON_AddStringToObject(button, "callback_data", data);
+        cJSON_AddItemToArray(row, button);
+        cJSON_AddItemToArray(rows, row);
+    }
+
+    xSemaphoreTake(s_confirm.lock, portMAX_DELAY);
+    /* Drop a give left over from an answer that raced the previous timeout. */
+    xSemaphoreTake(s_confirm.answered, 0);
+    taskENTER_CRITICAL(&s_confirm_mux);
+    strlcpy(s_confirm.nonce, nonce, sizeof(s_confirm.nonce));
+    strlcpy(s_confirm.chat_id, chat_id, sizeof(s_confirm.chat_id));
+    s_confirm.choice_count = (int)label_count;
+    s_confirm.choice = -1;
+    taskEXIT_CRITICAL(&s_confirm_mux);
+
+    err = cap_im_tg_send_html_markup(chat_id, html, rows, out_message_id);
+    if (err == ESP_OK) {
+        xSemaphoreTake(s_confirm.answered, pdMS_TO_TICKS(timeout_ms));
+    }
+    /* The poll task clears the nonce when it accepts an answer, so this also catches an answer
+     * that arrived just as the wait timed out. */
+    taskENTER_CRITICAL(&s_confirm_mux);
+    *out_choice = s_confirm.nonce[0] == '\0' ? s_confirm.choice : -1;
+    s_confirm.nonce[0] = '\0';
+    taskEXIT_CRITICAL(&s_confirm_mux);
+    xSemaphoreGive(s_confirm.lock);
+    return err;
+}
+
+esp_err_t cap_im_tg_edit_message(const char *chat_id, int64_t message_id, const char *html)
+{
+    cJSON *body = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err;
+
+    if (!chat_id || !html) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "chat_id", chat_id);
+    cJSON_AddNumberToObject(body, "message_id", (double)message_id);
+    cJSON_AddStringToObject(body, "text", html);
+    cJSON_AddStringToObject(body, "parse_mode", "HTML");
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = cap_im_tg_api_call("editMessageText", body_json, &resp);
+    free(body_json);
+    free(resp);
+    return err;
 }

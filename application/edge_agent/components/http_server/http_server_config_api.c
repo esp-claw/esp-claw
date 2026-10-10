@@ -28,21 +28,32 @@
     sizeof(((app_config_t *)0)->field) \
 }
 
+/* Secret fields are masked in GET; posting the mask back keeps the stored value. */
+#define CONFIG_SECRET_FIELD(group, field) { \
+    #field, (group), \
+    offsetof(app_config_t, field), \
+    sizeof(((app_config_t *)0)->field), \
+    true \
+}
+
+#define CONFIG_SECRET_MASK "********"
+
 typedef struct {
     const char *name;
     const char *group;
     size_t offset;
     size_t size;
+    bool secret;
 } config_field_def_t;
 
 static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("wifi",         wifi_ssid),
-    CONFIG_FIELD("wifi",         wifi_password),
+    CONFIG_SECRET_FIELD("wifi",  wifi_password),
     CONFIG_FIELD("wifi",         ap_ssid),
-    CONFIG_FIELD("wifi",         ap_password),
+    CONFIG_SECRET_FIELD("wifi",  ap_password),
     CONFIG_FIELD("wifi",         ap_behavior),
 
-    CONFIG_FIELD("llm",          llm_api_key),
+    CONFIG_SECRET_FIELD("llm",   llm_api_key),
     CONFIG_FIELD("llm",          llm_backend_type),
     CONFIG_FIELD("llm",          llm_model),
     CONFIG_FIELD("llm",          llm_base_url),
@@ -56,26 +67,36 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("llm",          llm_image_remote_url_only),
 
     CONFIG_FIELD("im",           qq_app_id),
-    CONFIG_FIELD("im",           qq_app_secret),
+    CONFIG_SECRET_FIELD("im",    qq_app_secret),
     CONFIG_FIELD("im",           qq_msg_type),
     CONFIG_FIELD("im",           feishu_app_id),
-    CONFIG_FIELD("im",           feishu_app_secret),
-    CONFIG_FIELD("im",           tg_bot_token),
-    CONFIG_FIELD("im",           wechat_token),
+    CONFIG_SECRET_FIELD("im",    feishu_app_secret),
+    CONFIG_SECRET_FIELD("im",    tg_bot_token),
+    CONFIG_FIELD("im",           tg_allowed_user_ids),
+    CONFIG_SECRET_FIELD("im",    wechat_token),
     CONFIG_FIELD("im",           wechat_base_url),
     CONFIG_FIELD("im",           wechat_cdn_base_url),
     CONFIG_FIELD("im",           wechat_account_id),
 
-    CONFIG_FIELD("search",       search_brave_key),
-    CONFIG_FIELD("search",       search_tavily_key),
+    CONFIG_SECRET_FIELD("search", search_brave_key),
+    CONFIG_SECRET_FIELD("search", search_tavily_key),
     CONFIG_FIELD("search",       search_http_allowlist),
+
+    CONFIG_FIELD("stt",          stt_base_url),
+    CONFIG_SECRET_FIELD("stt",   stt_api_key),
+    CONFIG_FIELD("stt",          stt_model),
 
     CONFIG_FIELD("capabilities", enabled_cap_groups),
     CONFIG_FIELD("capabilities", llm_visible_cap_groups),
+    CONFIG_FIELD("capabilities", ssh_hosts),
+    CONFIG_FIELD("capabilities", wol_targets),
 
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
     CONFIG_FIELD("time",         time_timezone),
+
+    CONFIG_FIELD("webdav",       webdav_user),
+    CONFIG_SECRET_FIELD("webdav", webdav_password),
 };
 
 static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);
@@ -195,7 +216,11 @@ static esp_err_t emit_config(httpd_req_t *req,
         if (!field_matches_filter(field, groups_csv, fields_csv)) {
             continue;
         }
-        http_server_json_add_string(root, field->name, field_value(config, field));
+        const char *value = field_value(config, field);
+        if (field->secret && value[0]) {
+            value = CONFIG_SECRET_MASK;
+        }
+        http_server_json_add_string(root, field->name, value);
     }
 
     if (extra_meta) {
@@ -323,6 +348,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         if (!cJSON_IsString(item)) {
             continue;
         }
+        if (field->secret && strcmp(item->valuestring, CONFIG_SECRET_MASK) == 0) {
+            /* Masked value echoed back by the WebUI: keep the stored secret. */
+            applied_count++;
+            continue;
+        }
         if (strcmp(field->name, "llm_max_tokens") == 0 ||
                 strcmp(field->name, "llm_default_image_max_bytes") == 0) {
             if (!is_positive_decimal_string(item->valuestring)) {
@@ -345,6 +375,22 @@ static esp_err_t config_post_handler(httpd_req_t *req)
                                        HTTPD_400_BAD_REQUEST,
                                        "LLM boolean fields must be true/false");
         }
+        if ((strcmp(field->name, "ssh_hosts") == 0 || strcmp(field->name, "wol_targets") == 0) &&
+                item->valuestring[0]) {
+            /* Truncated JSON would silently drop entries, so reject instead of clipping. */
+            cJSON *hosts = cJSON_Parse(item->valuestring);
+            bool valid = cJSON_IsArray(hosts) && strlen(item->valuestring) < field->size;
+
+            cJSON_Delete(hosts);
+            if (!valid) {
+                cJSON_Delete(root);
+                free(config);
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                           strcmp(field->name, "ssh_hosts") == 0 ?
+                                               "ssh_hosts must be a JSON array of at most 1535 bytes" :
+                                               "wol_targets must be a JSON array of at most 1023 bytes");
+            }
+        }
         strlcpy(field_mutable(config, field), item->valuestring, field->size);
         applied_count++;
     }
@@ -365,6 +411,9 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
 
     err = ctx->services.save_config(config);
+    if (err == ESP_OK) {
+        http_server_webdav_apply_config(config);
+    }
     free(config);
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save config");

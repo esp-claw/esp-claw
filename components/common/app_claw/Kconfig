@@ -171,6 +171,22 @@ menu "App Claw Config"
                 Enable the web search capability and keep app_claw's direct dependency
                 on cap_web_search.
 
+        config APP_CLAW_CAP_SSH
+            bool "Enable SSH command capability"
+            depends on APP_CLAW_CAP_IM_TG
+            default y
+            help
+                Enable ssh_exec: run commands on configured SSH hosts after the user
+                confirms each one with a Telegram inline button. Requires
+                MBEDTLS_THREADING_C with MBEDTLS_THREADING_PTHREAD for libssh.
+
+        config APP_CLAW_CAP_WOL
+            bool "Enable Wake-on-LAN capability"
+            default y
+            help
+                Enable wol_wake: send a Wake-on-LAN magic packet to one of the
+                targets configured in wol_targets.
+
         config APP_CLAW_CAP_ROUTER_MGR
             bool "Enable router manager capability"
             select APP_CLAW_CAP_EVENT_ROUTER

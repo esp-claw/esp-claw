@@ -163,6 +163,9 @@ export const en = {
   feishuAppId: 'Feishu App ID',
   feishuAppSecret: 'Feishu App Secret',
   tgBotToken: 'Telegram Bot Token',
+  tgAllowedUserIds: 'Allowed Telegram User IDs',
+  tgAllowedUserIdsHint:
+    'Comma-separated numeric user IDs. Messages from anyone else are ignored; empty ignores everyone.',
   wechatToken: 'WeChat Token',
   wechatBaseUrl: 'WeChat Base URL',
   wechatBaseUrlPlaceholder: 'https://ilinkai.weixin.qq.com',

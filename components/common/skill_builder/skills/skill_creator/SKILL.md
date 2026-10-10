@@ -47,6 +47,8 @@ File generation rules:
 - Create skill files by directly writing the needed files. Do not run a bundled preparation script or template generator.
 - Generate `SKILL.md` from the final behavior, not from a generic unchanged template.
 - Generate optional bundled files directly, such as `scripts/<name>.lua`, `references/<name>.md`, or assets.
+- Set `"manage_mode": "runtime"` in the frontmatter `metadata` of every skill created at runtime; `readonly` skills cannot be removed with `unregister_skill`.
+- When a skill runs web searches limited to one site, write the query with `site:domain` (colon, e.g. `site:example.com`).
 - If the environment cannot write files or cannot call `register_skill`, provide the target relative paths and full file contents, report the blocker, and do not claim the skill was fully created and registered.
 
 Registration rules:
@@ -107,7 +109,7 @@ Use this `SKILL.md` pattern for a Lua-backed skill:
     "cap_groups": [
       "cap_lua"
     ],
-    "manage_mode": "readonly"
+    "manage_mode": "runtime"
   }
 }
 ---

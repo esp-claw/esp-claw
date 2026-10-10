@@ -89,6 +89,16 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_WEB_SEARCH} == True
     path: ../../claw_capabilities/cap_web_search
 
+  cap_ssh:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_SSH} == True
+    path: ../../claw_capabilities/cap_ssh
+
+  cap_wol:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_WOL} == True
+    path: ../../claw_capabilities/cap_wol
+
   claw_cap:
     path: ../../claw_modules/claw_cap
 

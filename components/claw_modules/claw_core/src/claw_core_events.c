@@ -19,6 +19,8 @@ static const char *TAG = "claw_core";
 
 #define CLAW_CORE_STAGE_REASONING_SNIPPET_LEN 150
 
+static claw_core_progress_observer_fn s_progress_observer;
+
 static esp_err_t build_response_payload_json(const claw_core_request_t *request,
                                              const claw_core_response_t *response,
                                              char **out_payload_json)
@@ -325,4 +327,21 @@ void claw_core_publish_stage_note_for_round(claw_core_state_t *core,
     (void)round_index;
 #endif
     free(stage_note);
+}
+
+void claw_core_set_progress_observer(claw_core_progress_observer_fn observer)
+{
+    s_progress_observer = observer;
+}
+
+void claw_core_notify_progress(claw_core_progress_event_t event,
+                               const claw_core_request_t *request,
+                               const char *tool_name,
+                               const char *args_json)
+{
+    claw_core_progress_observer_fn observer = s_progress_observer;
+
+    if (observer && request) {
+        observer(event, request, tool_name, args_json);
+    }
 }
