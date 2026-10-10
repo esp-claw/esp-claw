@@ -759,6 +759,7 @@ static esp_err_t cap_im_qq_save_attachment(const char *chat_id,
     }
 
     err = cap_im_attachment_download_url_to_file(TAG,
+                                                 s_qq.attachment_root_dir,
                                                  normalized_url,
                                                  saved_path,
                                                  s_qq.max_inbound_file_bytes,
@@ -766,6 +767,7 @@ static esp_err_t cap_im_qq_save_attachment(const char *chat_id,
     if (err != ESP_OK) {
         return err;
     }
+    cap_im_attachment_prune_inbox(TAG, s_qq.attachment_root_dir, saved_path);
 
     content_type = cap_im_qq_is_image_mime(mime) ? "image" : "file";
     payload_json = cap_im_attachment_build_payload_json(

@@ -639,6 +639,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     snprintf(download_url, sizeof(download_url), "%s/file/bot%s/%s",
              CAP_IM_TG_API_BASE, s_tg.bot_token, remote_path);
     err = cap_im_attachment_download_url_to_file(TAG,
+                                                 s_tg.attachment_root_dir,
                                                  download_url,
                                                  saved_path,
                                                  s_tg.max_inbound_file_bytes,
@@ -647,7 +648,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
         free(remote_path);
         return err;
     }
-    cap_im_attachment_prune_inbox(TAG, s_tg.attachment_root_dir, "telegram", saved_path);
+    cap_im_attachment_prune_inbox(TAG, s_tg.attachment_root_dir, saved_path);
 
     grouped = media_group_id && media_group_id[0] &&
               cap_im_tg_media_group_add(media_group_id,
@@ -720,6 +721,11 @@ static void cap_im_tg_attachment_task(void *arg)
     cap_im_tg_attachment_job_t *job = NULL;
 
     (void)arg;
+
+    /* Enforce the inbox budget left over from before a reboot. */
+    if (s_tg.enable_inbound_attachments) {
+        cap_im_attachment_prune_inbox(TAG, s_tg.attachment_root_dir, NULL);
+    }
 
     while (1) {
         cap_im_tg_media_group_flush_expired();

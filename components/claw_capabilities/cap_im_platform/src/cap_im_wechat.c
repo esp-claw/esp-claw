@@ -1198,6 +1198,7 @@ static esp_err_t cap_im_wechat_save_attachment_buffer(const char *chat_id,
     ESP_RETURN_ON_ERROR(cap_im_attachment_save_buffer_to_file(TAG, saved_path, buf, buf_len),
                         TAG,
                         "save attachment buffer failed");
+    cap_im_attachment_prune_inbox(TAG, s_wechat.attachment_root_dir, saved_path);
 
     payload_json = cap_im_attachment_build_payload_json(
     &(cap_im_attachment_payload_config_t) {
