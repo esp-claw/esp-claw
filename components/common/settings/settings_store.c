@@ -192,6 +192,55 @@ esp_err_t settings_store_erase_key(const char *key)
     return err;
 }
 
+esp_err_t settings_store_get_blob(const char *key, void *buf, size_t *len)
+{
+    if (!key || !buf || !len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = settings_store_open(NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_get_blob(handle, key, buf, len);
+    nvs_close(handle);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "nvs_get_blob(%s) failed: %s", key, esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t settings_store_set_blob(const char *key, const void *data, size_t len)
+{
+    if (!key || (!data && len)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = settings_store_open(NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_blob(handle, key, data, len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_set_blob(%s) failed: %s", key, esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
+
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_commit failed: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
 esp_err_t settings_store_commit(void)
 {
     return ESP_OK;

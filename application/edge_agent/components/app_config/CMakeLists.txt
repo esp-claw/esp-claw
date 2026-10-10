@@ -6,4 +6,7 @@ idf_component_register(
     REQUIRES
         app_claw
         settings
+    PRIV_REQUIRES
+        json
+        nvs_flash
 )

@@ -543,6 +543,8 @@ static int32_t cap_wasm_random(wasm_exec_env_t env, uint8_t *buf, uint32_t len)
     return 0;
 }
 
+/* github.com/esp-claw/app-sdk (include/claw.h, tools/manifest_check.py, tools/wasm_check.py) mirrors
+ * this host API and its permissions; update it together with this table. */
 NativeSymbol g_cap_wasm_natives[] = {
     { "log", cap_wasm_log, "(i*~)", NULL },
     { "tool_register", cap_wasm_tool_register, "(*~*~*~)i", NULL },

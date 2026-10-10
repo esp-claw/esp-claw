@@ -33,7 +33,7 @@ Call `http_request` with `"profile": "gcloud"`. The device signs a service-accou
 ```
 
 - Never send an `Authorization` header; the device drops it.
-- `GET`/`HEAD` run immediately. `POST`/`PUT`/`PATCH`/`DELETE` ask the user for confirmation in Telegram (✅ Einmal / ❌ Abbrechen) and only work in an allowed Telegram chat. This includes read-only POST calls such as `entries:list`. "abgelehnt vom Benutzer" means: stop, do not retry.
+- `GET`/`HEAD` run immediately. `POST`/`PUT`/`PATCH`/`DELETE` ask the user for confirmation in Telegram (✅ Einmal / ❌ Abbrechen) and only work in an allowed Telegram chat. This includes read-only POST calls such as `entries:list`, unless the profile lists them in `read_only_posts`. "abgelehnt vom Benutzer" means: stop, do not retry.
 - JSON bodies go as a string in `body`; `Content-Type: application/json` is added automatically.
 - "system clock is not set yet" means the device has no SNTP time yet; wait and retry later.
 - "token endpoint returned HTTP 400 invalid_grant" usually means a wrong/revoked key or a clock skew.
@@ -54,7 +54,7 @@ Call `http_request` with `"profile": "gcloud"`. The device signs a service-accou
 | Stop VM | POST | compute: `/compute/v1/projects/{project}/zones/{zone}/instances/{name}/stop` | no body; returns an operation |
 | List Cloud Run services | GET | `https://run.googleapis.com/v2/projects/{project}/locations/{region}/services` | `-` as region lists all regions |
 | Get Cloud Run service | GET | `https://run.googleapis.com/v2/projects/{project}/locations/{region}/services/{service}` | `uri`, `latestReadyRevision`, `conditions` |
-| Read logs | POST | `https://logging.googleapis.com/v2/entries:list` | body below; needs confirmation (POST) |
+| Read logs | POST | `https://logging.googleapis.com/v2/entries:list` | body below; needs confirmation (POST) unless listed in `read_only_posts` |
 | List buckets | GET | `https://storage.googleapis.com/storage/v1/b?project={project}` | |
 | List objects | GET | `https://storage.googleapis.com/storage/v1/b/{bucket}/o?prefix=&maxResults=100` | URL-encode `/` in names as `%2F` when used in a path |
 | List budgets | GET | `https://billingbudgets.googleapis.com/v1/billingAccounts/{billing_account_id}/budgets` | needs Billing Account viewer rights for the service account on that billing account; billing account id format `XXXXXX-XXXXXX-XXXXXX` |

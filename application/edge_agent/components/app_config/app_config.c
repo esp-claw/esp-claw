@@ -9,13 +9,26 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "cJSON.h"
+#include "esp_log.h"
+#include "nvs.h"
 #include "settings_store.h"
+
+static const char *TAG = "app_config";
+
+/* Warn when the NVS partition is fuller than this (percent of entries). */
+#define APP_CONFIG_NVS_WARN_PCT 80
+/* Set once the search keys were turned into api_profiles entries. */
+#define APP_CONFIG_SEARCH_MIGRATED_KEY "srch_prof_mig"
 
 typedef struct {
     const char *key;
     const char *default_value;
     size_t offset;
     size_t size;
+    /* Large values are stored as a blob under this key (NVS strings must fit in one 4 KB page);
+     * an old string under `key` is still read and erased by the next save. */
+    const char *blob_key;
 } app_config_field_t;
 
 typedef struct {
@@ -31,7 +44,9 @@ typedef struct {
 } app_config_legacy_llm_preset_t;
 
 #define APP_CONFIG_FIELD(member, nvs_key, default_literal) \
-    { nvs_key, default_literal, offsetof(app_config_t, member), sizeof(((app_config_t *)0)->member) }
+    { nvs_key, default_literal, offsetof(app_config_t, member), sizeof(((app_config_t *)0)->member), NULL }
+#define APP_CONFIG_BLOB_FIELD(member, nvs_key, blob_key, default_literal) \
+    { nvs_key, default_literal, offsetof(app_config_t, member), sizeof(((app_config_t *)0)->member), blob_key }
 
 #define APP_DEFAULT_LLM_API_KEY              ""
 #define APP_DEFAULT_LLM_BACKEND_TYPE         ""
@@ -106,10 +121,10 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(search_brave_key, "brave_key", APP_DEFAULT_SEARCH_BRAVE_KEY),
     APP_CONFIG_FIELD(search_tavily_key, "tavily_key", APP_DEFAULT_SEARCH_TAVILY_KEY),
     APP_CONFIG_FIELD(search_http_allowlist, "http_allow_ls", APP_SEARCH_HTTP_ALLOWLIST),
-    APP_CONFIG_FIELD(ssh_hosts, "ssh_hosts", APP_DEFAULT_SSH_HOSTS),
-    APP_CONFIG_FIELD(wol_targets, "wol_targets", APP_DEFAULT_WOL_TARGETS),
-    APP_CONFIG_FIELD(api_profiles, "api_profiles", APP_DEFAULT_API_PROFILES),
-    APP_CONFIG_FIELD(app_trusted_keys, "app_trust_keys", APP_DEFAULT_APP_TRUSTED_KEYS),
+    APP_CONFIG_BLOB_FIELD(ssh_hosts, "ssh_hosts", "ssh_hosts_b", APP_DEFAULT_SSH_HOSTS),
+    APP_CONFIG_BLOB_FIELD(wol_targets, "wol_targets", "wol_targets_b", APP_DEFAULT_WOL_TARGETS),
+    APP_CONFIG_BLOB_FIELD(api_profiles, "api_profiles", "api_profiles_b", APP_DEFAULT_API_PROFILES),
+    APP_CONFIG_BLOB_FIELD(app_trusted_keys, "app_trust_keys", "app_trust_k_b", APP_DEFAULT_APP_TRUSTED_KEYS),
     APP_CONFIG_FIELD(app_allow_unsigned, "app_allow_uns", APP_DEFAULT_APP_ALLOW_UNSIGNED),
     APP_CONFIG_FIELD(stt_base_url, "stt_base_url", APP_DEFAULT_STT_BASE_URL),
     APP_CONFIG_FIELD(stt_api_key, "stt_api_key", APP_DEFAULT_STT_API_KEY),
@@ -214,6 +229,61 @@ static inline char *app_config_field_ptr(app_config_t *config, const app_config_
 static inline const char *app_config_field_cptr(const app_config_t *config, const app_config_field_t *field)
 {
     return (const char *)config + field->offset;
+}
+
+static const char *s_save_failed_key;
+
+/* Reads a field from its blob, falling back to the (legacy) string key. */
+static esp_err_t app_config_load_field(app_config_t *config, const app_config_field_t *field)
+{
+    char *value = app_config_field_ptr(config, field);
+
+    if (field->blob_key) {
+        size_t len = field->size;
+        esp_err_t err = settings_store_get_blob(field->blob_key, value, &len);
+
+        if (err == ESP_OK) {
+            value[len ? len - 1 : 0] = '\0';
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            return err;
+        }
+    }
+    return settings_store_get_string(field->key, value, field->size, field->default_value);
+}
+
+static esp_err_t app_config_save_field(const app_config_t *config, const app_config_field_t *field)
+{
+    const char *value = app_config_field_cptr(config, field);
+    esp_err_t err;
+
+    if (!field->blob_key) {
+        return settings_store_set_string(field->key, value);
+    }
+    /* Written with its NUL, so an empty value is a 1-byte blob. */
+    err = settings_store_set_blob(field->blob_key, value, strlen(value) + 1);
+    return err == ESP_OK ? settings_store_erase_key(field->key) : err;
+}
+
+static void app_config_log_nvs_usage(void)
+{
+    nvs_stats_t stats;
+    unsigned pct;
+
+    if (nvs_get_stats(NULL, &stats) != ESP_OK || stats.total_entries == 0) {
+        return;
+    }
+    pct = (unsigned)(stats.used_entries * 100 / stats.total_entries);
+    if (pct > APP_CONFIG_NVS_WARN_PCT) {
+        ESP_LOGW(TAG, "NVS %u%% full: %u of %u entries used (%u free, %u namespaces)", pct,
+                 (unsigned)stats.used_entries, (unsigned)stats.total_entries, (unsigned)stats.free_entries,
+                 (unsigned)stats.namespace_count);
+    } else {
+        ESP_LOGI(TAG, "NVS %u%% used: %u of %u entries (%u free, %u namespaces)", pct,
+                 (unsigned)stats.used_entries, (unsigned)stats.total_entries, (unsigned)stats.free_entries,
+                 (unsigned)stats.namespace_count);
+    }
 }
 
 static bool app_config_ap_behavior_is_valid(const char *ap_behavior)
@@ -443,6 +513,7 @@ esp_err_t app_config_init(void)
     if (err != ESP_OK) {
         return err;
     }
+    app_config_log_nvs_usage();
     return app_config_upgrade_legacy_llm_settings();
 }
 
@@ -470,10 +541,7 @@ esp_err_t app_config_load(app_config_t *config)
     app_config_load_defaults(config);
 
     for (size_t i = 0; i < sizeof(s_fields) / sizeof(s_fields[0]); ++i) {
-        esp_err_t err = settings_store_get_string(s_fields[i].key,
-                                                  app_config_field_ptr(config, &s_fields[i]),
-                                                  s_fields[i].size,
-                                                  s_fields[i].default_value);
+        esp_err_t err = app_config_load_field(config, &s_fields[i]);
         if (err != ESP_OK) {
             return err;
         }
@@ -510,15 +578,118 @@ esp_err_t app_config_save(const app_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
+    s_save_failed_key = NULL;
     for (size_t i = 0; i < sizeof(s_fields) / sizeof(s_fields[0]); ++i) {
-        esp_err_t err = settings_store_set_string(s_fields[i].key,
-                                                  app_config_field_cptr(config, &s_fields[i]));
+        esp_err_t err = app_config_save_field(config, &s_fields[i]);
         if (err != ESP_OK) {
+            s_save_failed_key = s_fields[i].key;
+            ESP_LOGE(TAG, "Saving %s failed: %s", s_fields[i].key, esp_err_to_name(err));
             return err;
         }
     }
 
     return settings_store_commit();
+}
+
+const char *app_config_save_failed_key(void)
+{
+    return s_save_failed_key;
+}
+
+/* Adds a profile named `name` unless api_profiles already has one; returns true if added. */
+static bool app_config_add_profile(cJSON *profiles, const char *name, const char *base_url, const char *host,
+                                   cJSON *auth, const char *read_only_post)
+{
+    const cJSON *entry = NULL;
+    cJSON *profile = NULL;
+    cJSON *hosts = NULL;
+
+    cJSON_ArrayForEach(entry, profiles) {
+        const char *entry_name = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "name"));
+
+        if (entry_name && strcmp(entry_name, name) == 0) {
+            cJSON_Delete(auth);
+            return false;
+        }
+    }
+    profile = cJSON_CreateObject();
+    hosts = cJSON_CreateStringArray(&host, 1);
+    cJSON_AddStringToObject(profile, "name", name);
+    cJSON_AddStringToObject(profile, "base_url", base_url);
+    cJSON_AddItemToObject(profile, "hosts", hosts);
+    cJSON_AddItemToObject(profile, "auth", auth);
+    if (read_only_post) {
+        cJSON_AddItemToObject(profile, "read_only_posts", cJSON_CreateStringArray(&read_only_post, 1));
+    }
+    cJSON_AddItemToArray(profiles, profile);
+    return true;
+}
+
+esp_err_t app_config_migrate_search_profiles(app_config_t *config)
+{
+    const app_config_field_t *field = NULL;
+    cJSON *profiles = NULL;
+    cJSON *auth = NULL;
+    char *rendered = NULL;
+    bool done = false;
+    bool tavily = false;
+    bool brave = false;
+    esp_err_t err;
+
+    if (!config) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    err = settings_store_has_key(APP_CONFIG_SEARCH_MIGRATED_KEY, &done);
+    if (err != ESP_OK || done || (!config->search_tavily_key[0] && !config->search_brave_key[0])) {
+        return err;
+    }
+    profiles = config->api_profiles[0] ? cJSON_Parse(config->api_profiles) : cJSON_CreateArray();
+    if (!cJSON_IsArray(profiles)) {
+        ESP_LOGW(TAG, "api_profiles is not a JSON array; search keys not migrated");
+        cJSON_Delete(profiles);
+        return ESP_OK;
+    }
+    if (config->search_tavily_key[0]) {
+        auth = cJSON_CreateObject();
+        cJSON_AddStringToObject(auth, "type", "bearer");
+        cJSON_AddStringToObject(auth, "token", config->search_tavily_key);
+        tavily = app_config_add_profile(profiles, "tavily", "https://api.tavily.com", "api.tavily.com", auth,
+                                        "/search");
+    }
+    if (config->search_brave_key[0]) {
+        auth = cJSON_CreateObject();
+        cJSON_AddStringToObject(auth, "type", "header");
+        cJSON_AddStringToObject(auth, "name", "X-Subscription-Token");
+        cJSON_AddStringToObject(auth, "value", config->search_brave_key);
+        brave = app_config_add_profile(profiles, "brave", "https://api.search.brave.com", "api.search.brave.com",
+                                       auth, NULL);
+    }
+    rendered = tavily || brave ? cJSON_PrintUnformatted(profiles) : NULL;
+    cJSON_Delete(profiles);
+    if (rendered && strlen(rendered) >= sizeof(config->api_profiles)) {
+        ESP_LOGW(TAG, "api_profiles has no room for the search profiles; search keys not migrated");
+        cJSON_free(rendered);
+        return ESP_OK;
+    }
+    if (rendered) {
+        for (size_t i = 0; i < sizeof(s_fields) / sizeof(s_fields[0]); ++i) {
+            if (strcmp(s_fields[i].key, "api_profiles") == 0) {
+                field = &s_fields[i];
+            }
+        }
+        strlcpy(config->api_profiles, rendered, sizeof(config->api_profiles));
+        cJSON_free(rendered);
+        err = app_config_save_field(config, field);
+    } else if (tavily || brave) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (err == ESP_OK) {
+        err = settings_store_set_string(APP_CONFIG_SEARCH_MIGRATED_KEY, "1");
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Search keys migrated to API profiles:%s%s", tavily ? " tavily" : "", brave ? " brave" : "");
+    }
+    return err;
 }
 
 esp_err_t app_config_validate_wifi(const app_config_t *config, const char **message)

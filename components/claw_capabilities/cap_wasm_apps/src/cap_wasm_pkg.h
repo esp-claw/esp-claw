@@ -8,7 +8,7 @@
 /*
  * Signed app packages (.ecapp), signature checks, version order and eviction choice. Pure C +
  * cJSON + mbedTLS (SHA-256, base64) + Monocypher (Ed25519) so it can be unit-tested on the host.
- * apps/sdk/ecapp.py is the host side.
+ * tools/ecapp.py of github.com/esp-claw/app-sdk is the host side.
  *
  * Package: "ECAP", u8 format (1), u8 entry count (3), u16 reserved (0), then per entry
  * u8 name length, name, u32 little-endian data length, data. The entries are exactly

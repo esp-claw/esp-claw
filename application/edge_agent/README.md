@@ -83,3 +83,31 @@ idf.py menuconfig
 idf.py build
 idf.py flash monitor
 ```
+
+## API credential profiles (`api_profiles`)
+
+`api_profiles` (device config, JSON array, at most 3583 bytes) holds credentials that `http_request`
+(with `"profile"`) and WASM apps use without ever seeing the secret (apps: see
+https://github.com/esp-claw/app-sdk and https://github.com/esp-claw/app-template):
+
+```json
+[
+  {"name": "cloudflare", "base_url": "https://api.cloudflare.com/client/v4",
+   "hosts": ["api.cloudflare.com"], "auth": {"type": "bearer", "token": "..."},
+   "read_only_posts": ["/graphql"]},
+  {"name": "brave", "base_url": "https://api.search.brave.com", "hosts": ["api.search.brave.com"],
+   "auth": {"type": "header", "name": "X-Subscription-Token", "value": "..."}}
+]
+```
+
+- `auth.type` is `bearer` (`token`), `header` (`name`, `value`) or `google_service_account`
+  (`json`, `scopes`).
+- `hosts` are host names or `*.domain` patterns; requests and redirects must stay on https and on
+  these hosts. On a redirect to a host other than the one the request started on, the auth header
+  is removed before the redirect is followed (e.g. GitHub job logs: `api.github.com` →
+  `*.blob.core.windows.net`, so add both to `hosts`). Redirect URLs may be up to 2047 bytes.
+- `GET`/`HEAD` run directly; other methods ask for confirmation in Telegram. `read_only_posts`
+  (optional) lists `POST` endpoints that only read and run without confirmation: `/path`
+  patterns are matched against the path after `base_url`, `https://host/path` patterns against
+  the whole URL; the query string is ignored and `*` matches any characters except `/`. Example:
+  `["/v1/projects/*/analytics/endpoints/logs*"]`.
