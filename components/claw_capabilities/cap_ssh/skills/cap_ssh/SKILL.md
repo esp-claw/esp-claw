@@ -32,7 +32,7 @@ Use this skill when the user asks to run a command on, inspect, or administer on
 - `host` must be one of the names listed in the `ssh_exec` tool description. Do not pass IP addresses or hostnames.
 - A call sends the exact command to the user's Telegram chat and waits up to 60 seconds for the user to approve it, unless the host's allow rules cover it. Tell the user what you are about to run and why before calling.
 - The tool description lists each host's allow rules ("no prompt: df *, free *, uptime"). Prefer commands in exactly those forms; they run at once and the user only gets a notice.
-- Only works for requests that came from Telegram. Other channels, scheduled jobs and sub-agents get an error (sub-agents may use the remote file tools except `remote_delete`).
+- Only works for requests that came from Telegram, including sub-agents working for one (the prompt then names the sub-agent). Other channels and scheduled jobs, and their sub-agents, get an error.
 - Prefer one short, non-interactive command per call. Commands that wait for input or run longer than 30 seconds are cut off.
 
 ## Allow rules
@@ -52,7 +52,7 @@ Use this skill when the user asks to run a command on, inspect, or administer on
 - `remote_list` returns `entries`, one per line: `name/` for directories, `name@` for symlinks, `name size` for files.
 - `remote_mkdir` creates a directory and its missing parents.
 - `remote_delete` removes a file, symlink or empty directory after the user confirms it in Telegram ("🗑 Löschen" / "❌ Abbrechen", 60 s).
-- Writing, reading, listing and creating directories run without confirmation and also work in sub-agents that handle a Telegram request; `remote_delete` is root-agent only, like `ssh_exec`.
+- Writing, reading, listing and creating directories run without confirmation. Like `ssh_exec`, all remote tools work only for Telegram requests and their sub-agents.
 - If the host is off or unreachable (connect failed), wake it with `wol_wake` (cap_wol skill), wait about a minute and retry.
 - Use these tools instead of `ssh_exec` with redirections or heredocs, which always need confirmation.
 

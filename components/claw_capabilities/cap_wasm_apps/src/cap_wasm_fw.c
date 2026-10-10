@@ -35,9 +35,6 @@
 #include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "sdkconfig.h"
-#if CONFIG_APP_CLAW_CAP_IM_TG
-#include "cap_im_tg.h"
-#endif
 
 static const char *TAG = "cap_wasm_fw";
 
@@ -429,7 +426,7 @@ static esp_err_t fw_write(const char *bin, const cap_wasm_fw_sig_t *sig, const c
 static esp_err_t fw_update(const char *url, bool force, const claw_cap_call_context_t *ctx,
                            char *output, size_t output_size)
 {
-    const char *chat = cap_wasm_confirm_chat(ctx);
+    const char *chat = cap_im_tg_confirm_chat(ctx);
     const char *running = esp_app_get_description()->version;
     const size_t html_size = 512;
     const esp_timer_create_args_t reboot_args = { .callback = fw_reboot, .name = "fw_reboot" };
@@ -469,6 +466,7 @@ static esp_err_t fw_update(const char *url, bool force, const claw_cap_call_cont
              "signiert: Schlüssel <code>%s</code>\nDas Gerät startet danach neu; scheitert der Start, kehrt es zur "
              "alten Version zurück.", sig.project, running, sig.version, cmp < 0 ? " ⚠️ Downgrade" : "",
              sig.size / 1024, fw_next_slot()->label, sig.key_id);
+    cap_im_tg_confirm_note(ctx, html, html_size);
     ret = cap_wasm_ask(chat, html, html_size, "✅ Aktualisieren");
     if (ret != ESP_OK) {
         snprintf(output, output_size, "Not updated: %s", ret == ESP_ERR_TIMEOUT ? "the confirmation timed out" :
@@ -622,7 +620,7 @@ esp_err_t cap_wasm_fw_command_execute(const char *input_json, const claw_cap_cal
 {
     char command[300] = "fw ";
     char verb[16] = "";
-    const char *chat = cap_wasm_confirm_chat(ctx);
+    const char *chat = cap_im_tg_confirm_chat(ctx);
     esp_err_t err;
 
     fw_input_str(input_json, "command", command + 3, sizeof(command) - 3);

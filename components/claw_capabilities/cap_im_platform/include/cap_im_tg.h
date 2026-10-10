@@ -46,6 +46,22 @@ esp_err_t cap_im_tg_send_html(const char *chat_id, const char *html, int64_t *ou
  */
 esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *const *labels, size_t label_count,
                             uint32_t timeout_ms, int *out_choice, int64_t *out_message_id);
+/*
+ * The chat in which a mutating action requested with `ctx` may be confirmed, or NULL when it must be
+ * refused. Only work that a message in an allowed Telegram chat started qualifies:
+ * - the root agent, or a slash command (caller SYSTEM), on a request with source_cap "tg_gateway";
+ * - a subagent on a request with source_cap "cap_agent_mgr/tg_gateway": claw_agent_mgr appends the
+ *   source of the root request that spawned or fed it, so a subagent started by a scheduler, router
+ *   or Web IM request ("cap_agent_mgr/cap_scheduler", ...) is refused even when it targets Telegram.
+ * channel/chat_id are trusted only together with source_cap "tg_gateway", which Lua cannot claim.
+ * The root agent handling a subagent's completion (source_cap "cap_agent_mgr") is refused.
+ */
+const char *cap_im_tg_confirm_chat(const claw_cap_call_context_t *ctx);
+/*
+ * For subagent calls, puts "requested by subagent <agent id>" in front of the NUL-terminated `html`
+ * (buffer of `size` bytes), cutting the prompt's tail if needed. Returns the new length.
+ */
+size_t cap_im_tg_confirm_note(const claw_cap_call_context_t *ctx, char *html, size_t size);
 /* True once a getUpdates poll succeeded since boot (the bot token works and Telegram is reachable). */
 bool cap_im_tg_is_online(void);
 /* Replaces a sent message with `html` and removes its inline buttons. */

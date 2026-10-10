@@ -2001,6 +2001,11 @@ static esp_err_t claw_event_router_execute_emit_event_action(
     }
 
     value = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "source_cap"));
+    /* Rules (which the agent can write) must not pose as the Telegram gateway. */
+    if (value && strcmp(value, "tg_gateway") == 0) {
+        cJSON_Delete(rendered_input);
+        return ESP_ERR_INVALID_ARG;
+    }
     strlcpy(event.source_cap, value ? value : "claw_event_router", sizeof(event.source_cap));
     value = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "event_type"));
     strlcpy(event.event_type, value ? value : "trigger", sizeof(event.event_type));

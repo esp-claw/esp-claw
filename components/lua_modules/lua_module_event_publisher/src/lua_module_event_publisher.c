@@ -270,6 +270,17 @@ static void lua_module_event_publisher_raise_publish_error(lua_State *L, esp_err
     luaL_error(L, "event publish failed: %s", esp_err_to_name(err));
 }
 
+/* Only the Telegram gateway may publish as tg_gateway: tools trust it as "an allowed user wrote this". */
+static const char *lua_event_publisher_source_cap(lua_State *L)
+{
+    const char *source_cap = lua_table_get_string_field(L, 1, "source_cap", true);
+
+    if (strcmp(source_cap, "tg_gateway") == 0) {
+        luaL_error(L, "source_cap tg_gateway is reserved");
+    }
+    return source_cap;
+}
+
 static int lua_event_publisher_publish_message(lua_State *L)
 {
     const char *source_cap = NULL;
@@ -281,7 +292,7 @@ static int lua_event_publisher_publish_message(lua_State *L)
     esp_err_t err;
 
     luaL_checktype(L, 1, LUA_TTABLE);
-    source_cap = lua_table_get_string_field(L, 1, "source_cap", true);
+    source_cap = lua_event_publisher_source_cap(L);
     channel = lua_table_get_string_field(L, 1, "channel", true);
     chat_id = lua_table_get_string_field(L, 1, "chat_id", true);
     text = lua_table_get_string_field(L, 1, "text", true);
@@ -311,7 +322,7 @@ static int lua_event_publisher_publish_trigger(lua_State *L)
     esp_err_t err;
 
     luaL_checktype(L, 1, LUA_TTABLE);
-    source_cap = lua_table_get_string_field(L, 1, "source_cap", true);
+    source_cap = lua_event_publisher_source_cap(L);
     event_type = lua_table_get_string_field(L, 1, "event_type", true);
     event_key = lua_table_get_string_field(L, 1, "event_key", true);
     payload_json = lua_table_get_payload_json_field(L, 1, true);
@@ -353,7 +364,7 @@ static int lua_event_publisher_publish(lua_State *L)
 
     luaL_checktype(L, 1, LUA_TTABLE);
 
-    source_cap = lua_table_get_string_field(L, 1, "source_cap", true);
+    source_cap = lua_event_publisher_source_cap(L);
     event_type = lua_table_get_string_field(L, 1, "event_type", true);
     event_id = lua_table_get_string_field(L, 1, "event_id", false);
     source_channel = lua_table_get_string_field(L, 1, "source_channel", false);

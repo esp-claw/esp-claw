@@ -1004,21 +1004,6 @@ static void cap_ssh_write_result(const char *name, const cap_ssh_job_t *job, cha
     free(rendered);
 }
 
-/* Confirmation is only possible in the Telegram chat the request came from. Sub-agents working for
- * such a request carry its chat but come from cap_agent_mgr; they may use the tools that never ask. */
-static bool cap_ssh_from_telegram(const claw_cap_call_context_t *ctx, bool allow_subagent)
-{
-    if (!ctx || !ctx->channel || strcmp(ctx->channel, "telegram") != 0 || !ctx->chat_id || !ctx->chat_id[0] ||
-            !ctx->source_cap) {
-        return false;
-    }
-    if (ctx->caller == CLAW_CAP_CALLER_AGENT && strcmp(ctx->source_cap, "tg_gateway") == 0) {
-        return true;
-    }
-    return allow_subagent && (ctx->caller == CLAW_CAP_CALLER_AGENT || ctx->caller == CLAW_CAP_CALLER_SUB_AGENT) &&
-           strcmp(ctx->source_cap, "cap_agent_mgr") == 0;
-}
-
 static esp_err_t cap_ssh_exec_execute(const char *input_json,
                                       const claw_cap_call_context_t *ctx,
                                       char *output,
@@ -1044,7 +1029,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     int choice = -1;
     esp_err_t err;
 
-    if (!cap_ssh_from_telegram(ctx, false)) {
+    if (!cap_im_tg_confirm_chat(ctx)) {
         snprintf(output, output_size,
                  "Error: ssh_exec is only available for requests from an allowed Telegram chat");
         return ESP_ERR_NOT_SUPPORTED;
@@ -1121,6 +1106,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
         }
     }
 
+    prompt_len = cap_im_tg_confirm_note(ctx, html, CAP_SSH_PROMPT_MAX);
     if (auto_allowed) {
         choice = 0;
         err = cap_im_tg_send_html(ctx->chat_id, html, &message_id);
@@ -1252,7 +1238,7 @@ static esp_err_t cap_ssh_remote_execute(cap_ssh_op_t op, const char *input_json,
     int choice = -1;
     esp_err_t err = ESP_ERR_INVALID_ARG;
 
-    if (!cap_ssh_from_telegram(ctx, op != CAP_SSH_OP_DELETE)) {
+    if (!cap_im_tg_confirm_chat(ctx)) {
         snprintf(output, output_size, "Error: %s is only available for requests from an allowed Telegram chat",
                  s_op_names[op]);
         return ESP_ERR_NOT_SUPPORTED;
@@ -1325,6 +1311,7 @@ static esp_err_t cap_ssh_remote_execute(cap_ssh_op_t op, const char *input_json,
         for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
             cap_ssh_html_put(html, &prompt_len, parts[i], i % 2 == 1);
         }
+        prompt_len = cap_im_tg_confirm_note(ctx, html, CAP_SSH_PROMPT_MAX);
         err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_SSH_CONFIRM_TIMEOUT_MS, &choice, &message_id);
         if (err != ESP_OK) {
             snprintf(output, output_size, "Error: could not ask for confirmation in Telegram (%s)", esp_err_to_name(err));
@@ -1513,7 +1500,7 @@ static const claw_cap_descriptor_t s_ssh_descriptors[] = {
         .family = "system",
         .description = s_ssh.description,
         .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM | CLAW_CAP_FLAG_ROOT_AGENT_ONLY,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
         "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\",\"description\":\"Configured host name\"},"
         "\"command\":{\"type\":\"string\",\"description\":\"Shell command to run\"}},"
@@ -1585,7 +1572,7 @@ static const claw_cap_descriptor_t s_ssh_descriptors[] = {
         .description = "Delete a file or empty directory in an SSH host's workdir after the user confirms it in "
                        "Telegram.",
         .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM | CLAW_CAP_FLAG_ROOT_AGENT_ONLY,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
         "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\"},"
         "\"path\":{\"type\":\"string\",\"description\":\"Path relative to the workdir\"}},"

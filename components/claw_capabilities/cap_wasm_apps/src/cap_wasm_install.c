@@ -28,9 +28,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
-#if CONFIG_APP_CLAW_CAP_IM_TG
-#include "cap_im_tg.h"
-#endif
 
 static const char *TAG = "cap_wasm_apps";
 
@@ -312,7 +309,7 @@ static bool cap_wasm_stage(const char *name, const cap_wasm_pkg_t *pkg)
 esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
                            const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
-    const char *chat = cap_wasm_confirm_chat(ctx);
+    const char *chat = cap_im_tg_confirm_chat(ctx);
     const size_t html_size = 1536;
     char source[CAP_WASM_URL_MAX];
     char installed[CAP_WASM_VERSION_MAX + 1];
@@ -391,6 +388,7 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     snprintf(html + len, html_size - len, "\nRechte: %s\nLimits: %u KB Speicher, %u ms pro Aufruf\n"
              "Signiert: Schlüssel <code>%s</code>, app.wasm %u Bytes", perms, (unsigned)mf.memory_kb,
              (unsigned)mf.call_timeout_ms, key_id, (unsigned)pkg.wasm.len);
+    cap_im_tg_confirm_note(ctx, html, html_size);
     ret = cap_wasm_ask(chat, html, html_size, "✅ Installieren");
     if (ret != ESP_OK) {
         snprintf(output, output_size, "Not installed: %s", ret == ESP_ERR_TIMEOUT ? "the confirmation timed out" :
@@ -416,9 +414,9 @@ done:
 
 esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
-    const char *chat = cap_wasm_confirm_chat(ctx);
+    const char *chat = cap_im_tg_confirm_chat(ctx);
     char installed[CAP_WASM_VERSION_MAX + 1];
-    char html[256];
+    char html[320];
     esp_err_t ret;
 
     if (!chat) {
@@ -432,6 +430,7 @@ esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, 
     cap_wasm_installed_version(name, installed);
     snprintf(html, sizeof(html), "<b>WASM-App entfernen?</b>\n<b>%s</b> %s\nLöscht die App und ihre gespeicherten Daten.",
              name, installed[0] ? installed : "(ohne gültiges Manifest)");
+    cap_im_tg_confirm_note(ctx, html, sizeof(html));
     ret = cap_wasm_ask(chat, html, sizeof(html), "🗑 Entfernen");
     if (ret != ESP_OK) {
         snprintf(output, output_size, "Not removed: %s", ret == ESP_ERR_TIMEOUT ? "the confirmation timed out" :

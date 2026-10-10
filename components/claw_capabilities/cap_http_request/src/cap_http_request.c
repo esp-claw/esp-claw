@@ -28,8 +28,8 @@
 #include "mbedtls/platform_util.h"
 #include "mbedtls/sha256.h"
 #include "sdkconfig.h"
-#if CONFIG_APP_CLAW_CAP_IM_TG
 #include "cap_im_tg.h"
+#if CONFIG_APP_CLAW_CAP_IM_TG
 #define CAP_HTTP_REQUEST_CAN_CONFIRM 1
 #else
 #define CAP_HTTP_REQUEST_CAN_CONFIRM 0
@@ -781,10 +781,7 @@ static esp_err_t cap_http_request_run(const cJSON *input,
         mutation = method != HTTP_METHOD_GET && method != HTTP_METHOD_HEAD &&
                    !(method == HTTP_METHOD_POST && cap_http_rules_read_only_post(profile, url));
         /* Mutations are confirmed in the Telegram chat the request came from. */
-        if (mutation && (!ctx || ctx->caller != CLAW_CAP_CALLER_AGENT || !ctx->channel ||
-                         strcmp(ctx->channel, "telegram") != 0 || !ctx->source_cap ||
-                         strcmp(ctx->source_cap, "tg_gateway") != 0 || !ctx->chat_id || !ctx->chat_id[0] ||
-                         !CAP_HTTP_REQUEST_CAN_CONFIRM)) {
+        if (mutation && (!CAP_HTTP_REQUEST_CAN_CONFIRM || !cap_im_tg_confirm_chat(ctx))) {
             snprintf(output, output_size,
                      "Error: %s via a profile needs confirmation and is only available for requests "
                      "from an allowed Telegram chat; GET/HEAD work everywhere",
@@ -928,6 +925,7 @@ static esp_err_t cap_http_request_run(const cJSON *input,
                                       CAP_HTTP_REQUEST_PROMPT_BODY_MAX, true);
             cap_http_request_html_put(html, &prompt_len, "</pre>", SIZE_MAX, false);
         }
+        prompt_len = cap_im_tg_confirm_note(ctx, html, CAP_HTTP_REQUEST_PROMPT_MAX);
         err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_HTTP_REQUEST_CONFIRM_TIMEOUT_MS,
                                 &choice, &message_id);
         if (err != ESP_OK) {

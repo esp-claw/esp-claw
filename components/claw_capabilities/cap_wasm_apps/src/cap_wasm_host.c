@@ -26,9 +26,6 @@
 #include "nvs.h"
 #include "ping/ping_sock.h"
 #include "sdkconfig.h"
-#if CONFIG_APP_CLAW_CAP_IM_TG
-#include "cap_im_tg.h"
-#endif
 
 static const char *TAG = "cap_wasm_apps";
 
@@ -349,14 +346,13 @@ static int32_t cap_wasm_confirm(wasm_exec_env_t env, const char *text, uint32_t 
     if (text_len > CAP_WASM_CONFIRM_TEXT_MAX) {
         return -CAP_WASM_E2BIG;
     }
-    /* Same rule as http_request mutations: only for agent calls from an allowed Telegram chat. */
-    if (!ctx || ctx->caller != CLAW_CAP_CALLER_AGENT || !ctx->channel || strcmp(ctx->channel, "telegram") != 0 ||
-            !ctx->source_cap || strcmp(ctx->source_cap, "tg_gateway") != 0 || !ctx->chat_id || !ctx->chat_id[0]) {
+    /* Same rule as http_request mutations: only for work from an allowed Telegram chat. */
+    if (!cap_im_tg_confirm_chat(ctx)) {
         return -CAP_WASM_ENOTSUP;
     }
 #if CONFIG_APP_CLAW_CAP_IM_TG
     static const char *const labels[] = {"✅ Ja", "❌ Abbrechen"};
-    const size_t html_size = 128 + CAP_WASM_APP_NAME_MAX + 5 * CAP_WASM_CONFIRM_TEXT_MAX;
+    const size_t html_size = 288 + CAP_WASM_APP_NAME_MAX + 5 * CAP_WASM_CONFIRM_TEXT_MAX;
     char *html = heap_caps_malloc(html_size, CAP_WASM_PSRAM_CAPS);
     size_t len;
     int choice = -1;
@@ -377,6 +373,7 @@ static int32_t cap_wasm_confirm(wasm_exec_env_t env, const char *text, uint32_t 
         }
     }
     html[len] = '\0';
+    len = cap_im_tg_confirm_note(ctx, html, html_size);
 
     cap_wasm_budget_pause(true);
     err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_WASM_CONFIRM_TIMEOUT_MS, &choice, &message_id);

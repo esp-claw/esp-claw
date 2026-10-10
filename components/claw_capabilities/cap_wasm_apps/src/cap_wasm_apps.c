@@ -1492,17 +1492,6 @@ esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char 
     return err;
 }
 
-const char *cap_wasm_confirm_chat(const claw_cap_call_context_t *ctx)
-{
-    /* Agent calls and /app commands from an allowed Telegram chat, like http_request mutations. */
-    if (!ctx || (ctx->caller != CLAW_CAP_CALLER_AGENT && ctx->caller != CLAW_CAP_CALLER_SYSTEM) ||
-            !ctx->channel || strcmp(ctx->channel, "telegram") != 0 || !ctx->source_cap ||
-            strcmp(ctx->source_cap, "tg_gateway") != 0 || !ctx->chat_id || !ctx->chat_id[0]) {
-        return NULL;
-    }
-    return ctx->chat_id;
-}
-
 /* ---------- Management tools and /apps ---------- */
 
 static esp_err_t cap_wasm_status(bool json, char *output, size_t output_size)
@@ -1629,7 +1618,7 @@ static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap
     }
     if (strcmp(verb, "install") == 0 || strcmp(verb, "update") == 0 || strcmp(verb, "remove") == 0) {
         /* Confirmation is answered through the Telegram poll task this handler runs on. */
-        const char *chat = cap_wasm_confirm_chat(ctx);
+        const char *chat = cap_im_tg_confirm_chat(ctx);
 
         err = chat ? cap_wasm_start_job(command, chat) : ESP_ERR_NOT_SUPPORTED;
         snprintf(output, output_size, "%s", err == ESP_OK ? "⏳ Working on it…" :

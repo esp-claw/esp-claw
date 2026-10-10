@@ -24,6 +24,7 @@ static const char *TAG = "claw_agent_mgr";
 #define CLAW_AGENT_MGR_MAX_BASE_PROVIDERS 7
 #define CLAW_AGENT_MGR_MAX_AGENTS        (1 + CONFIG_CLAW_AGENT_MGR_MAX_SUBAGENTS)
 #define CLAW_AGENT_MGR_NOTIFY_TEXT_SIZE  768
+#define CLAW_AGENT_MGR_SOURCE_CAP_SIZE   48
 
 static const char *CLAW_AGENT_MGR_DEFAULT_ROOT_AGENT_SYSTEM_PROMPT =
     "You are the root agent. Own the user-facing conversation, decide whether work "
@@ -874,6 +875,20 @@ static bool claw_agent_mgr_ctx_is_root_agent(const claw_cap_call_context_t *ctx)
                    ctx->caller == CLAW_CAP_CALLER_AGENT);
 }
 
+/*
+ * Source of a request to a subagent: "cap_agent_mgr/" plus the source of the root request it works
+ * for, e.g. "cap_agent_mgr/tg_gateway". Set per request, so input from a later scheduler-started root
+ * request does not inherit the Telegram origin of the spawn; tools use it to decide whether a subagent
+ * may ask for confirmation (cap_im_tg_confirm_chat()).
+ */
+static const char *claw_agent_mgr_sub_source_cap(const claw_cap_call_context_t *parent_ctx,
+                                                 char buf[CLAW_AGENT_MGR_SOURCE_CAP_SIZE])
+{
+    snprintf(buf, CLAW_AGENT_MGR_SOURCE_CAP_SIZE, "cap_agent_mgr/%s",
+             parent_ctx->source_cap ? parent_ctx->source_cap : "");
+    return buf;
+}
+
 static esp_err_t claw_agent_mgr_start_subagent_locked(claw_agent_mgr_agent_t *agent)
 {
     if (!agent) {
@@ -898,6 +913,7 @@ esp_err_t claw_agent_mgr_spawn_subagent(const claw_cap_call_context_t *parent_ct
     claw_agent_mgr_agent_t *agent = NULL;
     claw_core_request_t request = {0};
     char agent_id[CLAW_SESSION_MGR_ID_SIZE] = {0};
+    char source_cap[CLAW_AGENT_MGR_SOURCE_CAP_SIZE];
     size_t agent_id_len = 0;
     esp_err_t err;
 
@@ -955,7 +971,7 @@ esp_err_t claw_agent_mgr_spawn_subagent(const claw_cap_call_context_t *parent_ct
         request.user_text = prompt;
         request.source_channel = parent_ctx->channel;
         request.source_chat_id = parent_ctx->chat_id;
-        request.source_cap = "cap_agent_mgr";
+        request.source_cap = claw_agent_mgr_sub_source_cap(parent_ctx, source_cap);
         err = claw_agent_mgr_submit_to_agent(agent, &request, 1000);
     }
     if (err != ESP_OK) {
@@ -1036,6 +1052,7 @@ esp_err_t claw_agent_mgr_send_subagent_input(const claw_cap_call_context_t *ctx,
 {
     claw_agent_mgr_agent_t *agent = NULL;
     claw_core_request_t request = {0};
+    char source_cap[CLAW_AGENT_MGR_SOURCE_CAP_SIZE];
     esp_err_t err;
 
     if (!claw_agent_mgr_ctx_is_root_agent(ctx) || !input || !input[0]) {
@@ -1058,7 +1075,7 @@ esp_err_t claw_agent_mgr_send_subagent_input(const claw_cap_call_context_t *ctx,
         request.user_text = input;
         request.source_channel = ctx->channel;
         request.source_chat_id = ctx->chat_id;
-        request.source_cap = "cap_agent_mgr";
+        request.source_cap = claw_agent_mgr_sub_source_cap(ctx, source_cap);
         err = claw_agent_mgr_submit_to_agent(agent, &request, 1000);
     }
     claw_agent_mgr_unlock();

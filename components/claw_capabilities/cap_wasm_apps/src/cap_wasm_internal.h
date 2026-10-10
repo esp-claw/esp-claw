@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "cap_wasm_manifest.h"
+#include "cap_im_tg.h"
 #include "cap_wasm_pkg.h"
 #include "claw_cap.h"
 #include "wasm_export.h"
@@ -154,8 +155,6 @@ bool cap_wasm_rmdir(const char *path);
 esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char *extra,
                          char *output, size_t output_size);
 
-/* Telegram chat to confirm in for `ctx`, or NULL when it does not come from an allowed chat. */
-const char *cap_wasm_confirm_chat(const claw_cap_call_context_t *ctx);
 
 /*
  * Downloads an .ecapp from an https URL, verifies it, asks for confirmation in the Telegram chat

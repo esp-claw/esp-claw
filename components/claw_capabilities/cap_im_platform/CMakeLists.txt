@@ -1,6 +1,7 @@
 set(srcs
     "src/cap_im_attachment.c"
     "src/cap_im_platform.c"
+    "src/cap_im_tg_origin.c"
 )
 
 if(CONFIG_APP_CLAW_CAP_IM_FEISHU)
