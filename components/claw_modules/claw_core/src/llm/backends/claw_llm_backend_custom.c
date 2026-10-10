@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "llm/backends/claw_llm_backend_anthropic.h"
+#include "llm/backends/claw_llm_backend_openai_codex.h"
 #include "llm/backends/claw_llm_backend_openai_compatible.h"
 
 typedef struct custom_backend_registration_node {
@@ -25,6 +26,7 @@ static const claw_llm_backend_registration_t *find_builtin_backend_registration(
     static const builtin_backend_registration_getter_t getters[] = {
         claw_llm_backend_openai_compatible_registration,
         claw_llm_backend_anthropic_registration,
+        claw_llm_backend_openai_codex_registration,
     };
     size_t i;
 
