@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/cap_files.c"
+        "src/cap_files_quota.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

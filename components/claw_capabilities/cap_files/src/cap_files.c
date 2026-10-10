@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "cap_files.h"
+#include "cap_files_quota.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -170,6 +171,38 @@ static esp_err_t cap_files_resolve_path(const char *path, char *resolved, size_t
     }
 
     return ESP_OK;
+}
+
+static bool cap_files_in_user_area(const char *path)
+{
+    const char *base = claw_paths_get(CLAW_PATH_DATA);
+
+    return base && cap_files_quota_applies(base, path);
+}
+
+/* The user file area (the data root outside its system directories) shares the device flash with
+ * configuration, skills and memory, so it gets a small budget; work files belong on a remote host. */
+static bool cap_files_quota_ok(const char *path, size_t size, char *output, size_t output_size)
+{
+    size_t used;
+
+    if (!cap_files_in_user_area(path)) {
+        return true;
+    }
+    if (size > CAP_FILES_QUOTA_FILE) {
+        snprintf(output, output_size, "Error: files outside the system directories (memory, skills, apps, scripts, "
+                 "...) are limited to %d KB each on the device flash. Store work files on the remote host with "
+                 "remote_write_file instead.", CAP_FILES_QUOTA_FILE / 1024);
+        return false;
+    }
+    used = cap_files_quota_used(claw_paths_get(CLAW_PATH_DATA), path);
+    if (used + size > CAP_FILES_QUOTA_TOTAL) {
+        snprintf(output, output_size, "Error: the user file area of the device flash is full (%u of %d bytes used, "
+                 "%u more needed). Store work files on the remote host with remote_write_file instead.",
+                 (unsigned)used, CAP_FILES_QUOTA_TOTAL, (unsigned)size);
+        return false;
+    }
+    return true;
 }
 
 static esp_err_t cap_files_ensure_dir(const char *path)
@@ -494,6 +527,10 @@ static esp_err_t cap_files_write_file_execute(const char *input_json,
         snprintf(output, output_size, "Error: read-only path: %s", resolved_path);
         return ESP_ERR_INVALID_ARG;
     }
+    if (!cap_files_quota_ok(resolved_path, strlen(content), output, output_size)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     if (cap_files_ensure_parent_dirs(resolved_path) != ESP_OK) {
         cJSON_Delete(root);
@@ -585,6 +622,7 @@ static esp_err_t cap_files_copy_file_execute(const char *input_json,
     const char *dst_path = NULL;
     char resolved_src_path[256];
     char resolved_dst_path[256];
+    struct stat st = {0};
     esp_err_t err;
 
     (void)ctx;
@@ -613,6 +651,11 @@ static esp_err_t cap_files_copy_file_execute(const char *input_json,
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: read-only destination: %s", resolved_dst_path);
         return ESP_ERR_INVALID_ARG;
+    }
+    if (stat(resolved_src_path, &st) == 0 &&
+            !cap_files_quota_ok(resolved_dst_path, (size_t)st.st_size, output, output_size)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
     }
 
     err = cap_files_copy_file_internal(resolved_src_path, resolved_dst_path);
@@ -681,6 +724,12 @@ static esp_err_t cap_files_move_file_execute(const char *input_json,
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: read-only destination: %s", resolved_dst_path);
         return ESP_ERR_INVALID_ARG;
+    }
+    /* Moving within the user file area does not change its usage. */
+    if (!cap_files_in_user_area(resolved_src_path) &&
+            !cap_files_quota_ok(resolved_dst_path, (size_t)st.st_size, output, output_size)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
     }
 
     if (cap_files_ensure_parent_dirs(resolved_dst_path) != ESP_OK) {
@@ -780,7 +829,9 @@ static const claw_cap_descriptor_t s_files_descriptors[] = {
         .id = "write_file",
         .name = "write_file",
         .family = "files",
-        .description = "Create or overwrite a text file",
+        .description = "Create or overwrite a text file on the device flash. Outside memory/, skills/, apps/, "
+                       "scripts/ and the other system directories files are limited to 32 KB each and 128 KB in "
+                       "total; put work files on a remote host with remote_write_file.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute path under a writable directory\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}",

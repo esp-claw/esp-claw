@@ -5,6 +5,7 @@
  */
 #include "cap_ssh.h"
 
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +14,7 @@
 
 #include "cJSON.h"
 #include "cap_im_tg.h"
+#include "cap_ssh_files.h"
 #include "cap_ssh_rules.h"
 #include "claw_cap.h"
 #include "claw_task.h"
@@ -24,6 +26,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "libssh/libssh.h"
+#include "libssh/sftp.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/platform_util.h"
 #include "nvs.h"
@@ -32,6 +35,9 @@ static const char *TAG = "cap_ssh";
 
 #define CAP_SSH_HOSTS_MAX          1536
 #define CAP_SSH_DESCRIPTION_MAX    384
+#define CAP_SSH_FILES_DESC_MAX     384
+#define CAP_SSH_WRITE_MAX          (64 * 1024)
+#define CAP_SSH_READ_MAX           (16 * 1024)
 #define CAP_SSH_PUBKEY_MAX         160
 #define CAP_SSH_COMMAND_MAX        CAP_SSH_RULES_TEXT_MAX
 #define CAP_SSH_OUTPUT_MAX         (8 * 1024)
@@ -52,12 +58,34 @@ static const char *TAG = "cap_ssh";
 #define CAP_SSH_LABEL_MAX          64
 #define CAP_SSH_HOSTKEY_ALGOS      "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256"
 
+typedef enum {
+    CAP_SSH_OP_EXEC,
+    CAP_SSH_OP_WRITE,
+    CAP_SSH_OP_READ,
+    CAP_SSH_OP_LIST,
+    CAP_SSH_OP_MKDIR,
+    CAP_SSH_OP_DELETE,
+} cap_ssh_op_t;
+
+static const char *const s_op_names[] = {
+    "ssh_exec", "remote_write_file", "remote_read_file", "remote_list", "remote_mkdir", "remote_delete",
+};
+
 typedef struct {
+    cap_ssh_op_t op;
     char host[128];
     char user[64];
     char fingerprints[256];
+    char workdir[CAP_SSH_FILES_PATH_MAX];
+    char path[CAP_SSH_FILES_PATH_MAX];
     unsigned int port;
     const char *command;
+    const char *content;
+    size_t content_len;
+    bool append;
+    uint64_t offset;
+    uint64_t size;
+    size_t max_bytes;
     char *out;
     char *err;
     size_t out_len;
@@ -72,6 +100,7 @@ typedef struct {
 typedef struct {
     char hosts_json[CAP_SSH_HOSTS_MAX];
     char description[CAP_SSH_DESCRIPTION_MAX];
+    char files_description[CAP_SSH_FILES_DESC_MAX];
     char pubkey[CAP_SSH_PUBKEY_MAX];
     ssh_key key;
     volatile bool key_ready;
@@ -249,6 +278,253 @@ static void cap_ssh_read_output(ssh_session session, ssh_channel channel, cap_ss
     }
 }
 
+static void cap_ssh_sftp_fail(ssh_session session, sftp_session sftp, cap_ssh_job_t *job, const char *step)
+{
+    int code = sftp ? sftp_get_error(sftp) : SSH_FX_OK;
+
+    snprintf(job->error, sizeof(job->error), "%s failed: %s", step,
+             code == SSH_FX_NO_SUCH_FILE ? "no such file or directory" :
+             code == SSH_FX_PERMISSION_DENIED ? "permission denied" :
+             code == SSH_FX_FILE_ALREADY_EXISTS ? "already exists" :
+             code == SSH_FX_FAILURE ? "the server refused (for example a non-empty directory)" :
+             ssh_get_error(session));
+}
+
+/* Fails unless `path` exists and resolves, symlinks included, inside the canonical workdir `root`. */
+static bool cap_ssh_sftp_inside(ssh_session session, sftp_session sftp, cap_ssh_job_t *job, const char *root,
+                                const char *path)
+{
+    char *real = sftp_canonicalize_path(sftp, path);
+    bool ok = real && cap_ssh_files_inside(root, real);
+
+    if (!real) {
+        cap_ssh_sftp_fail(session, sftp, job, "resolve path");
+    } else if (!ok) {
+        snprintf(job->error, sizeof(job->error), "path leads outside the workdir");
+    }
+    ssh_string_free_char(real);
+    return ok;
+}
+
+/* Checks the directories of job->path below the workdir up to offset `end`, creating missing ones
+ * when `create` is set. A plain directory inside a checked one stays inside; symlinks must resolve
+ * inside `root`. */
+static bool cap_ssh_sftp_dirs(ssh_session session, sftp_session sftp, cap_ssh_job_t *job, const char *root,
+                              size_t end, bool create)
+{
+    char *path = job->path;
+    size_t i = strlen(job->workdir);
+    bool ok = true;
+
+    while (ok && i < end) {
+        sftp_attributes attrs;
+        char saved;
+
+        i += 1 + strcspn(path + i + 1, "/");
+        saved = path[i];
+        path[i] = '\0';
+        attrs = sftp_lstat(sftp, path);
+        if (!attrs) {
+            ok = create && sftp_get_error(sftp) == SSH_FX_NO_SUCH_FILE && sftp_mkdir(sftp, path, 0755) == SSH_OK;
+            if (!ok) {
+                cap_ssh_sftp_fail(session, sftp, job, create ? "create directory" : "open directory");
+            }
+        } else if (attrs->type == SSH_FILEXFER_TYPE_SYMLINK) {
+            ok = cap_ssh_sftp_inside(session, sftp, job, root, path);
+        } else if (attrs->type != SSH_FILEXFER_TYPE_DIRECTORY) {
+            ok = false;
+            snprintf(job->error, sizeof(job->error), "a parent of the path is not a directory");
+        }
+        sftp_attributes_free(attrs);
+        path[i] = saved;
+    }
+    return ok;
+}
+
+static void cap_ssh_sftp_write(ssh_session session, sftp_session sftp, cap_ssh_job_t *job, const char *root,
+                               int64_t deadline_us)
+{
+    sftp_attributes attrs = sftp_lstat(sftp, job->path);
+    sftp_file file = NULL;
+
+    /* Writing through a symlink is fine as long as it points inside the workdir. */
+    if (attrs && attrs->type == SSH_FILEXFER_TYPE_SYMLINK && !cap_ssh_sftp_inside(session, sftp, job, root, job->path)) {
+        goto done;
+    }
+    file = sftp_open(sftp, job->path, O_WRONLY | O_CREAT | (job->append ? O_APPEND : O_TRUNC), 0644);
+    if (!file) {
+        cap_ssh_sftp_fail(session, sftp, job, "open");
+        goto done;
+    }
+    while (job->out_len < job->content_len) {
+        /* Bounded chunks keep libssh's packet buffer small. */
+        size_t chunk = job->content_len - job->out_len < CAP_SSH_READ_MAX ? job->content_len - job->out_len :
+                       CAP_SSH_READ_MAX;
+        ssize_t n;
+
+        if (esp_timer_get_time() >= deadline_us) {
+            job->timed_out = true;
+            break;
+        }
+        n = sftp_write(file, job->content + job->out_len, chunk);
+        if (n <= 0) {
+            cap_ssh_sftp_fail(session, sftp, job, "write");
+            break;
+        }
+        job->out_len += (size_t)n;
+    }
+
+done:
+    if (file && sftp_close(file) != SSH_OK && !job->error[0]) {
+        cap_ssh_sftp_fail(session, sftp, job, "close");
+    }
+    sftp_attributes_free(attrs);
+}
+
+static void cap_ssh_sftp_read(ssh_session session, sftp_session sftp, cap_ssh_job_t *job, int64_t deadline_us)
+{
+    sftp_attributes attrs = sftp_stat(sftp, job->path);
+    sftp_file file = NULL;
+    int text_len;
+
+    if (!attrs || attrs->type != SSH_FILEXFER_TYPE_REGULAR) {
+        if (attrs) {
+            snprintf(job->error, sizeof(job->error), "not a regular file");
+        } else {
+            cap_ssh_sftp_fail(session, sftp, job, "stat");
+        }
+        goto done;
+    }
+    job->size = attrs->size;
+    file = sftp_open(sftp, job->path, O_RDONLY, 0);
+    if (!file || sftp_seek64(file, job->offset) != 0) {
+        cap_ssh_sftp_fail(session, sftp, job, "open");
+        goto done;
+    }
+    while (job->out_len < job->max_bytes) {
+        ssize_t n;
+
+        if (esp_timer_get_time() >= deadline_us) {
+            job->timed_out = true;
+            break;
+        }
+        n = sftp_read(file, job->out + job->out_len, job->max_bytes - job->out_len);
+        if (n < 0) {
+            cap_ssh_sftp_fail(session, sftp, job, "read");
+            goto done;
+        }
+        if (n == 0) {
+            break;
+        }
+        job->out_len += (size_t)n;
+    }
+    text_len = cap_ssh_files_text_len(job->out, job->out_len);
+    if (text_len < 0) {
+        snprintf(job->error, sizeof(job->error), "binary file; remote_read_file only returns UTF-8 text");
+    } else {
+        job->out_len = (size_t)text_len;
+        job->out[job->out_len] = '\0';
+    }
+
+done:
+    if (file) {
+        sftp_close(file);
+    }
+    sftp_attributes_free(attrs);
+}
+
+/* Lists one entry per line: "name/" for directories, "name@" for symlinks, "name size" otherwise. */
+static void cap_ssh_sftp_list(ssh_session session, sftp_session sftp, cap_ssh_job_t *job, int64_t deadline_us)
+{
+    sftp_dir dir = sftp_opendir(sftp, job->path);
+    sftp_attributes attrs;
+
+    if (!dir) {
+        cap_ssh_sftp_fail(session, sftp, job, "open directory");
+        return;
+    }
+    while (!job->truncated && !job->timed_out && (attrs = sftp_readdir(sftp, dir)) != NULL) {
+        size_t room = CAP_SSH_OUTPUT_MAX + 1 - job->out_len;
+        int n = 0;
+
+        if (strcmp(attrs->name, ".") != 0 && strcmp(attrs->name, "..") != 0) {
+            n = attrs->type == SSH_FILEXFER_TYPE_DIRECTORY ? snprintf(job->out + job->out_len, room, "%s/\n", attrs->name) :
+                attrs->type == SSH_FILEXFER_TYPE_SYMLINK ? snprintf(job->out + job->out_len, room, "%s@\n", attrs->name) :
+                snprintf(job->out + job->out_len, room, "%s %llu\n", attrs->name, (unsigned long long)attrs->size);
+        }
+        if (n < 0 || (size_t)n >= room) {
+            job->truncated = true;
+            job->out[job->out_len] = '\0';
+        } else {
+            job->out_len += (size_t)n;
+        }
+        job->timed_out = esp_timer_get_time() >= deadline_us;
+        sftp_attributes_free(attrs);
+    }
+    if (!job->truncated && !job->timed_out && !sftp_dir_eof(dir)) {
+        cap_ssh_sftp_fail(session, sftp, job, "read directory");
+    }
+    sftp_closedir(dir);
+}
+
+static void cap_ssh_sftp_run(ssh_session session, cap_ssh_job_t *job, int64_t deadline_us)
+{
+    sftp_session sftp = sftp_new(session);
+    sftp_attributes attrs = NULL;
+    char *root = NULL;
+    size_t parent = (size_t)(strrchr(job->path, '/') - job->path);
+
+    if (!sftp || sftp_init(sftp) != SSH_OK) {
+        cap_ssh_sftp_fail(session, sftp, job, "SFTP start");
+        goto done;
+    }
+    root = sftp_canonicalize_path(sftp, job->workdir);
+    attrs = root ? sftp_stat(sftp, root) : NULL;
+    if (!attrs || attrs->type != SSH_FILEXFER_TYPE_DIRECTORY) {
+        snprintf(job->error, sizeof(job->error), "the workdir is not a directory on the host");
+        goto done;
+    }
+
+    switch (job->op) {
+    case CAP_SSH_OP_WRITE:
+        if (cap_ssh_sftp_dirs(session, sftp, job, root, parent, true)) {
+            cap_ssh_sftp_write(session, sftp, job, root, deadline_us);
+        }
+        break;
+    case CAP_SSH_OP_READ:
+        if (cap_ssh_sftp_inside(session, sftp, job, root, job->path)) {
+            cap_ssh_sftp_read(session, sftp, job, deadline_us);
+        }
+        break;
+    case CAP_SSH_OP_LIST:
+        if (cap_ssh_sftp_inside(session, sftp, job, root, job->path)) {
+            cap_ssh_sftp_list(session, sftp, job, deadline_us);
+        }
+        break;
+    case CAP_SSH_OP_MKDIR:
+        cap_ssh_sftp_dirs(session, sftp, job, root, strlen(job->path), true);
+        break;
+    case CAP_SSH_OP_DELETE:
+        /* The entry itself may be a symlink pointing anywhere; only its directory must be inside. */
+        sftp_attributes_free(attrs);
+        attrs = cap_ssh_sftp_dirs(session, sftp, job, root, parent, false) ? sftp_lstat(sftp, job->path) : NULL;
+        if (attrs && (attrs->type == SSH_FILEXFER_TYPE_DIRECTORY ? sftp_rmdir(sftp, job->path) :
+                      sftp_unlink(sftp, job->path)) != SSH_OK) {
+            cap_ssh_sftp_fail(session, sftp, job, "delete");
+        } else if (!attrs && !job->error[0]) {
+            cap_ssh_sftp_fail(session, sftp, job, "stat");
+        }
+        break;
+    default:
+        break;
+    }
+
+done:
+    sftp_attributes_free(attrs);
+    ssh_string_free_char(root);
+    sftp_free(sftp);
+}
+
 static void cap_ssh_run(cap_ssh_job_t *job)
 {
     ssh_session session = NULL;
@@ -288,6 +564,10 @@ static void cap_ssh_run(cap_ssh_job_t *job)
                  "public key authentication failed; add the key from /ssh pubkey to authorized_keys");
         goto done;
     }
+    if (job->op != CAP_SSH_OP_EXEC) {
+        cap_ssh_sftp_run(session, job, deadline_us);
+        goto done;
+    }
     channel = ssh_channel_new(session);
     if (!channel || ssh_channel_open_session(channel) != SSH_OK ||
             ssh_channel_request_exec(channel, job->command) != SSH_OK) {
@@ -322,8 +602,8 @@ static void cap_ssh_worker_task(void *arg)
         } else {
             snprintf(job->error, sizeof(job->error), "SSH client key is not available");
         }
-        ESP_LOGI(TAG, "ssh_exec %s@%s done exit=%d err=%s internal_free=%u",
-                 job->user, job->host, job->exit_code, job->error[0] ? job->error : "none",
+        ESP_LOGI(TAG, "%s %s@%s done exit=%d err=%s internal_free=%u",
+                 s_op_names[job->op], job->user, job->host, job->exit_code, job->error[0] ? job->error : "none",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         xSemaphoreGive(job->done);
     }
@@ -504,6 +784,9 @@ static void cap_ssh_build_description(void)
     cJSON *hosts = cJSON_Parse(s_ssh.hosts_json);
     cJSON *entry = NULL;
     cap_ssh_rule_print_t print = {.out = desc, .size = CAP_SSH_DESCRIPTION_MAX};
+    char files[CAP_SSH_FILES_DESC_MAX];
+    size_t files_len;
+    bool any_workdir = false;
 
     if (!desc) {
         cJSON_Delete(hosts);
@@ -511,10 +794,18 @@ static void cap_ssh_build_description(void)
     }
     print.len = (size_t)snprintf(desc, print.size, "Run a shell command on a configured SSH host. Asks the user "
                                  "in Telegram unless the host's allow rules cover it. Hosts:");
+    files_len = (size_t)snprintf(files, sizeof(files), "Create, overwrite or (append=true) extend a UTF-8 text file "
+                                 "in an SSH host's workdir without confirmation, max 64 KB per call. Use it for work "
+                                 "files instead of write_file. path is relative to the workdir. Hosts (workdir):");
     cJSON_ArrayForEach(entry, (cJSON_IsArray(hosts) ? hosts : NULL)) {
         const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "name"));
+        const char *workdir = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "workdir"));
         size_t before;
 
+        if (name && workdir && files_len < sizeof(files)) {
+            files_len += (size_t)snprintf(files + files_len, sizeof(files) - files_len, " %s (%s)", name, workdir);
+            any_workdir = true;
+        }
         if (!name || print.len >= print.size) {
             continue;
         }
@@ -537,7 +828,11 @@ static void cap_ssh_build_description(void)
         }
         strlcat(desc, " none configured", CAP_SSH_DESCRIPTION_MAX);
     }
+    if (!any_workdir) {
+        strlcat(files, " none configured", sizeof(files));
+    }
     strlcpy(s_ssh.description, desc, sizeof(s_ssh.description));
+    strlcpy(s_ssh.files_description, files, sizeof(s_ssh.files_description));
     cJSON_Delete(hosts);
     free(desc);
 }
@@ -652,6 +947,7 @@ static bool cap_ssh_lookup_host(const char *name, cap_ssh_job_t *job, char *outp
         const char *host = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "host"));
         const char *user = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "user"));
         const char *fingerprint = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "fingerprint"));
+        const char *workdir = cJSON_GetStringValue(cJSON_GetObjectItem(entry, "workdir"));
         cJSON *port = cJSON_GetObjectItem(entry, "port");
 
         if (!entry_name || strcmp(entry_name, name) != 0) {
@@ -665,6 +961,11 @@ static bool cap_ssh_lookup_host(const char *name, cap_ssh_job_t *job, char *outp
         if (!fingerprint || strncmp(fingerprint, "SHA256:", 7) != 0) {
             snprintf(output, output_size,
                      "Error: ssh host '%s' has no pinned SHA256 host key fingerprint; refusing to connect", name);
+            break;
+        }
+        if (workdir && strlcpy(job->workdir, workdir, sizeof(job->workdir)) >= sizeof(job->workdir)) {
+            snprintf(output, output_size, "Error: ssh host '%s' has a workdir longer than %d bytes", name,
+                     CAP_SSH_FILES_PATH_MAX - 1);
             break;
         }
         strlcpy(job->host, host, sizeof(job->host));
@@ -703,6 +1004,21 @@ static void cap_ssh_write_result(const char *name, const cap_ssh_job_t *job, cha
     free(rendered);
 }
 
+/* Confirmation is only possible in the Telegram chat the request came from. Sub-agents working for
+ * such a request carry its chat but come from cap_agent_mgr; they may use the tools that never ask. */
+static bool cap_ssh_from_telegram(const claw_cap_call_context_t *ctx, bool allow_subagent)
+{
+    if (!ctx || !ctx->channel || strcmp(ctx->channel, "telegram") != 0 || !ctx->chat_id || !ctx->chat_id[0] ||
+            !ctx->source_cap) {
+        return false;
+    }
+    if (ctx->caller == CLAW_CAP_CALLER_AGENT && strcmp(ctx->source_cap, "tg_gateway") == 0) {
+        return true;
+    }
+    return allow_subagent && (ctx->caller == CLAW_CAP_CALLER_AGENT || ctx->caller == CLAW_CAP_CALLER_SUB_AGENT) &&
+           strcmp(ctx->source_cap, "cap_agent_mgr") == 0;
+}
+
 static esp_err_t cap_ssh_exec_execute(const char *input_json,
                                       const claw_cap_call_context_t *ctx,
                                       char *output,
@@ -728,9 +1044,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     int choice = -1;
     esp_err_t err;
 
-    /* Confirmation is only possible in the Telegram chat the request came from. */
-    if (!ctx || ctx->caller != CLAW_CAP_CALLER_AGENT || !ctx->channel || strcmp(ctx->channel, "telegram") != 0 ||
-            !ctx->source_cap || strcmp(ctx->source_cap, "tg_gateway") != 0 || !ctx->chat_id || !ctx->chat_id[0]) {
+    if (!cap_ssh_from_telegram(ctx, false)) {
         snprintf(output, output_size,
                  "Error: ssh_exec is only available for requests from an allowed Telegram chat");
         return ESP_ERR_NOT_SUPPORTED;
@@ -881,6 +1195,222 @@ cleanup:
     return err;
 }
 
+static void cap_ssh_remote_result(const char *name, const cap_ssh_job_t *job, char *output, size_t output_size)
+{
+    cJSON *root = NULL;
+    char *rendered = NULL;
+
+    if (job->op == CAP_SSH_OP_WRITE) {
+        snprintf(output, output_size, "OK: wrote %u bytes to %s:%s", (unsigned)job->out_len, name, job->path);
+        return;
+    }
+    if (job->op == CAP_SSH_OP_MKDIR || job->op == CAP_SSH_OP_DELETE) {
+        snprintf(output, output_size, job->op == CAP_SSH_OP_MKDIR ? "OK: directory %s:%s exists" : "OK: deleted %s:%s",
+                 name, job->path);
+        return;
+    }
+    root = cJSON_CreateObject();
+    if (root) {
+        cJSON_AddStringToObject(root, "host", name);
+        cJSON_AddStringToObject(root, "path", job->path);
+        if (job->op == CAP_SSH_OP_READ) {
+            cJSON_AddNumberToObject(root, "size", (double)job->size);
+            cJSON_AddNumberToObject(root, "offset", (double)job->offset);
+            cJSON_AddNumberToObject(root, "next_offset", (double)(job->offset + job->out_len));
+            cJSON_AddBoolToObject(root, "eof", job->offset + job->out_len >= job->size);
+            cJSON_AddStringToObject(root, "content", job->out);
+        } else {
+            cJSON_AddStringToObject(root, "entries", job->out);
+            cJSON_AddBoolToObject(root, "truncated", job->truncated);
+        }
+        rendered = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+    }
+    if (rendered && strlen(rendered) >= output_size) {
+        snprintf(output, output_size, "Error: result does not fit; read fewer bytes with max_bytes");
+    } else {
+        snprintf(output, output_size, "%s", rendered ? rendered : "Error: out of memory");
+    }
+    free(rendered);
+}
+
+/* remote_* tools: SFTP inside the host's workdir. Only remote_delete asks in Telegram. */
+static esp_err_t cap_ssh_remote_execute(cap_ssh_op_t op, const char *input_json, const claw_cap_call_context_t *ctx,
+                                        char *output, size_t output_size)
+{
+    cJSON *input = NULL;
+    cJSON *offset = NULL;
+    cJSON *max_bytes = NULL;
+    const char *name = NULL;
+    const char *path = NULL;
+    const char *content = NULL;
+    const char *const labels[] = {"🗑 Löschen", "❌ Abbrechen"};
+    cap_ssh_job_t *job = NULL;
+    char *html = NULL;
+    size_t prompt_len = 0;
+    int64_t message_id = 0;
+    int choice = -1;
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+
+    if (!cap_ssh_from_telegram(ctx, op != CAP_SSH_OP_DELETE)) {
+        snprintf(output, output_size, "Error: %s is only available for requests from an allowed Telegram chat",
+                 s_op_names[op]);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!s_ssh.key_ready) {
+        snprintf(output, output_size, "Error: SSH client key is not available");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    input = cJSON_Parse(input_json);
+    name = cJSON_GetStringValue(cJSON_GetObjectItem(input, "host"));
+    path = cJSON_GetStringValue(cJSON_GetObjectItem(input, "path"));
+    content = cJSON_GetStringValue(cJSON_GetObjectItem(input, "content"));
+    offset = cJSON_GetObjectItem(input, "offset");
+    max_bytes = cJSON_GetObjectItem(input, "max_bytes");
+    if (op == CAP_SSH_OP_LIST && (!path || !path[0])) {
+        path = ".";
+    }
+    if (!name || !name[0] || !path || !path[0] || (op == CAP_SSH_OP_WRITE && !content)) {
+        snprintf(output, output_size, "Error: host and path%s are required", op == CAP_SSH_OP_WRITE ? " and content" : "");
+        goto cleanup;
+    }
+    if (content && strlen(content) > CAP_SSH_WRITE_MAX) {
+        snprintf(output, output_size, "Error: content is longer than %d bytes; write the rest with append=true",
+                 CAP_SSH_WRITE_MAX);
+        goto cleanup;
+    }
+
+    job = calloc(1, sizeof(*job));
+    if (!job) {
+        err = ESP_ERR_NO_MEM;
+        snprintf(output, output_size, "Error: out of memory");
+        goto cleanup;
+    }
+    if (!cap_ssh_lookup_host(name, job, output, output_size)) {
+        goto cleanup;
+    }
+    /* Normalizes the workdir in place, then puts the path under it. */
+    if (!job->workdir[0] || !cap_ssh_files_resolve(job->workdir, ".", job->workdir, sizeof(job->workdir))) {
+        snprintf(output, output_size, "Error: ssh host '%s' has no valid workdir (an absolute path other than /)", name);
+        goto cleanup;
+    }
+    if (!cap_ssh_files_resolve(job->workdir, path, job->path, sizeof(job->path))) {
+        snprintf(output, output_size, "Error: path must stay inside the workdir %s (no '..', no control characters)",
+                 job->workdir);
+        goto cleanup;
+    }
+    if ((op == CAP_SSH_OP_WRITE || op == CAP_SSH_OP_DELETE) && strcmp(job->path, job->workdir) == 0) {
+        snprintf(output, output_size, "Error: path must name an entry inside the workdir");
+        goto cleanup;
+    }
+    job->op = op;
+    job->content = content;
+    job->content_len = content ? strlen(content) : 0;
+    job->append = cJSON_IsTrue(cJSON_GetObjectItem(input, "append"));
+    job->offset = cJSON_IsNumber(offset) && offset->valuedouble > 0 ? (uint64_t)offset->valuedouble : 0;
+    job->max_bytes = cJSON_IsNumber(max_bytes) && max_bytes->valuedouble >= 1 &&
+                     max_bytes->valuedouble < CAP_SSH_READ_MAX ? (size_t)max_bytes->valuedouble : CAP_SSH_READ_MAX;
+
+    if (op == CAP_SSH_OP_DELETE) {
+        /* Odd entries are config or LLM data and get escaped. */
+        const char *parts[] = {"<b>Löschen bestätigen</b>\nHost: <b>", name, "</b>\n<pre>", job->path, "</pre>"};
+
+        html = heap_caps_malloc(CAP_SSH_PROMPT_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!html) {
+            err = ESP_ERR_NO_MEM;
+            snprintf(output, output_size, "Error: out of memory");
+            goto cleanup;
+        }
+        for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+            cap_ssh_html_put(html, &prompt_len, parts[i], i % 2 == 1);
+        }
+        err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_SSH_CONFIRM_TIMEOUT_MS, &choice, &message_id);
+        if (err != ESP_OK) {
+            snprintf(output, output_size, "Error: could not ask for confirmation in Telegram (%s)", esp_err_to_name(err));
+            goto cleanup;
+        }
+        if (choice != 0) {
+            cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len,
+                                  choice < 0 ? "⌛ Zeitüberschreitung" : "❌ abgelehnt", "");
+            snprintf(output, output_size, "Error: %s",
+                     choice < 0 ? "Zeitüberschreitung: keine Bestätigung innerhalb von 60 s" : "abgelehnt vom Benutzer");
+            err = choice < 0 ? ESP_ERR_TIMEOUT : ESP_FAIL;
+            goto cleanup;
+        }
+    }
+
+    if (op == CAP_SSH_OP_READ || op == CAP_SSH_OP_LIST) {
+        job->out = heap_caps_calloc(1, (op == CAP_SSH_OP_READ ? job->max_bytes : CAP_SSH_OUTPUT_MAX) + 1,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    job->done = xSemaphoreCreateBinary();
+    if ((!job->out && (op == CAP_SSH_OP_READ || op == CAP_SSH_OP_LIST)) || !job->done ||
+            xQueueSend(s_ssh.queue, &job, 0) != pdTRUE) {
+        err = ESP_ERR_NO_MEM;
+        snprintf(output, output_size, "Error: could not start the SSH session");
+    } else {
+        /* The worker bounds every step with its own timeouts. */
+        xSemaphoreTake(job->done, portMAX_DELAY);
+        if (job->error[0]) {
+            err = ESP_FAIL;
+            snprintf(output, output_size, "Error: %s %s: %s", s_op_names[op], name, job->error);
+        } else if (job->timed_out) {
+            err = ESP_ERR_TIMEOUT;
+            snprintf(output, output_size, "Error: %s %s: stopped after 30 s%s", s_op_names[op], name,
+                     op == CAP_SSH_OP_WRITE ? "; the file is incomplete" : "");
+        } else {
+            err = ESP_OK;
+            cap_ssh_remote_result(name, job, output, output_size);
+        }
+    }
+    if (html) {
+        cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len, err == ESP_OK ? "✅ gelöscht" : "⚠️ fehlgeschlagen", "");
+    }
+
+cleanup:
+    if (job) {
+        if (job->done) {
+            vSemaphoreDelete(job->done);
+        }
+        free(job->out);
+        free(job);
+    }
+    free(html);
+    cJSON_Delete(input);
+    return err;
+}
+
+static esp_err_t cap_ssh_remote_write(const char *input_json, const claw_cap_call_context_t *ctx, char *output,
+                                      size_t output_size)
+{
+    return cap_ssh_remote_execute(CAP_SSH_OP_WRITE, input_json, ctx, output, output_size);
+}
+
+static esp_err_t cap_ssh_remote_read(const char *input_json, const claw_cap_call_context_t *ctx, char *output,
+                                     size_t output_size)
+{
+    return cap_ssh_remote_execute(CAP_SSH_OP_READ, input_json, ctx, output, output_size);
+}
+
+static esp_err_t cap_ssh_remote_list(const char *input_json, const claw_cap_call_context_t *ctx, char *output,
+                                     size_t output_size)
+{
+    return cap_ssh_remote_execute(CAP_SSH_OP_LIST, input_json, ctx, output, output_size);
+}
+
+static esp_err_t cap_ssh_remote_mkdir(const char *input_json, const claw_cap_call_context_t *ctx, char *output,
+                                      size_t output_size)
+{
+    return cap_ssh_remote_execute(CAP_SSH_OP_MKDIR, input_json, ctx, output, output_size);
+}
+
+static esp_err_t cap_ssh_remote_delete(const char *input_json, const claw_cap_call_context_t *ctx, char *output,
+                                       size_t output_size)
+{
+    return cap_ssh_remote_execute(CAP_SSH_OP_DELETE, input_json, ctx, output, output_size);
+}
+
 static esp_err_t cap_ssh_command_execute(const char *input_json,
                                          const claw_cap_call_context_t *ctx,
                                          char *output,
@@ -989,6 +1519,78 @@ static const claw_cap_descriptor_t s_ssh_descriptors[] = {
         "\"command\":{\"type\":\"string\",\"description\":\"Shell command to run\"}},"
         "\"required\":[\"host\",\"command\"]}",
         .execute = cap_ssh_exec_execute,
+    },
+    {
+        .id = "remote_write_file",
+        .name = "remote_write_file",
+        .family = "files",
+        .description = s_ssh.files_description,
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\",\"description\":\"Host with a workdir\"},"
+        "\"path\":{\"type\":\"string\",\"description\":\"File path relative to the workdir; missing directories are created\"},"
+        "\"content\":{\"type\":\"string\",\"description\":\"UTF-8 text, at most 65536 bytes\"},"
+        "\"append\":{\"type\":\"boolean\",\"description\":\"Append instead of overwrite\"}},"
+        "\"required\":[\"host\",\"path\",\"content\"]}",
+        .execute = cap_ssh_remote_write,
+    },
+    {
+        .id = "remote_read_file",
+        .name = "remote_read_file",
+        .family = "files",
+        .description = "Read a UTF-8 text file from an SSH host's workdir (see remote_write_file), at most 16 KB per "
+                       "call; continue at next_offset until eof. Binary files are refused.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\",\"description\":\"File path relative to the workdir\"},"
+        "\"offset\":{\"type\":\"integer\",\"description\":\"Byte offset, default 0\"},"
+        "\"max_bytes\":{\"type\":\"integer\",\"description\":\"Default and maximum 16384\"}},"
+        "\"required\":[\"host\",\"path\"]}",
+        .execute = cap_ssh_remote_read,
+    },
+    {
+        .id = "remote_list",
+        .name = "remote_list",
+        .family = "files",
+        .description = "List a directory in an SSH host's workdir: one entry per line, \"name/\" for directories, "
+                       "\"name@\" for symlinks, \"name size\" for files.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\",\"description\":\"Directory relative to the workdir, default the workdir\"}},"
+        "\"required\":[\"host\"]}",
+        .execute = cap_ssh_remote_list,
+    },
+    {
+        .id = "remote_mkdir",
+        .name = "remote_mkdir",
+        .family = "files",
+        .description = "Create a directory, with missing parents, in an SSH host's workdir.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\",\"description\":\"Directory relative to the workdir\"}},"
+        "\"required\":[\"host\",\"path\"]}",
+        .execute = cap_ssh_remote_mkdir,
+    },
+    {
+        .id = "remote_delete",
+        .name = "remote_delete",
+        .family = "files",
+        .description = "Delete a file or empty directory in an SSH host's workdir after the user confirms it in "
+                       "Telegram.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM | CLAW_CAP_FLAG_ROOT_AGENT_ONLY,
+        .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\"},"
+        "\"path\":{\"type\":\"string\",\"description\":\"Path relative to the workdir\"}},"
+        "\"required\":[\"host\",\"path\"]}",
+        .execute = cap_ssh_remote_delete,
     },
     {
         .id = "ssh_command",

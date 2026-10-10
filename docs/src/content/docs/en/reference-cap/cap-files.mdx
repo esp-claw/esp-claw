@@ -83,6 +83,10 @@ cap_files_ensure_parent_dirs(resolved_path);
 // e.g. /fatfs → /fatfs/notes → /fatfs/notes/2026 …
 ```
 
+### User file area quota
+
+The data root outside its system directories (`apps`, `inbox`, `memory`, `router_rules`, `scheduler`, `scripts`, `sessions`, `skills`, `static`) is the user file area. `write_file`, `copy_file`, and `move_file` (from a system directory) into it are limited to 32 KB per file and 128 KB in total (`cap_files_quota.h`); the error points to `remote_write_file` (cap_ssh), since work files belong on a remote host. Writes into the system directories are not limited.
+
 ### `copy_file` / `move_file`: sandboxed paths and destination preparation
 
 Both `copy_file` and `move_file` require the source and destination to stay under the managed root, and they reject identical source/destination paths.
