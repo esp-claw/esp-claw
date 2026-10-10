@@ -45,11 +45,22 @@ export type AppConfig = {
   llm_visible_cap_groups: string;
   enabled_lua_modules: string;
   time_timezone: string;
+  webdav_user: string;
+  webdav_password: string;
 };
 
 /** Server-side configuration groups (must stay in sync with
  * CONFIG_FIELDS in http_server_config_api.c). */
-export type ConfigGroup = 'wifi' | 'llm' | 'im' | 'search' | 'stt' | 'capabilities' | 'skills' | 'time';
+export type ConfigGroup =
+  | 'wifi'
+  | 'llm'
+  | 'im'
+  | 'search'
+  | 'stt'
+  | 'capabilities'
+  | 'skills'
+  | 'time'
+  | 'webdav';
 
 export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   wifi: ['wifi_ssid', 'wifi_password', 'ap_ssid', 'ap_password', 'ap_behavior'],
@@ -85,6 +96,7 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups', 'ssh_hosts', 'wol_targets'],
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],
+  webdav: ['webdav_user', 'webdav_password'],
 };
 
 export function blankConfig(): Partial<AppConfig> {

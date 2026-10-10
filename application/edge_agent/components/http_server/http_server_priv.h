@@ -17,6 +17,7 @@
 #define HTTP_SERVER_SCRATCH_SIZE      4096
 #define HTTP_SERVER_PATH_MAX          256
 #define HTTP_SERVER_UPLOAD_MAX_SIZE   (512 * 1024)
+#define HTTP_SERVER_TMP_SUFFIX        ".davtmp"
 
 typedef struct {
     httpd_handle_t server;
@@ -43,6 +44,9 @@ bool http_server_build_child_relative_path(const char *base_path,
                                            const char *entry_name,
                                            char *out_path,
                                            size_t out_path_size);
+int http_server_recv_to_file(httpd_req_t *req, const char *path);
+int http_server_replace_file(const char *src, const char *dst);
+int http_server_rmdir_recursive(const char *path);
 
 esp_err_t http_server_register_assets_routes(httpd_handle_t server);
 esp_err_t http_server_register_capabilities_routes(httpd_handle_t server);
@@ -55,5 +59,7 @@ esp_err_t http_server_register_lua_app_routes(httpd_handle_t server);
 #endif
 esp_err_t http_server_register_wechat_routes(httpd_handle_t server);
 esp_err_t http_server_register_webim_routes(httpd_handle_t server);
+esp_err_t http_server_register_webdav_routes(httpd_handle_t server);
+void http_server_webdav_apply_config(const app_config_t *config);
 void http_server_webim_ws_fd_remove(int fd);
 esp_err_t http_server_captive_404_handler(httpd_req_t *req, httpd_err_code_t error);
