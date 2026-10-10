@@ -28,6 +28,10 @@ void cap_wasm_apps_set_trust(const char *trusted_keys_json, bool allow_unsigned)
  *         app in <base_path>/apps/<name>/ in the "cap_wasm_apps" group (apps load on their first
  *         call), plus the management tools and the /apps and /app command handler in
  *         "cap_wasm_apps_mgr". App errors are logged and never fail boot.
+ *
+ *         The same group holds the firmware update tools (firmware_status/check/update and the
+ *         /fw handler, signed by the same trusted keys), and this call starts the post-update
+ *         health check that confirms a freshly booted image or lets the bootloader roll back.
  */
 esp_err_t cap_wasm_apps_register_group(const char *base_path);
 

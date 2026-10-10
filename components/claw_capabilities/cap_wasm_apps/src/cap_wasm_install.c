@@ -41,10 +41,14 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_OUTPUT_MAX    1024
 #define CAP_WASM_MAX_REDIRECTS 5
 
-static atomic_flag s_busy = ATOMIC_FLAG_INIT;
+atomic_flag g_cap_wasm_busy = ATOMIC_FLAG_INIT;
 
 typedef struct {
-    uint8_t *buf;
+    uint8_t *buf;         /* with max: collect the body here... */
+    size_t max;
+    cap_wasm_sink_t sink; /* ...or hand it to sink */
+    void *sink_ctx;
+    bool sink_failed;
     size_t len;
     bool too_big;
     bool redirect_refused;
@@ -79,10 +83,16 @@ static esp_err_t cap_wasm_dl_event(esp_http_client_event_t *evt)
         return esp_http_client_set_redirection(evt->client);
     }
     /* Bodies of redirect responses also arrive here. */
-    if (evt->event_id != HTTP_EVENT_ON_DATA || esp_http_client_get_status_code(evt->client) != 200 || dl->too_big) {
+    if (evt->event_id != HTTP_EVENT_ON_DATA || esp_http_client_get_status_code(evt->client) != 200 || dl->too_big ||
+            dl->sink_failed) {
         return ESP_OK;
     }
-    if ((size_t)evt->data_len > CAP_WASM_PKG_MAX - dl->len) {
+    if (dl->sink) {
+        dl->sink_failed = !dl->sink(dl->sink_ctx, evt->data, evt->data_len);
+        dl->len += evt->data_len;
+        return ESP_OK;
+    }
+    if ((size_t)evt->data_len > dl->max - dl->len) {
         dl->too_big = true;
         return ESP_OK;
     }
@@ -91,13 +101,13 @@ static esp_err_t cap_wasm_dl_event(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-static uint8_t *cap_wasm_download(const char *url, size_t *out_len, char *err, size_t err_size)
+/* GET `url` into dl (buffer or sink); ESP_OK on HTTP 200 with the whole body taken. */
+static esp_err_t cap_wasm_fetch(const char *url, cap_wasm_dl_t *dl, char *err, size_t err_size)
 {
-    cap_wasm_dl_t dl = { .buf = heap_caps_malloc(CAP_WASM_PKG_MAX, CAP_WASM_PSRAM_CAPS) };
     esp_http_client_config_t cfg = {
         .url = url,
         .event_handler = cap_wasm_dl_event,
-        .user_data = &dl,
+        .user_data = dl,
         .timeout_ms = CAP_WASM_HTTP_MS,
         .buffer_size = 4096, /* response headers, incl. a long Location */
         .buffer_size_tx = CAP_HTTP_REQUEST_REDIRECT_URL_MAX + 512, /* request line of the redirect target */
@@ -105,30 +115,55 @@ static uint8_t *cap_wasm_download(const char *url, size_t *out_len, char *err, s
         .disable_auto_redirect = true,
         .max_redirection_count = CAP_WASM_MAX_REDIRECTS,
     };
-    esp_http_client_handle_t client = dl.buf ? esp_http_client_init(&cfg) : NULL;
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_err_t ret = client ? esp_http_client_perform(client) : ESP_ERR_NO_MEM;
     int status = client ? esp_http_client_get_status_code(client) : 0;
 
     if (client) {
         esp_http_client_cleanup(client);
     }
-    free(dl.location);
+    free(dl->location);
+    dl->location = NULL;
     /* The query string may carry a token, so it is not logged. */
     ESP_LOGI(TAG, "download %.*s: %s, HTTP %d, %u bytes", (int)strcspn(url, "?#"), url, esp_err_to_name(ret), status,
-             (unsigned)dl.len);
-    if (ret == ESP_OK && status == 200 && !dl.too_big && dl.len > 0) {
-        *out_len = dl.len;
-        return dl.buf;
+             (unsigned)dl->len);
+    if (ret == ESP_OK && status == 200 && !dl->too_big && !dl->sink_failed && dl->len > 0) {
+        return ESP_OK;
     }
-    if (dl.too_big) {
-        snprintf(err, err_size, "the package is larger than %d KB", CAP_WASM_PKG_MAX / 1024);
-    } else if (dl.redirect_refused) {
+    if (dl->too_big) {
+        snprintf(err, err_size, "the download is larger than %u KB", (unsigned)(dl->max / 1024));
+    } else if (dl->sink_failed) {
+        snprintf(err, err_size, "cannot store the download");
+    } else if (dl->redirect_refused) {
         snprintf(err, err_size, "redirect refused (HTTP %d to a non-https or overlong URL)", status);
     } else {
         snprintf(err, err_size, "download failed (%s, HTTP %d)", esp_err_to_name(ret), status);
     }
-    heap_caps_free(dl.buf);
-    return NULL;
+    return ESP_FAIL;
+}
+
+uint8_t *cap_wasm_download(const char *url, size_t max, size_t *out_len, char *err, size_t err_size)
+{
+    cap_wasm_dl_t dl = { .buf = heap_caps_malloc(max + 1, CAP_WASM_PSRAM_CAPS), .max = max };
+
+    if (!dl.buf) {
+        snprintf(err, err_size, "out of memory");
+        return NULL;
+    }
+    if (cap_wasm_fetch(url, &dl, err, err_size) != ESP_OK) {
+        heap_caps_free(dl.buf);
+        return NULL;
+    }
+    dl.buf[dl.len] = '\0';
+    *out_len = dl.len;
+    return dl.buf;
+}
+
+esp_err_t cap_wasm_stream(const char *url, cap_wasm_sink_t sink, void *ctx, char *err, size_t err_size)
+{
+    cap_wasm_dl_t dl = { .sink = sink, .sink_ctx = ctx };
+
+    return cap_wasm_fetch(url, &dl, err, err_size);
 }
 
 /* Version from <apps>/<name>/manifest.json into `out` ("" when not installed or unreadable). */
@@ -192,7 +227,7 @@ static size_t cap_wasm_html_escape(char *dst, size_t size, const char *src)
 }
 
 /* Shows `html` with a confirm and a cancel button; ESP_OK when confirmed. */
-static esp_err_t cap_wasm_ask(const char *chat, char *html, size_t html_size, const char *yes_label)
+esp_err_t cap_wasm_ask(const char *chat, char *html, size_t html_size, const char *yes_label)
 {
 #if CONFIG_APP_CLAW_CAP_IM_TG
     const char *const labels[] = { yes_label, "❌ Abbrechen" };
@@ -308,12 +343,12 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
                  "the URL must start with https:// and have at most 255 chars");
         return ESP_ERR_INVALID_ARG;
     }
-    if (atomic_flag_test_and_set(&s_busy)) {
-        snprintf(output, output_size, "Error: another app install is running, try again later");
+    if (atomic_flag_test_and_set(&g_cap_wasm_busy)) {
+        snprintf(output, output_size, "Error: another app install or firmware update is running, try again later");
         return ESP_ERR_INVALID_STATE;
     }
 
-    buf = cap_wasm_download(url, &len, err, sizeof(err));
+    buf = cap_wasm_download(url, CAP_WASM_PKG_MAX, &len, err, sizeof(err));
     if (!buf || !cap_wasm_pkg_parse(buf, len, &pkg, err, sizeof(err))) {
         snprintf(output, output_size, "Error: %s", err);
         goto done;
@@ -375,7 +410,7 @@ done:
     heap_caps_free(manifest);
     heap_caps_free(sig);
     heap_caps_free(html);
-    atomic_flag_clear(&s_busy);
+    atomic_flag_clear(&g_cap_wasm_busy);
     return ret;
 }
 
@@ -431,6 +466,8 @@ static void cap_wasm_job_task(void *arg)
     force = strcmp(a, "--force") == 0;
     if (!output) {
         ESP_LOGE(TAG, "/app %s: out of memory", verb);
+    } else if (strcmp(verb, "fw") == 0) {
+        cap_wasm_fw_command(job->command + 2, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "install") == 0) {
         cap_wasm_install(force ? b : a, NULL, force, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "update") == 0 && a[0]) {

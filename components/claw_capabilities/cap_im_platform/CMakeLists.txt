@@ -51,3 +51,5 @@ idf_component_register(
         mbedtls
         console
 )
+
+idf_component_optional_requires(PRIVATE claw_skill)

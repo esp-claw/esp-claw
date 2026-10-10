@@ -65,18 +65,32 @@ add_custom_target(edge_agent_prepare_system_fs_image ALL
     VERBATIM
 )
 
-fatfs_create_rawflash_image(system "${EDGE_AGENT_FATFS_SYSTEM_BUILD_ROOT}" FLASH_IN_PROJECT)
+if(CONFIG_EDGE_AGENT_SYSTEM_FS_EMBEDDED)
+    # No system partition: pack the staging tree (minus the display fonts) into an image that
+    # main embeds in the app and serves at /system (main/app_romfs.c).
+    set(EDGE_AGENT_SYSTEM_FS_TARGET edge_agent_system_fs_blob)
+    idf_build_get_property(python PYTHON)
+    add_custom_target(edge_agent_system_fs_blob ALL
+        COMMAND ${python} "${CMAKE_SOURCE_DIR}/tools/pack_system_fs.py"
+                "${EDGE_AGENT_FATFS_SYSTEM_BUILD_ROOT}" "${CMAKE_BINARY_DIR}/system_fs.bin" --exclude fonts
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/system_fs.bin"
+        VERBATIM
+    )
+else()
+    set(EDGE_AGENT_SYSTEM_FS_TARGET fatfs_system_bin)
+    fatfs_create_rawflash_image(system "${EDGE_AGENT_FATFS_SYSTEM_BUILD_ROOT}" FLASH_IN_PROJECT)
+endif()
 fatfs_create_spiflash_image(storage "${EDGE_AGENT_FATFS_BUILD_ROOT}" FLASH_IN_PROJECT)
 
-# Skill / Lua resources are now baked into the read-only system partition
-# so storage can be reformatted at runtime without losing them.
+# Skill / Lua resources are now baked into the read-only system partition (or the embedded
+# system image) so storage can be reformatted at runtime without losing them.
 skill_builder_configure_skill_sync(
-    TARGET fatfs_system_bin
+    TARGET ${EDGE_AGENT_SYSTEM_FS_TARGET}
     SKILL_OUTPUT_DIR "${EDGE_AGENT_FATFS_SYSTEM_BUILD_ROOT}/skills"
 )
 
 lua_module_builder_configure_builtin_lua_sync(
-    TARGET fatfs_system_bin
+    TARGET ${EDGE_AGENT_SYSTEM_FS_TARGET}
     BUILTIN_OUTPUT_DIR "${EDGE_AGENT_FATFS_SYSTEM_BUILD_ROOT}/scripts/builtin"
     DOCS_OUTPUT_DIR "${EDGE_AGENT_FATFS_SYSTEM_BUILD_ROOT}/scripts/docs"
 )
@@ -84,5 +98,5 @@ lua_module_builder_configure_builtin_lua_sync(
 add_dependencies(skill_builder_sync_skills edge_agent_prepare_system_fs_image)
 add_dependencies(lua_module_builder_sync_builtin_scripts edge_agent_prepare_system_fs_image)
 add_dependencies(lua_module_builder_sync_docs edge_agent_prepare_system_fs_image)
-add_dependencies(fatfs_system_bin edge_agent_prepare_system_fs_image)
+add_dependencies(${EDGE_AGENT_SYSTEM_FS_TARGET} edge_agent_prepare_system_fs_image)
 add_dependencies(fatfs_storage_bin edge_agent_prepare_fatfs_image)

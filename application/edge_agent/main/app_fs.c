@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "app_fs.h"
+#include "app_romfs.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -181,6 +182,13 @@ static const char *storage_sdcard_mount_point(void)
 
 static esp_err_t app_fs_init_system(void)
 {
+#if CONFIG_EDGE_AGENT_SYSTEM_FS_EMBEDDED
+    // Skills, scripts and recovery seeds are embedded in the app image, so an OTA update
+    // replaces them together with the firmware.
+    ESP_RETURN_ON_ERROR(app_romfs_register(s_system_base_path), TAG, "Failed to register embedded system files");
+    ESP_LOGI(TAG, "Embedded system files served at %s", s_system_base_path);
+    return ESP_OK;
+#else
     esp_vfs_fat_mount_config_t mount_config = {
         .max_files = 8,
         .allocation_unit_size = 4096,
@@ -194,6 +202,7 @@ static esp_err_t app_fs_init_system(void)
 
     log_fatfs_info(s_system_base_path);
     return ESP_OK;
+#endif
 }
 
 static esp_err_t app_fs_init_storage(void)

@@ -1,0 +1,45 @@
+# Builds edge_agent for esp32_S3_DevKitC_1 on a release tag (vMAJOR.MINOR.PATCH) and attaches the
+# unsigned app image to the GitHub release as edge_agent.bin. Sign it locally with
+#   tools/fwsign.py sign edge_agent.bin --key <ed25519.pem>
+# and upload edge_agent.bin.sig.json to the same release: devices look for exactly these two
+# asset names in the latest release (/fw check, /fw update).
+name: Firmware release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build edge_agent (esp32_S3_DevKitC_1)
+        shell: bash
+        working-directory: application/edge_agent
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # The device compares versions like semver; esp_app_desc_t holds at most 31 chars.
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ && ${#version} -le 31 ]] || {
+            echo "tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-PRE]"; exit 1; }
+          git config --global --add safe.directory '*'
+          . "$IDF_PATH/export.sh"
+          pip install esp-bmgr-assist
+          # version.txt takes precedence over project(VERSION) for esp_app_desc_t.version.
+          echo "$version" > version.txt
+          idf.py bmgr -c ./boards -b esp32_S3_DevKitC_1
+          idf.py build
+          grep -q '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8MB_ota.csv"$' sdkconfig
+          sha256sum build/edge_agent.bin
+
+      - name: Attach the unsigned image to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: application/edge_agent/build/edge_agent.bin
+          fail_on_unmatched_files: true

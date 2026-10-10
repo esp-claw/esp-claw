@@ -8,6 +8,7 @@
 #include "claw_utils_string.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -22,8 +23,10 @@
 #include "claw_core.h"
 #include "claw_task.h"
 #include "claw_event_publisher.h"
+#include "claw_cap.h"
 #include "esp_crt_bundle.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -33,12 +36,18 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#if CONFIG_APP_CLAW_CAP_SKILL_MGR
+#include "claw_skill.h"
+#endif
 
 static const char *TAG = "cap_im_tg";
 
 #define CAP_IM_TG_API_BASE            "https://api.telegram.org"
 #define CAP_IM_TG_HTTP_RESP_INIT      2048
 #define CAP_IM_TG_MAX_MSG_LEN         4096
+#define CAP_IM_TG_LIST_MAX            (8 * 1024) /* /help, /skills, /tools replies, sent in chunks */
+#define CAP_IM_TG_LIST_TAIL           32         /* room kept for "… and N more" */
+#define CAP_IM_TG_SUMMARY_MAX         100        /* bytes of a skill summary in /skills */
 /* Rich messages allow 32768 characters and 500 blocks; stay well below both. */
 #define CAP_IM_TG_RICH_MAX_BYTES      30000
 #define CAP_IM_TG_RICH_MAX_LINES      400
@@ -141,6 +150,7 @@ typedef struct {
 } cap_im_tg_confirm_t;
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
+static volatile bool s_tg_online; /* a getUpdates poll succeeded since boot */
 static bool s_tg_initialized;
 static bool s_tg_rich_unsupported;
 static cap_im_tg_confirm_t s_confirm;
@@ -1104,6 +1114,249 @@ static void cap_im_tg_handle_cap_command(const char *chat_id, const char *text, 
     free(output);
 }
 
+/* Appends to a list reply; once full, only counts what did not fit. */
+typedef struct {
+    char *buf;
+    size_t size;
+    size_t len;
+    size_t dropped;
+} cap_im_tg_list_t;
+
+static void cap_im_tg_list_add(cap_im_tg_list_t *list, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (list->dropped) {
+        list->dropped++;
+        return;
+    }
+    va_start(ap, fmt);
+    n = vsnprintf(list->buf + list->len, list->size - list->len, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= list->size - list->len - CAP_IM_TG_LIST_TAIL) {
+        list->buf[list->len] = '\0';
+        list->dropped = 1;
+        return;
+    }
+    list->len += (size_t)n;
+}
+
+/* Sends the list; cap_im_tg_send_text() splits it into messages within Telegram's limit. */
+static void cap_im_tg_list_send(const char *chat_id, cap_im_tg_list_t *list, const char *what)
+{
+    if (list->dropped) {
+        snprintf(list->buf + list->len, list->size - list->len, "\n… and %u more", (unsigned)list->dropped);
+    }
+    if (cap_im_tg_send_text(chat_id, list->buf) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send the %s list", what);
+    }
+}
+
+static bool cap_im_tg_list_init(cap_im_tg_list_t *list)
+{
+    *list = (cap_im_tg_list_t) {
+        .buf = heap_caps_malloc(CAP_IM_TG_LIST_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .size = CAP_IM_TG_LIST_MAX,
+    };
+    if (list->buf) {
+        list->buf[0] = '\0';
+    }
+    return list->buf != NULL;
+}
+
+static void cap_im_tg_cmd_help(const char *chat_id, const char *args);
+static void cap_im_tg_cmd_skills(const char *chat_id, const char *args);
+static void cap_im_tg_cmd_tools(const char *chat_id, const char *args);
+
+/*
+ * Every slash command handled here: the source of truth for dispatch, /help and setMyCommands.
+ * A command with a cap is offered only while that cap is registered (its capability is enabled)
+ * and gets {"command": "<args>"}; the others run locally.
+ */
+static const struct {
+    const char *name;
+    const char *description;
+    const char *cap;
+    void (*handler)(const char *chat_id, const char *args);
+} s_tg_commands[] = {
+    {"help", "List these commands", NULL, cap_im_tg_cmd_help},
+    {"session", "Manage chat sessions (new, list, switch, delete)", "session_command", NULL},
+    {"llm", "Configure the LLM model and endpoint", "llm_config_command", NULL},
+    {"skills", "List the registered skills", NULL, cap_im_tg_cmd_skills},
+    {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},
+    {"ssh", "SSH client (pubkey, allowed, allow, revoke)", "ssh_command", NULL},
+    {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
+    {"app", "Install, update or remove a WASM app", "apps_command", NULL},
+    {"fw", "Firmware status, check and update", "firmware_command", NULL},
+};
+#define CAP_IM_TG_COMMAND_COUNT (sizeof(s_tg_commands) / sizeof(s_tg_commands[0]))
+
+static bool cap_im_tg_command_enabled(size_t i)
+{
+    return !s_tg_commands[i].cap || claw_cap_find(s_tg_commands[i].cap) != NULL;
+}
+
+/* Bit i set when s_tg_commands[i] is offered. */
+static uint32_t cap_im_tg_command_mask(void)
+{
+    uint32_t mask = 0;
+
+    for (size_t i = 0; i < CAP_IM_TG_COMMAND_COUNT; i++) {
+        mask |= cap_im_tg_command_enabled(i) ? 1u << i : 0;
+    }
+    return mask;
+}
+
+static void cap_im_tg_cmd_help(const char *chat_id, const char *args)
+{
+    cap_im_tg_list_t list;
+
+    (void)args;
+    if (!cap_im_tg_list_init(&list)) {
+        return;
+    }
+    cap_im_tg_list_add(&list, "Commands:");
+    for (size_t i = 0; i < CAP_IM_TG_COMMAND_COUNT; i++) {
+        if (cap_im_tg_command_enabled(i)) {
+            cap_im_tg_list_add(&list, "\n/%s — %s", s_tg_commands[i].name, s_tg_commands[i].description);
+        }
+    }
+    cap_im_tg_list_add(&list, "\nAnything else goes to the assistant.");
+    cap_im_tg_list_send(chat_id, &list, "command");
+    free(list.buf);
+}
+
+#if CONFIG_APP_CLAW_CAP_SKILL_MGR
+static esp_err_t cap_im_tg_add_skill(const claw_skill_catalog_entry_t *entry, void *user_ctx)
+{
+    cap_im_tg_list_t *list = user_ctx;
+    const char *summary = entry->summary ? entry->summary : "";
+    size_t len = claw_utils_utf8_prefix_len(summary, CAP_IM_TG_SUMMARY_MAX);
+
+    cap_im_tg_list_add(list, "\n`%s` %s — %.*s%s", entry->id,
+                       entry->manage_mode == CLAW_SKILL_MANAGE_MODE_READONLY ? "(readonly)" : "(runtime)",
+                       (int)len, summary, summary[len] ? "…" : "");
+    return ESP_OK;
+}
+#endif
+
+static void cap_im_tg_cmd_skills(const char *chat_id, const char *args)
+{
+    cap_im_tg_list_t list;
+
+    (void)args;
+    if (!cap_im_tg_list_init(&list)) {
+        return;
+    }
+    cap_im_tg_list_add(&list, "Skills:");
+#if CONFIG_APP_CLAW_CAP_SKILL_MGR
+    if (claw_skill_foreach_catalog_entry(cap_im_tg_add_skill, &list) != ESP_OK) {
+        cap_im_tg_list_add(&list, "\n(the skill registry is not ready)");
+    }
+#else
+    cap_im_tg_list_add(&list, "\n(skills are not enabled in this firmware)");
+#endif
+    cap_im_tg_list_send(chat_id, &list, "skill");
+    free(list.buf);
+}
+
+/* The WASM app tools with their app and state, from apps_status (cap_wasm_apps). */
+static void cap_im_tg_add_wasm_tools(cap_im_tg_list_t *list)
+{
+    const size_t size = 4096;
+    char *status = malloc(size);
+    cJSON *apps = NULL;
+    const cJSON *app = NULL;
+
+    if (status && claw_cap_call("apps_status", "{}", &(claw_cap_call_context_t) {
+                .channel = "telegram",
+                .source_cap = "tg_gateway",
+                .caller = CLAW_CAP_CALLER_SYSTEM,
+            }, status, size) == ESP_OK) {
+        apps = cJSON_Parse(status);
+    }
+    free(status);
+    cJSON_ArrayForEach(app, apps) {
+        const cJSON *tool = NULL;
+        bool first = true;
+
+        cap_im_tg_list_add(list, "\nWASM app `%s` (%s, %s):",
+                           cJSON_GetStringValue(cJSON_GetObjectItem(app, "name")) ?: "?",
+                           cJSON_GetStringValue(cJSON_GetObjectItem(app, "state")) ?: "?",
+                           cJSON_IsTrue(cJSON_GetObjectItem(app, "loaded")) ? "loaded" : "unloaded");
+        cJSON_ArrayForEach(tool, cJSON_GetObjectItem(app, "tools")) {
+            cap_im_tg_list_add(list, "%s `%s`", first ? "" : ",", cJSON_GetStringValue(tool) ?: "?");
+            first = false;
+        }
+        if (first) {
+            cap_im_tg_list_add(list, " no tools");
+        }
+    }
+    cJSON_Delete(apps);
+}
+
+static void cap_im_tg_cmd_tools(const char *chat_id, const char *args)
+{
+    claw_cap_group_list_t groups = claw_cap_list_groups();
+    cap_im_tg_list_t list;
+
+    (void)args;
+    if (!cap_im_tg_list_init(&list)) {
+        return;
+    }
+    cap_im_tg_list_add(&list, "Tools the LLM can call, by capability:");
+    for (size_t g = 0; g < groups.count; g++) {
+        claw_cap_list_t caps = claw_cap_list();
+        bool first = true;
+
+        /* App tools are listed per app below. */
+        if (strcmp(groups.items[g].group_id, "cap_wasm_apps") == 0) {
+            continue;
+        }
+        for (size_t i = 0; i < caps.count; i++) {
+            claw_cap_descriptor_info_t info;
+
+            if (!(caps.items[i].cap_flags & CLAW_CAP_FLAG_CALLABLE_BY_LLM) ||
+                    claw_cap_get_descriptor_state(caps.items[i].name, &info) != ESP_OK || !info.group_id ||
+                    strcmp(info.group_id, groups.items[g].group_id) != 0) {
+                continue;
+            }
+            cap_im_tg_list_add(&list, first ? "\n%s: `%s`" : ", `%s`", first ? groups.items[g].group_id : caps.items[i].name,
+                               caps.items[i].name);
+            first = false;
+        }
+    }
+    if (claw_cap_find("apps_status")) {
+        cap_im_tg_add_wasm_tools(&list);
+    }
+    cap_im_tg_list_send(chat_id, &list, "tool");
+    free(list.buf);
+}
+
+/* Runs `text` when it is one of s_tg_commands (and enabled); false otherwise. */
+static bool cap_im_tg_dispatch_command(const char *chat_id, const char *text)
+{
+    char command[24];
+
+    for (size_t i = 0; i < CAP_IM_TG_COMMAND_COUNT; i++) {
+        snprintf(command, sizeof(command), "/%s", s_tg_commands[i].name);
+        if (!cap_im_tg_is_command(text, command) || !cap_im_tg_command_enabled(i)) {
+            continue;
+        }
+        if (s_tg_commands[i].handler) {
+            const char *args = text + strlen(command);
+
+            args += *args == '@' ? strcspn(args, " ") : 0;
+            s_tg_commands[i].handler(chat_id, args + strspn(args, " "));
+        } else {
+            cap_im_tg_handle_cap_command(chat_id, text, command, s_tg_commands[i].cap);
+        }
+        return true;
+    }
+    return false;
+}
+
 static void cap_im_tg_handle_update(cJSON *update_json)
 {
     cJSON *update_id_json;
@@ -1268,17 +1521,10 @@ static void cap_im_tg_handle_update(cJSON *update_json)
 
     text_json = cJSON_GetObjectItem(message_json, "text");
     if (cJSON_IsString(text_json) && text_json->valuestring &&
-            cap_im_tg_is_command(text_json->valuestring, "/ssh")) {
-        cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/ssh", "ssh_command");
-#if CONFIG_APP_CLAW_CAP_WASM_APPS
-    } else if (cJSON_IsString(text_json) && text_json->valuestring &&
-               cap_im_tg_is_command(text_json->valuestring, "/apps")) {
-        cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/apps", "apps_command");
-    } else if (cJSON_IsString(text_json) && text_json->valuestring &&
-               cap_im_tg_is_command(text_json->valuestring, "/app")) {
-        cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/app", "apps_command");
-#endif
-    } else if (cJSON_IsString(text_json) && text_json->valuestring && text_json->valuestring[0]) {
+            cap_im_tg_dispatch_command(chat_id, text_json->valuestring)) {
+        return;
+    }
+    if (cJSON_IsString(text_json) && text_json->valuestring && text_json->valuestring[0]) {
         if (cap_im_tg_publish_inbound_text(chat_id,
                                            sender_id,
                                            message_id,
@@ -2254,42 +2500,27 @@ static esp_err_t cap_im_tg_send_media(const char *chat_id,
     return ESP_OK;
 }
 
-static void cap_im_tg_set_commands(void)
+/* Publishes the enabled s_tg_commands as the bot menu; true when Telegram took it. */
+static bool cap_im_tg_set_commands(uint32_t mask)
 {
-    static const struct {
-        const char *command;
-        const char *description;
-    } commands[] = {
-        {"session", "Manage chat sessions (new, list, switch, delete)"},
-        {"llm", "Configure the LLM model and endpoint"},
-        {"ssh", "SSH client (pubkey, allowed, allow, revoke)"},
-    };
-    cJSON *body = NULL;
-    cJSON *list = NULL;
+    cJSON *body = cJSON_CreateObject();
+    cJSON *list = cJSON_AddArrayToObject(body, "commands");
     char *body_json = NULL;
     char *resp = NULL;
     esp_err_t err = ESP_ERR_NO_MEM;
 
-    body = cJSON_CreateObject();
-    list = cJSON_AddArrayToObject(body, "commands");
-    if (!list) {
-        cJSON_Delete(body);
-        return;
-    }
+    for (size_t i = 0; list && i < CAP_IM_TG_COMMAND_COUNT; i++) {
+        cJSON *item;
 
-    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
-        cJSON *item = cJSON_CreateObject();
-
-        if (!item) {
-            cJSON_Delete(body);
-            return;
+        if (!(mask & (1u << i))) {
+            continue;
         }
-        cJSON_AddStringToObject(item, "command", commands[i].command);
-        cJSON_AddStringToObject(item, "description", commands[i].description);
+        item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "command", s_tg_commands[i].name);
+        cJSON_AddStringToObject(item, "description", s_tg_commands[i].description);
         cJSON_AddItemToArray(list, item);
     }
-
-    body_json = cJSON_PrintUnformatted(body);
+    body_json = list ? cJSON_PrintUnformatted(body) : NULL;
     cJSON_Delete(body);
     if (body_json) {
         err = cap_im_tg_api_call("setMyCommands", body_json, &resp);
@@ -2299,15 +2530,25 @@ static void cap_im_tg_set_commands(void)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Telegram setMyCommands failed: %s", esp_err_to_name(err));
     }
+    return err == ESP_OK;
 }
 
 static void cap_im_tg_poll_task(void *arg)
 {
+    uint32_t published_mask = UINT32_MAX;
+
     (void)arg;
 
-    cap_im_tg_set_commands();
     while (!s_tg.stop_requested) {
-        if (cap_im_tg_poll_once() != ESP_OK) {
+        /* Capabilities may register after the poll task starts: republish when the set changes. */
+        uint32_t mask = cap_im_tg_command_mask();
+
+        if (mask != published_mask && cap_im_tg_set_commands(mask)) {
+            published_mask = mask;
+        }
+        if (cap_im_tg_poll_once() == ESP_OK) {
+            s_tg_online = true;
+        } else {
             if (s_tg.stop_requested) {
                 break;
             }
@@ -2319,6 +2560,11 @@ static void cap_im_tg_poll_task(void *arg)
 
     s_tg.poll_task = NULL;
     claw_task_delete(NULL);
+}
+
+bool cap_im_tg_is_online(void)
+{
+    return s_tg_online;
 }
 
 static esp_err_t cap_im_tg_gateway_init(void)

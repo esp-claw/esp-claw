@@ -1728,6 +1728,50 @@ static const claw_cap_descriptor_t s_mgr_descriptors[] = {
         .input_schema_json = CAP_WASM_NAME_SCHEMA,
         .execute = cap_wasm_remove_execute,
     },
+    {
+        .id = "firmware_command",
+        .name = "firmware_command",
+        .family = "firmware",
+        .description = "Handle the /fw chat command.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_RESTRICTED,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        .execute = cap_wasm_fw_command_execute,
+    },
+    {
+        .id = "firmware_status",
+        .name = "firmware_status",
+        .family = "firmware",
+        .description = "Show the running firmware version and OTA slot, the other slot and the last update result.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+        .execute = cap_wasm_fw_status_execute,
+    },
+    {
+        .id = "firmware_check",
+        .name = "firmware_check",
+        .family = "firmware",
+        .description = "Check for a newer signed firmware: the latest GitHub release by default, or an https .bin url "
+                       "(with <url>.sig.json next to it).",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}}}",
+        .execute = cap_wasm_fw_check_execute,
+    },
+    {
+        .id = "firmware_update",
+        .name = "firmware_update",
+        .family = "firmware",
+        .description = "Install a newer signed firmware (latest GitHub release or an https .bin url) and reboot. "
+                       "force allows a downgrade or reinstall. The user confirms in Telegram; only works in a "
+                       "Telegram chat.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},"
+                             "\"force\":{\"type\":\"boolean\"}}}",
+        .execute = cap_wasm_fw_update_execute,
+    },
 };
 
 static const claw_cap_group_t s_mgr_group = {
@@ -1809,6 +1853,7 @@ esp_err_t cap_wasm_apps_register_group(const char *base_path)
     if (claw_cap_register_group(&s_mgr_group) != ESP_OK) {
         ESP_LOGE(TAG, "failed to register the %s group", CAP_WASM_MGR_GROUP);
     }
+    cap_wasm_fw_boot();
     s_req_queue = xQueueCreate(1, sizeof(cap_wasm_req_t *));
     s_done = xSemaphoreCreateBinary();
     s_call_lock = xSemaphoreCreateMutex();

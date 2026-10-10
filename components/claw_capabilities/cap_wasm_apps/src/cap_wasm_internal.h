@@ -7,6 +7,7 @@
 
 /* Shared between the runtime (cap_wasm_apps.c) and the host API (cap_wasm_host.c). */
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -126,6 +127,23 @@ extern char g_cap_wasm_apps_dir[64];
 extern cap_wasm_key_t g_cap_wasm_trusted[CAP_WASM_MAX_TRUSTED];
 extern size_t g_cap_wasm_trusted_count;
 
+/* Held by an app install and by a firmware update, which must not run at the same time. */
+extern atomic_flag g_cap_wasm_busy;
+
+/* Takes a chunk of a streamed download; false aborts the download. */
+typedef bool (*cap_wasm_sink_t)(void *ctx, const uint8_t *data, size_t len);
+
+/*
+ * https GET following at most 5 https redirects (no auth sent, queries not logged). download
+ * returns the body (at most `max` bytes plus a NUL, PSRAM, caller frees), stream hands it to `sink`
+ * in chunks.
+ */
+uint8_t *cap_wasm_download(const char *url, size_t max, size_t *out_len, char *err, size_t err_size);
+esp_err_t cap_wasm_stream(const char *url, cap_wasm_sink_t sink, void *ctx, char *err, size_t err_size);
+
+/* Shows `html` with a confirm and a cancel button in `chat`; ESP_OK when confirmed. */
+esp_err_t cap_wasm_ask(const char *chat, char *html, size_t html_size, const char *yes_label);
+
 /* Whole file in PSRAM, NUL-terminated; NULL when missing, empty or larger than max_size. */
 char *cap_wasm_read_file(const char *path, size_t max_size, size_t *out_size);
 bool cap_wasm_write_file(const char *path, const char *data, size_t len);
@@ -150,5 +168,26 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
 /* Asks for confirmation, then deletes the app, its files and its key-value data. */
 esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
 
-/* Runs "/app install|update|remove ..." on its own task and sends the result to `chat_id`. */
+/*
+ * Runs "/app install|update|remove ..." (or "fw <args>" for cap_wasm_fw_command) on its own task
+ * and sends the result to `chat_id`.
+ */
 esp_err_t cap_wasm_start_job(const char *command, const char *chat_id);
+
+/* ---------- Firmware updates (cap_wasm_fw.c) ---------- */
+
+/* "/fw" arguments: "" (status), "check [url]" or "update [--force] [url]". Blocks; not on the poll task. */
+esp_err_t cap_wasm_fw_command(const char *args, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+
+/* Starts the post-update health check / rollback report when there is something to do. */
+void cap_wasm_fw_boot(void);
+
+/* Tool handlers in the cap_wasm_apps_mgr group. */
+esp_err_t cap_wasm_fw_command_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                      char *output, size_t output_size);
+esp_err_t cap_wasm_fw_status_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                     char *output, size_t output_size);
+esp_err_t cap_wasm_fw_check_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                    char *output, size_t output_size);
+esp_err_t cap_wasm_fw_update_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                     char *output, size_t output_size);
