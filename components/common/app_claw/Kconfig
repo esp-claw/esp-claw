@@ -187,6 +187,14 @@ menu "App Claw Config"
                 Enable wol_wake: send a Wake-on-LAN magic packet to one of the
                 targets configured in wol_targets.
 
+        config APP_CLAW_CAP_WASM_APPS
+            bool "Enable WASM apps capability"
+            depends on APP_CLAW_CAP_HTTP_REQUEST
+            default y
+            help
+                Load sandboxed WASM apps (WAMR interpreter) from <storage>/apps/<name>/
+                at boot, expose the tools they register to the LLM and handle /apps.
+
         config APP_CLAW_CAP_ROUTER_MGR
             bool "Enable router manager capability"
             select APP_CLAW_CAP_EVENT_ROUTER

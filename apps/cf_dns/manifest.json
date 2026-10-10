@@ -1,0 +1,12 @@
+{
+  "name": "cf_dns",
+  "version": "1.0.0",
+  "description": "Read-only Cloudflare DNS: list zones and DNS records via the device's cloudflare API profile.",
+  "permissions": {
+    "http_profiles": ["cloudflare"]
+  },
+  "limits": {
+    "memory_kb": 128,
+    "call_timeout_ms": 10000
+  }
+}

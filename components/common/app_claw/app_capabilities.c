@@ -70,6 +70,9 @@
 #if CONFIG_APP_CLAW_CAP_WOL
 #include "cap_wol.h"
 #endif
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+#include "cap_wasm_apps.h"
+#endif
 #include "claw_cap.h"
 #if CONFIG_APP_CLAW_CAP_MEMORY
 #include "claw_memory.h"
@@ -770,6 +773,15 @@ static esp_err_t app_cap_register_wol(const app_claw_config_t *config,
 }
 #endif
 
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+static esp_err_t app_cap_register_wasm_apps(const app_claw_config_t *config,
+                                            const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    return cap_wasm_apps_register_group(paths->fatfs_base_path);
+}
+#endif
+
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
 static esp_err_t app_cap_register_router_mgr(const app_claw_config_t *config,
                                              const app_claw_storage_paths_t *paths)
@@ -855,6 +867,9 @@ static const app_capability_group_entry_t s_capability_group_entries[] = {
 #if CONFIG_APP_CLAW_CAP_WOL
     { "cap_wol", "Wake-on-LAN", "Register Wake-on-LAN cap", true, app_cap_prepare_wol, app_cap_register_wol },
 #endif
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+    { "cap_wasm_apps", "WASM Apps", "Register WASM apps cap", true, NULL, app_cap_register_wasm_apps },
+#endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     { "cap_router_mgr", "Router Manager", "Register router manager cap", true, NULL, app_cap_register_router_mgr },
 #endif
@@ -917,6 +932,9 @@ static const app_capability_group_info_t s_capability_group_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_CAP_WOL
     { "cap_wol", "Wake-on-LAN", true },
+#endif
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+    { "cap_wasm_apps", "WASM Apps", true },
 #endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     { "cap_router_mgr", "Router Manager", false },

@@ -1,0 +1,13 @@
+{
+  "name": "hello",
+  "version": "1.0.0",
+  "description": "Demo and runtime test app: echo, benchmark, persistent counter, runaway loop.",
+  "permissions": {
+    "log": true,
+    "kv": true
+  },
+  "limits": {
+    "memory_kb": 64,
+    "call_timeout_ms": 5000
+  }
+}
