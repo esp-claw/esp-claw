@@ -26,9 +26,12 @@
 #define CAP_IM_ATTACHMENT_PATH_BUF_SIZE 256
 #define CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES (512 * 1024)
 #define CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS 64
+#define CAP_IM_ATTACHMENT_PRUNE_MAX_SKIPPED 8
 #define CAP_IM_ATTACHMENT_MIN_FREE_BYTES (256 * 1024)
 /* 2020-01-01 UTC. Earlier wall-clock time means the clock was never set, so mtimes are not ordered. */
 #define CAP_IM_ATTACHMENT_MIN_VALID_EPOCH 1577836800
+/* Inbox layout is <root>/<platform>/<chat>/<file>: two directory levels above the files. */
+#define CAP_IM_ATTACHMENT_INBOX_DIR_DEPTH 2
 
 typedef struct {
     FILE *file;
@@ -360,7 +363,9 @@ static esp_err_t cap_im_attachment_download_event_handler(esp_http_client_event_
     return ESP_OK;
 }
 
-static esp_err_t cap_im_attachment_check_free_space(const char *log_tag, const char *path)
+/* Free bytes on the FAT volume holding path. Returns UINT64_MAX if the query fails, so callers
+ * treat an unknown free space as sufficient. */
+static uint64_t cap_im_attachment_free_bytes(const char *log_tag, const char *path)
 {
     char root[32];
     uint64_t total = 0;
@@ -371,17 +376,36 @@ static esp_err_t cap_im_attachment_check_free_space(const char *log_tag, const c
 
     if (err != ESP_OK) {
         ESP_LOGW(log_tag, "attachment free space query failed: root=%s err=%s", root, esp_err_to_name(err));
+        return UINT64_MAX;
+    }
+    return free_bytes;
+}
+
+static uint64_t cap_im_attachment_gc(const char *log_tag,
+                                     const char *root_dir,
+                                     const char *keep_path,
+                                     bool need_free);
+
+static esp_err_t cap_im_attachment_ensure_free_space(const char *log_tag, const char *root_dir)
+{
+    uint64_t free_bytes = cap_im_attachment_free_bytes(log_tag, root_dir);
+
+    if (free_bytes >= CAP_IM_ATTACHMENT_MIN_FREE_BYTES) {
         return ESP_OK;
     }
+    ESP_LOGW(log_tag, "attachment storage low, running GC: free=%u min=%u",
+             (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES);
+    free_bytes = cap_im_attachment_gc(log_tag, root_dir, NULL, true);
     if (free_bytes < CAP_IM_ATTACHMENT_MIN_FREE_BYTES) {
-        ESP_LOGW(log_tag, "attachment skipped, storage low: free=%u min=%u root=%s",
-                 (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES, root);
+        ESP_LOGW(log_tag, "attachment skipped, storage low after GC: free=%u min=%u",
+                 (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
 
 esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
+                                                 const char *root_dir,
                                                  const char *url,
                                                  const char *dest_path,
                                                  size_t max_bytes,
@@ -394,11 +418,11 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
     esp_err_t err;
     int status;
 
-    if (!url || !url[0] || !dest_path || !dest_path[0]) {
+    if (!root_dir || !root_dir[0] || !url || !url[0] || !dest_path || !dest_path[0]) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    err = cap_im_attachment_check_free_space(log_tag, dest_path);
+    err = cap_im_attachment_ensure_free_space(log_tag, root_dir);
     if (err != ESP_OK) {
         return err;
     }
@@ -502,7 +526,8 @@ esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
 }
 
 /* Retention order: true when (mtime, path) should be removed before the current oldest candidate.
- * An empty oldest_path means no candidate yet. Ties on mtime fall back to path order. */
+ * An empty oldest_path means no candidate yet. Ties on mtime fall back to path order. Files written
+ * while the clock was unset carry the FAT minimum date and therefore sort as oldest. */
 static bool cap_im_attachment_is_older(time_t mtime,
                                        const char *path,
                                        time_t oldest_mtime,
@@ -517,111 +542,136 @@ static bool cap_im_attachment_is_older(time_t mtime,
     return strcmp(path, oldest_path) < 0;
 }
 
-static bool cap_im_attachment_join_path(char *dst, size_t dst_size, const char *dir, const char *name)
-{
-    int written = snprintf(dst, dst_size, "%s/%s", dir, name);
+typedef struct {
+    char path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];        /* scan cursor, extended per directory level */
+    char oldest_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE]; /* empty when no deletable file was found */
+    const char *keep_path;
+    uint64_t skipped[CAP_IM_ATTACHMENT_PRUNE_MAX_SKIPPED]; /* path hashes whose remove() failed */
+    size_t skipped_count;
+    uint64_t total_bytes;
+    uint64_t oldest_bytes;
+    time_t oldest_mtime;
+} cap_im_attachment_gc_t;
 
-    return written > 0 && (size_t)written < dst_size;
+static bool cap_im_attachment_gc_is_skipped(const cap_im_attachment_gc_t *gc, const char *path)
+{
+    uint64_t hash = cap_im_attachment_fnv1a64(path);
+
+    for (size_t i = 0; i < gc->skipped_count; i++) {
+        if (gc->skipped[i] == hash) {
+            return true;
+        }
+    }
+    return false;
 }
 
-/* Scans <platform_path>/<chat>/<file>. Sets total_bytes to the sum of all regular files (keep_path
- * included) and oldest_path to the oldest file other than keep_path (empty if there is none).
- * Returns -1 if the platform directory cannot be opened. */
-static int cap_im_attachment_find_oldest(const char *platform_path,
-                                         const char *keep_path,
-                                         char *oldest_path,
-                                         size_t oldest_size,
-                                         uint64_t *total_bytes)
+/* Walks gc->path (length len) down `depth` directory levels, summing every regular file into
+ * total_bytes and tracking the oldest file that is neither keep_path nor skipped. */
+static void cap_im_attachment_gc_scan(cap_im_attachment_gc_t *gc, size_t len, int depth)
 {
-    DIR *platform_dir = NULL;
-    struct dirent *chat_entry = NULL;
-    time_t oldest_mtime = 0;
+    DIR *dir = opendir(gc->path);
+    struct dirent *entry = NULL;
 
-    oldest_path[0] = '\0';
-    *total_bytes = 0;
-    platform_dir = opendir(platform_path);
-    if (!platform_dir) {
-        return -1;
+    if (!dir) {
+        return;
     }
-
-    while ((chat_entry = readdir(platform_dir)) != NULL) {
-        char chat_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
-        struct dirent *file_entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
         struct stat st = {0};
-        DIR *chat_dir = NULL;
+        int written;
 
-        if (chat_entry->d_name[0] == '.' ||
-                !cap_im_attachment_join_path(chat_path, sizeof(chat_path), platform_path, chat_entry->d_name) ||
-                stat(chat_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        if (entry->d_name[0] == '.') {
             continue;
         }
-
-        chat_dir = opendir(chat_path);
-        if (!chat_dir) {
+        written = snprintf(gc->path + len, sizeof(gc->path) - len, "/%s", entry->d_name);
+        if (written <= 0 || len + (size_t)written >= sizeof(gc->path) || stat(gc->path, &st) != 0) {
             continue;
         }
-        while ((file_entry = readdir(chat_dir)) != NULL) {
-            char file_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
-
-            if (file_entry->d_name[0] == '.' ||
-                    !cap_im_attachment_join_path(file_path, sizeof(file_path), chat_path, file_entry->d_name) ||
-                    stat(file_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-                continue;
+        if (depth > 0) {
+            if (S_ISDIR(st.st_mode)) {
+                cap_im_attachment_gc_scan(gc, len + (size_t)written, depth - 1);
             }
-
-            *total_bytes += (uint64_t)st.st_size;
-            if (strcmp(file_path, keep_path) == 0) {
-                continue;
-            }
-            if (cap_im_attachment_is_older(st.st_mtime, file_path, oldest_mtime, oldest_path)) {
-                strlcpy(oldest_path, file_path, oldest_size);
-                oldest_mtime = st.st_mtime;
-            }
+            continue;
         }
-        closedir(chat_dir);
+        if (!S_ISREG(st.st_mode)) {
+            continue;
+        }
+        gc->total_bytes += (uint64_t)st.st_size;
+        if ((gc->keep_path && strcmp(gc->path, gc->keep_path) == 0) ||
+                cap_im_attachment_gc_is_skipped(gc, gc->path) ||
+                !cap_im_attachment_is_older(st.st_mtime, gc->path, gc->oldest_mtime, gc->oldest_path)) {
+            continue;
+        }
+        strlcpy(gc->oldest_path, gc->path, sizeof(gc->oldest_path));
+        gc->oldest_mtime = st.st_mtime;
+        gc->oldest_bytes = (uint64_t)st.st_size;
     }
-
-    closedir(platform_dir);
-    return 0;
+    gc->path[len] = '\0';
+    closedir(dir);
 }
 
-void cap_im_attachment_prune_inbox(const char *log_tag,
-                                   const char *root_dir,
-                                   const char *platform_dir,
-                                   const char *keep_path)
+static bool cap_im_attachment_gc_goal_met(uint64_t total_bytes, uint64_t free_bytes, bool need_free)
 {
-    char platform_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
-    char oldest_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
-    uint64_t total_bytes = 0;
+    return total_bytes <= CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES &&
+           (!need_free || free_bytes >= CAP_IM_ATTACHMENT_MIN_FREE_BYTES);
+}
 
-    if (!log_tag || !root_dir || !platform_dir || !keep_path ||
-            !cap_im_attachment_join_path(platform_path, sizeof(platform_path), root_dir, platform_dir)) {
-        return;
+/* Deletes the oldest inbox files across all platforms until the inbox fits the budget and, if
+ * need_free, the volume has CAP_IM_ATTACHMENT_MIN_FREE_BYTES free, or nothing deletable is left.
+ * keep_path (may be NULL) is never deleted. Returns free bytes after the run (UINT64_MAX if unknown). */
+static uint64_t cap_im_attachment_gc(const char *log_tag,
+                                     const char *root_dir,
+                                     const char *keep_path,
+                                     bool need_free)
+{
+    cap_im_attachment_gc_t gc = {.keep_path = keep_path};
+    uint64_t free_bytes = UINT64_MAX;
+    uint64_t freed_bytes = 0;
+    int attempts = 0;
+    int removed = 0;
+
+    if (strlcpy(gc.path, root_dir, sizeof(gc.path)) >= sizeof(gc.path)) {
+        return free_bytes;
     }
-
-    /* Without a valid clock, mtimes are not ordered and the names carry no time, so the
-     * save order is unknown. Skip pruning rather than delete arbitrary attachments. */
+    /* Attachments are a cache: freeing storage wins over exact ordering, so prune anyway. */
     if (time(NULL) < CAP_IM_ATTACHMENT_MIN_VALID_EPOCH) {
-        ESP_LOGW(log_tag, "attachment retention skipped: system clock not set, save order unknown");
-        return;
+        ESP_LOGW(log_tag, "attachment GC: system clock not set, deletion order may be inaccurate");
     }
 
-    for (int removed = 0; removed < CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS; removed++) {
-        if (cap_im_attachment_find_oldest(platform_path, keep_path, oldest_path, sizeof(oldest_path),
-                                          &total_bytes) != 0) {
-            ESP_LOGW(log_tag, "attachment retention scan failed: dir=%s errno=%d", platform_path, errno);
-            return;
+    for (;;) {
+        gc.total_bytes = 0;
+        gc.oldest_path[0] = '\0';
+        cap_im_attachment_gc_scan(&gc, strlen(gc.path), CAP_IM_ATTACHMENT_INBOX_DIR_DEPTH);
+        free_bytes = cap_im_attachment_free_bytes(log_tag, root_dir);
+        if (cap_im_attachment_gc_goal_met(gc.total_bytes, free_bytes, need_free) ||
+                gc.oldest_path[0] == '\0' || attempts >= CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS) {
+            break;
         }
-        if (total_bytes <= CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES || oldest_path[0] == '\0') {
-            return;
+        attempts++;
+        if (remove(gc.oldest_path) != 0) {
+            ESP_LOGW(log_tag, "attachment GC remove failed: path=%s errno=%d", gc.oldest_path, errno);
+            if (gc.skipped_count == CAP_IM_ATTACHMENT_PRUNE_MAX_SKIPPED) {
+                break;
+            }
+            gc.skipped[gc.skipped_count++] = cap_im_attachment_fnv1a64(gc.oldest_path);
+            continue;
         }
-        if (remove(oldest_path) != 0) {
-            ESP_LOGW(log_tag, "attachment retention remove failed: path=%s errno=%d", oldest_path, errno);
-            return;
-        }
-        ESP_LOGI(log_tag, "attachment retention removed oldest file: %s (inbox %u bytes, budget %u)",
-                 oldest_path, (unsigned int)total_bytes, (unsigned int)CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES);
+        ESP_LOGI(log_tag, "attachment GC removed %s (%u bytes)", gc.oldest_path, (unsigned int)gc.oldest_bytes);
+        removed++;
+        freed_bytes += gc.oldest_bytes;
     }
+
+    ESP_LOGI(log_tag, "attachment GC done: removed=%d failed=%d freed=%u total=%u budget=%u free=%u",
+             removed, attempts - removed, (unsigned int)freed_bytes, (unsigned int)gc.total_bytes,
+             (unsigned int)CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES, (unsigned int)free_bytes);
+    return free_bytes;
+}
+
+void cap_im_attachment_prune_inbox(const char *log_tag, const char *root_dir, const char *keep_path)
+{
+    if (!log_tag || !root_dir || !root_dir[0]) {
+        return;
+    }
+    cap_im_attachment_gc(log_tag, root_dir, keep_path, false);
 }
 
 char *cap_im_attachment_build_payload_json(

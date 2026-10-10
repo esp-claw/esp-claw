@@ -1168,6 +1168,7 @@ static esp_err_t cap_im_feishu_save_attachment_metadata(const char *chat_id,
     if (err != ESP_OK) {
         return err;
     }
+    cap_im_attachment_prune_inbox(TAG, s_feishu.attachment_root_dir, saved_path);
 
     payload_json = cap_im_attachment_build_payload_json(
     &(cap_im_attachment_payload_config_t) {
@@ -1612,6 +1613,7 @@ static esp_err_t cap_im_feishu_save_attachment(const char *chat_id,
                                                       attachment_kind,
                                                       content_json);
     }
+    cap_im_attachment_prune_inbox(TAG, s_feishu.attachment_root_dir, saved_path);
 
     payload_json = cap_im_attachment_build_payload_json(
     &(cap_im_attachment_payload_config_t) {
