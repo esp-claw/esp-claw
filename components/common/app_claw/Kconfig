@@ -354,7 +354,9 @@ menu "App Claw Config"
 
         config APP_CLAW_LUA_MODULE_DISPLAY
             bool "Enable display Lua module"
-            default y
+            default y if ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT
+            default n
+            select APP_CLAW_LUA_MODULE_IMAGE
             help
                 Enable the display Lua module and keep app_claw's direct dependency
                 on lua_module_display when Lua capability is enabled.
@@ -403,9 +405,11 @@ menu "App Claw Config"
 
         config APP_CLAW_LUA_MODULE_IMAGE
             bool "Enable image Lua module"
-            default y
+            default y if ESP_BOARD_DEV_CAMERA_SUPPORT
+            default n
             help
-                Enable the image Lua module. Exposes frame format conversion helpers.
+                Enable the image Lua module. Exposes frame format conversion helpers
+                (JPEG via esp_new_jpeg). Selected by the display module.
 
         config APP_CLAW_LUA_MODULE_IMU
             bool "Enable IMU Lua module"
@@ -459,7 +463,8 @@ menu "App Claw Config"
 
         config APP_CLAW_LUA_MODULE_LVGL
             bool "Enable LVGL Lua module"
-            default y
+            default y if ESP_BOARD_DEV_DISPLAY_LCD_SUPPORT
+            default n
             help
                 Enable the LVGL Lua module and keep app_claw's direct dependency
                 on lua_module_lvgl when Lua capability is enabled.
