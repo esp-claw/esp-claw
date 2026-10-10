@@ -73,7 +73,7 @@ Every v4 REST response is an envelope:
 | Traffic analytics | POST | `/graphql` | GraphQL, see below |
 
 ### Analytics (GraphQL)
-The old REST zone analytics endpoints are retired; use the GraphQL Analytics API at `POST /graphql` with `{"query": "...", "variables": {...}}`. Because it is a POST, the device asks for Telegram confirmation even though it only reads. Example (daily requests, last days):
+The old REST zone analytics endpoints are retired; use the GraphQL Analytics API at `POST /graphql` with `{"query": "...", "variables": {...}}`. Because it is a POST, the device asks for Telegram confirmation unless the profile lists `"/graphql"` in `read_only_posts`. Example (daily requests, last days):
 
 ```json
 {"profile": "cloudflare", "method": "POST", "path": "/graphql",

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "cap_http_request.h"
+#include "cap_http_rules.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,7 +42,6 @@ static const char *TAG = "cap_http_request";
 #define CAP_HTTP_REQUEST_MAX_BODY_LIMIT     ((64 * 1024) - 1)
 #define CAP_HTTP_REQUEST_MAX_FILE_LIMIT     2147483647
 #define CAP_HTTP_REQUEST_ALLOWLIST_MAX      320
-#define CAP_HTTP_REQUEST_REDIRECT_URL_MAX   512
 #define CAP_HTTP_REQUEST_PROFILE_NAME_MAX   32
 #define CAP_HTTP_REQUEST_TOKEN_CACHE_MAX    4
 #define CAP_HTTP_REQUEST_TOKEN_RESP_MAX     4096
@@ -67,7 +67,11 @@ typedef struct {
     bool truncated;
     bool check_redirect_allowlist;
     const cJSON *profile_hosts; /* when set, redirects must stay on https and these hosts */
-    char redirect_location[CAP_HTTP_REQUEST_REDIRECT_URL_MAX];
+    const char *auth_name;      /* profile auth header, dropped on redirects to another host */
+    char *redirect_location;
+    int location_headers;       /* Location headers in the current response */
+    char origin_host[128];
+    char current_host[128];
 } cap_http_request_buf_t;
 
 typedef struct {
@@ -85,14 +89,6 @@ typedef struct {
 
 static EXT_RAM_BSS_ATTR cap_http_request_state_t s_http_request = {0};
 
-static bool cap_http_request_extract_url_host(const char *url, char *host, size_t host_size);
-static bool cap_http_request_extract_redirect_host(const char *location,
-                                                   esp_http_client_handle_t client,
-                                                   char *host, size_t host_size);
-static bool cap_http_request_host_allowed(const char *host);
-static bool cap_http_request_host_in_list(const char *host, const cJSON *hosts);
-static bool cap_http_request_profile_redirect_ok(const char *location, const char *host, const cJSON *hosts);
-
 static esp_err_t cap_http_request_event_handler(esp_http_client_event_t *event)
 {
     cap_http_request_buf_t *buf = NULL;
@@ -105,29 +101,47 @@ static esp_err_t cap_http_request_event_handler(esp_http_client_event_t *event)
     buf = (cap_http_request_buf_t *)event->user_data;
 
     switch (event->event_id) {
+    case HTTP_EVENT_HEADERS_SENT:
+        if (buf) {
+            free(buf->redirect_location);
+            buf->redirect_location = NULL;
+            buf->location_headers = 0;
+        }
+        break;
+
     case HTTP_EVENT_ON_HEADER:
         if (buf && buf->check_redirect_allowlist &&
                 event->header_key && event->header_value &&
                 strcasecmp(event->header_key, "Location") == 0) {
-            strlcpy(buf->redirect_location, event->header_value, sizeof(buf->redirect_location));
+            /* esp_http_client concatenates repeated Location headers: refuse those. */
+            free(buf->redirect_location);
+            buf->redirect_location = ++buf->location_headers == 1 ? strdup(event->header_value) : NULL;
         }
         break;
 
     case HTTP_EVENT_REDIRECT:
         if (buf && buf->check_redirect_allowlist) {
-            char host[128] = {0};
+            const char *location = buf->redirect_location ? buf->redirect_location : "";
+            /* Redirect URLs may carry signed query strings: log only up to the query. */
+            int shown = (int)strcspn(location, "?#");
+            char host[128];
+            cap_http_redirect_t action = cap_http_rules_redirect(location, buf->current_host, buf->origin_host,
+                                                                 buf->profile_hosts, s_http_request.allowlist,
+                                                                 host, sizeof(host));
 
-            if (!buf->redirect_location[0] ||
-                    !cap_http_request_extract_redirect_host(buf->redirect_location, event->client,
-                            host, sizeof(host)) ||
-                    (buf->profile_hosts ?
-                     !cap_http_request_profile_redirect_ok(buf->redirect_location, host, buf->profile_hosts) :
-                     !cap_http_request_host_allowed(host))) {
-                ESP_LOGW(TAG, "Redirect to '%s' blocked by allowlist", buf->redirect_location);
+            if (action == CAP_HTTP_REDIRECT_BLOCK) {
+                ESP_LOGW(TAG, "Redirect to '%.*s' blocked by allowlist", shown, location);
                 return ESP_FAIL;
             }
-            ESP_LOGI(TAG, "Redirect to host '%s' allowed by allowlist", host);
-            buf->redirect_location[0] = '\0';
+            if (action == CAP_HTTP_REDIRECT_FOLLOW_NO_AUTH && buf->auth_name) {
+                /* Header names are matched case-insensitively. */
+                esp_http_client_delete_header(event->client, buf->auth_name);
+                buf->auth_name = NULL;
+                ESP_LOGI(TAG, "Redirect to host '%s': credentials not forwarded", host);
+            } else {
+                ESP_LOGI(TAG, "Redirect to host '%s' allowed by allowlist", host);
+            }
+            strlcpy(buf->current_host, host, sizeof(buf->current_host));
             return esp_http_client_set_redirection(event->client);
         }
         break;
@@ -231,243 +245,6 @@ static bool cap_http_request_is_valid_method(const char *method, esp_http_client
     return false;
 }
 
-static bool cap_http_request_extract_url_host(const char *url, char *host, size_t host_size)
-{
-    const char *scheme = NULL;
-    const char *authority = NULL;
-    const char *authority_end = NULL;
-    const char *start = NULL;
-    const char *at = NULL;
-    const char *host_end = NULL;
-    size_t host_len = 0;
-
-    if (!url || !host || host_size == 0) {
-        return false;
-    }
-    host[0] = '\0';
-
-    scheme = strstr(url, "://");
-    if (!scheme || (strncasecmp(url, "http://", 7) != 0 && strncasecmp(url, "https://", 8) != 0)) {
-        return false;
-    }
-    authority = scheme + 3;
-    authority_end = authority + strcspn(authority, "/?#");
-    if (authority >= authority_end) {
-        return false;
-    }
-
-    start = authority;
-    for (const char *p = authority; p < authority_end; p++) {
-        if (*p == '@') {
-            at = p;
-        }
-    }
-    if (at) {
-        start = at + 1;
-    }
-
-    if (start >= authority_end) {
-        return false;
-    }
-
-    if (*start == '[') {
-        const char *closing = NULL;
-        for (const char *p = start + 1; p < authority_end; p++) {
-            if (*p == ']') {
-                closing = p;
-                break;
-            }
-        }
-        if (!closing || closing == start + 1) {
-            return false;
-        }
-        host_len = (size_t)(closing - (start + 1));
-        if (host_len + 1 > host_size) {
-            return false;
-        }
-        memcpy(host, start + 1, host_len);
-        host[host_len] = '\0';
-        return true;
-    }
-
-    host_end = start;
-    while (host_end < authority_end && *host_end != ':') {
-        host_end++;
-    }
-    if (host_end <= start) {
-        return false;
-    }
-    host_len = (size_t)(host_end - start);
-    if (host_len + 1 > host_size) {
-        return false;
-    }
-    memcpy(host, start, host_len);
-    host[host_len] = '\0';
-    return true;
-}
-
-static bool cap_http_request_extract_redirect_host(const char *location,
-                                                   esp_http_client_handle_t client,
-                                                   char *host, size_t host_size)
-{
-    char current_url[CAP_HTTP_REQUEST_REDIRECT_URL_MAX];
-    char protocol_relative_url[CAP_HTTP_REQUEST_REDIRECT_URL_MAX + 8];
-
-    if (!location || !location[0] || !host || host_size == 0) {
-        return false;
-    }
-
-    if (cap_http_request_extract_url_host(location, host, host_size)) {
-        return true;
-    }
-
-    if (location[0] == '/' && location[1] == '/') {
-        if (snprintf(protocol_relative_url, sizeof(protocol_relative_url), "https:%s", location) >=
-                (int)sizeof(protocol_relative_url)) {
-            return false;
-        }
-        return cap_http_request_extract_url_host(protocol_relative_url, host, host_size);
-    }
-
-    if (!client) {
-        return false;
-    }
-
-    if (esp_http_client_get_url(client, current_url, sizeof(current_url)) != ESP_OK) {
-        return false;
-    }
-
-    return cap_http_request_extract_url_host(current_url, host, host_size);
-}
-
-static bool cap_http_request_host_matches_allowlist_token(const char *host, const char *token)
-{
-    size_t host_len;
-    size_t token_len;
-
-    if (!host || !token || !host[0] || !token[0]) {
-        return false;
-    }
-
-    host_len = strlen(host);
-    token_len = strlen(token);
-
-    if (token_len == 1 && token[0] == '*') {
-        return true;
-    }
-
-    if (token_len >= 3 && token[0] == '*' && token[1] == '.') {
-        const char *base = token + 2;
-        const char *suffix = token + 1;
-        size_t suffix_len = token_len - 1;
-
-        if (strcasecmp(host, base) == 0) {
-            return true;
-        }
-        return host_len > suffix_len &&
-               strcasecmp(host + host_len - suffix_len, suffix) == 0;
-    }
-
-    if (token[0] == '.') {
-        const char *exact = token + 1;
-        size_t token_with_dot_len = token_len;
-
-        if (strcasecmp(host, exact) == 0) {
-            return true;
-        }
-        return host_len > token_with_dot_len &&
-               strcasecmp(host + host_len - token_with_dot_len, token) == 0;
-    }
-
-    return strcasecmp(host, token) == 0;
-}
-
-static bool cap_http_request_host_allowed(const char *host)
-{
-    char allowlist_copy[CAP_HTTP_REQUEST_ALLOWLIST_MAX];
-    char *saveptr = NULL;
-    char *token = NULL;
-
-    if (!host || !host[0] || !s_http_request.allowlist[0]) {
-        return false;
-    }
-
-    strlcpy(allowlist_copy, s_http_request.allowlist, sizeof(allowlist_copy));
-    for (token = strtok_r(allowlist_copy, ",", &saveptr);
-            token;
-            token = strtok_r(NULL, ",", &saveptr)) {
-        char *start = token;
-        char *end = NULL;
-
-        while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') {
-            start++;
-        }
-        end = start + strlen(start);
-        while (end > start &&
-                (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
-            end--;
-        }
-        *end = '\0';
-        if (!start[0]) {
-            continue;
-        }
-        if (start[0] == '[' && end > start + 1 && end[-1] == ']') {
-            start++;
-            end[-1] = '\0';
-        }
-        if (cap_http_request_host_matches_allowlist_token(host, start)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static bool cap_http_request_host_in_list(const char *host, const cJSON *hosts)
-{
-    const cJSON *item = NULL;
-
-    cJSON_ArrayForEach(item, hosts) {
-        if (cJSON_IsString(item) && cap_http_request_host_matches_allowlist_token(host, item->valuestring)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Profile URLs must not contain whitespace, control bytes, backslashes, or userinfo, so this
- * parser and esp_http_client cannot disagree on the host the credentials are sent to. */
-static bool cap_http_request_profile_url_ok(const char *url)
-{
-    const char *authority = strstr(url, "://");
-    size_t authority_len;
-
-    if (strncasecmp(url, "https://", 8) != 0 || !authority) {
-        return false;
-    }
-    for (const char *p = url; *p; p++) {
-        if ((unsigned char)*p <= 0x20 || *p == 0x7f || *p == '\\') {
-            return false;
-        }
-    }
-    authority += 3;
-    authority_len = strcspn(authority, "/?#");
-    return memchr(authority, '@', authority_len) == NULL;
-}
-
-/* Profile requests carry credentials: redirects must stay on https and on the profile hosts. */
-static bool cap_http_request_profile_redirect_ok(const char *location, const char *host, const cJSON *hosts)
-{
-    if (strncasecmp(location, "https://", 8) == 0) {
-        if (!cap_http_request_profile_url_ok(location)) {
-            return false;
-        }
-    } else if (location[0] != '/' || location[1] == '/' || strpbrk(location, "\\\r\n")) {
-        return false;
-    }
-    return cap_http_request_host_in_list(host, hosts);
-}
-
 static bool cap_http_request_header_value_ok(const char *value)
 {
     return value && value[0] && !strpbrk(value, "\r\n");
@@ -481,6 +258,7 @@ static bool cap_http_request_profile_valid(const cJSON *profile, char *err, size
     const cJSON *hosts = cJSON_GetObjectItem(profile, "hosts");
     const cJSON *auth = cJSON_GetObjectItem(profile, "auth");
     const char *type = cJSON_GetStringValue(cJSON_GetObjectItem(auth, "type"));
+    const cJSON *read_only_posts = cJSON_GetObjectItem(profile, "read_only_posts");
     const cJSON *host = NULL;
     char base_host[128];
 
@@ -498,11 +276,21 @@ static bool cap_http_request_profile_valid(const cJSON *profile, char *err, size
             return false;
         }
     }
-    if (!base_url || !cap_http_request_profile_url_ok(base_url) ||
-            !cap_http_request_extract_url_host(base_url, base_host, sizeof(base_host)) ||
-            !cap_http_request_host_in_list(base_host, hosts)) {
+    if (!base_url || !cap_http_rules_https_url_ok(base_url) ||
+            !cap_http_rules_url_host(base_url, base_host, sizeof(base_host)) ||
+            !cap_http_rules_host_in_list(base_host, hosts)) {
         snprintf(err, err_size, "base_url must be an https URL whose host matches hosts");
         return false;
+    }
+    if (read_only_posts && !cJSON_IsArray(read_only_posts)) {
+        snprintf(err, err_size, "read_only_posts must be an array of /paths or https:// URLs");
+        return false;
+    }
+    cJSON_ArrayForEach(host, read_only_posts) {
+        if (!cJSON_IsString(host) || (host->valuestring[0] != '/' && strncmp(host->valuestring, "https://", 8) != 0)) {
+            snprintf(err, err_size, "read_only_posts must be an array of /paths or https:// URLs");
+            return false;
+        }
     }
     if (type && strcmp(type, "bearer") == 0) {
         if (cap_http_request_header_value_ok(cJSON_GetStringValue(cJSON_GetObjectItem(auth, "token")))) {
@@ -978,19 +766,20 @@ static esp_err_t cap_http_request_run(const cJSON *input,
             snprintf(profile_url, len, "%.*s%s", (int)base_len, base_url, path);
             url = profile_url;
         }
-        if (!cap_http_request_profile_url_ok(url) ||
-                !cap_http_request_extract_url_host(url, host, sizeof(host))) {
+        if (!cap_http_rules_https_url_ok(url) ||
+                !cap_http_rules_url_host(url, host, sizeof(host))) {
             snprintf(output, output_size, "Error: profile requests need a plain https URL without userinfo or spaces");
             err = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        if (!cap_http_request_host_in_list(host, cJSON_GetObjectItem(profile, "hosts"))) {
+        if (!cap_http_rules_host_in_list(host, cJSON_GetObjectItem(profile, "hosts"))) {
             snprintf(output, output_size, "Error: host '%s' is not allowed for profile '%s'", host, profile_name);
             err = ESP_ERR_INVALID_STATE;
             goto cleanup;
         }
         buf.profile_hosts = cJSON_GetObjectItem(profile, "hosts");
-        mutation = method != HTTP_METHOD_GET && method != HTTP_METHOD_HEAD;
+        mutation = method != HTTP_METHOD_GET && method != HTTP_METHOD_HEAD &&
+                   !(method == HTTP_METHOD_POST && cap_http_rules_read_only_post(profile, url));
         /* Mutations are confirmed in the Telegram chat the request came from. */
         if (mutation && (!ctx || ctx->caller != CLAW_CAP_CALLER_AGENT || !ctx->channel ||
                          strcmp(ctx->channel, "telegram") != 0 || !ctx->source_cap ||
@@ -1020,12 +809,12 @@ static esp_err_t cap_http_request_run(const cJSON *input,
             err = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        if (!cap_http_request_extract_url_host(url, host, sizeof(host))) {
+        if (!cap_http_rules_url_host(url, host, sizeof(host))) {
             snprintf(output, output_size, "Error: invalid url host");
             err = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        if (!cap_http_request_host_allowed(host)) {
+        if (!cap_http_rules_host_in_csv(host, s_http_request.allowlist)) {
             snprintf(output, output_size, "Error: host '%s' is not in allowlist", host);
             err = ESP_ERR_INVALID_STATE;
             goto cleanup;
@@ -1195,12 +984,17 @@ static esp_err_t cap_http_request_run(const cJSON *input,
         buf.max_len = (size_t)max_body_bytes;
     }
     buf.check_redirect_allowlist = true;
+    buf.auth_name = auth_name;
+    strlcpy(buf.origin_host, host, sizeof(buf.origin_host));
+    strlcpy(buf.current_host, host, sizeof(buf.current_host));
 
     config.url = url;
     config.event_handler = cap_http_request_event_handler;
     config.user_data = &buf;
     config.timeout_ms = timeout_ms;
     config.buffer_size = 4096;
+    /* The request line of a followed redirect must fit (e.g. ~1 KB signed blob URLs). */
+    config.buffer_size_tx = CAP_HTTP_REQUEST_REDIRECT_URL_MAX + 512;
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.disable_auto_redirect = true;
 
@@ -1310,6 +1104,7 @@ cleanup:
     free(auth_value);
     free(profile_url);
     free(buf.data);
+    free(buf.redirect_location);
     free(tmp_save_path);
     free(save_path_copy);
     cJSON_Delete(profiles);

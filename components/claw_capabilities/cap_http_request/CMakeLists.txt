@@ -1,12 +1,14 @@
 idf_component_register(
     SRCS
         "src/cap_http_request.c"
+        "src/cap_http_rules.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         claw_cap
         esp_http_client
         http_reuse
+        json
     PRIV_REQUIRES
         cap_im_platform
         esp_hw_support

@@ -26,8 +26,9 @@ Use this skill when the task needs a direct HTTP or HTTPS request to a known end
 
 ## API profiles (credentials)
 - Never put API tokens into `headers`. For APIs with a configured profile, pass `profile` and either `path` (appended to the profile's `base_url`) or a full https `url` on one of the profile's `hosts`. The device injects the credentials.
-- With `profile`, the profile's `hosts` replace the global allowlist, `Authorization` (and the profile's own auth header) supplied in `headers` is dropped, and redirects must stay on https and the profile's hosts.
+- With `profile`, the profile's `hosts` replace the global allowlist, `Authorization` (and the profile's own auth header) supplied in `headers` is dropped, and redirects must stay on https and the profile's hosts. On a redirect to another host (e.g. a signed download URL) the credentials are not forwarded.
 - `GET`/`HEAD` run directly. `POST`/`PUT`/`PATCH`/`DELETE` with a profile ask the user to confirm in Telegram and are refused outside an allowed Telegram chat.
+- Exception: a `POST` whose path matches the profile's `read_only_posts` (configured by the user for read-only endpoints such as GraphQL queries or search) runs directly, everywhere.
 - Service-specific guidance lives in the `cloudflare` and `gcloud` skills.
 
 ## Calling rules
