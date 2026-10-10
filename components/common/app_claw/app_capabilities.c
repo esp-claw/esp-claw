@@ -67,6 +67,9 @@
 #if CONFIG_APP_CLAW_CAP_SSH
 #include "cap_ssh.h"
 #endif
+#if CONFIG_APP_CLAW_CAP_WOL
+#include "cap_wol.h"
+#endif
 #include "claw_cap.h"
 #if CONFIG_APP_CLAW_CAP_MEMORY
 #include "claw_memory.h"
@@ -745,6 +748,26 @@ static esp_err_t app_cap_register_ssh(const app_claw_config_t *config,
 }
 #endif
 
+#if CONFIG_APP_CLAW_CAP_WOL
+static esp_err_t app_cap_prepare_wol(const app_claw_config_t *config,
+                                     const app_claw_storage_paths_t *paths)
+{
+    (void)paths;
+
+    ESP_RETURN_ON_ERROR(cap_wol_set_targets(config->wol_targets),
+                        TAG, "Failed to set WoL targets");
+    return ESP_OK;
+}
+
+static esp_err_t app_cap_register_wol(const app_claw_config_t *config,
+                                      const app_claw_storage_paths_t *paths)
+{
+    (void)config;
+    (void)paths;
+    return cap_wol_register_group();
+}
+#endif
+
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
 static esp_err_t app_cap_register_router_mgr(const app_claw_config_t *config,
                                              const app_claw_storage_paths_t *paths)
@@ -827,6 +850,9 @@ static const app_capability_group_entry_t s_capability_group_entries[] = {
 #if CONFIG_APP_CLAW_CAP_SSH
     { "cap_ssh", "SSH", "Register SSH cap", true, app_cap_prepare_ssh, app_cap_register_ssh },
 #endif
+#if CONFIG_APP_CLAW_CAP_WOL
+    { "cap_wol", "Wake-on-LAN", "Register Wake-on-LAN cap", true, app_cap_prepare_wol, app_cap_register_wol },
+#endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     { "cap_router_mgr", "Router Manager", "Register router manager cap", true, NULL, app_cap_register_router_mgr },
 #endif
@@ -886,6 +912,9 @@ static const app_capability_group_info_t s_capability_group_infos[] = {
 #endif
 #if CONFIG_APP_CLAW_CAP_SSH
     { "cap_ssh", "SSH", true },
+#endif
+#if CONFIG_APP_CLAW_CAP_WOL
+    { "cap_wol", "Wake-on-LAN", true },
 #endif
 #if CONFIG_APP_CLAW_CAP_ROUTER_MGR
     { "cap_router_mgr", "Router Manager", false },

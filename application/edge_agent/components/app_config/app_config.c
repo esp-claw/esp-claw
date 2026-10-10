@@ -59,6 +59,7 @@ typedef struct {
 #define APP_DEFAULT_SEARCH_BRAVE_KEY         ""
 #define APP_DEFAULT_SEARCH_TAVILY_KEY        ""
 #define APP_DEFAULT_SSH_HOSTS                ""
+#define APP_DEFAULT_WOL_TARGETS              ""
 #define APP_DEFAULT_STT_BASE_URL             "https://api.openai.com/v1"
 #define APP_DEFAULT_STT_API_KEY              ""
 #define APP_DEFAULT_STT_MODEL                "gpt-4o-mini-transcribe"
@@ -100,6 +101,7 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(search_tavily_key, "tavily_key", APP_DEFAULT_SEARCH_TAVILY_KEY),
     APP_CONFIG_FIELD(search_http_allowlist, "http_allow_ls", APP_SEARCH_HTTP_ALLOWLIST),
     APP_CONFIG_FIELD(ssh_hosts, "ssh_hosts", APP_DEFAULT_SSH_HOSTS),
+    APP_CONFIG_FIELD(wol_targets, "wol_targets", APP_DEFAULT_WOL_TARGETS),
     APP_CONFIG_FIELD(stt_base_url, "stt_base_url", APP_DEFAULT_STT_BASE_URL),
     APP_CONFIG_FIELD(stt_api_key, "stt_api_key", APP_DEFAULT_STT_API_KEY),
     APP_CONFIG_FIELD(stt_model, "stt_model", APP_DEFAULT_STT_MODEL),
@@ -596,6 +598,7 @@ void app_config_to_claw(const app_config_t *config, app_claw_config_t *out)
             config->search_http_allowlist,
             sizeof(out->search_http_allowlist));
     strlcpy(out->ssh_hosts, config->ssh_hosts, sizeof(out->ssh_hosts));
+    strlcpy(out->wol_targets, config->wol_targets, sizeof(out->wol_targets));
     strlcpy(out->stt_base_url, config->stt_base_url, sizeof(out->stt_base_url));
     strlcpy(out->stt_api_key, config->stt_api_key, sizeof(out->stt_api_key));
     strlcpy(out->stt_model, config->stt_model, sizeof(out->stt_model));

@@ -180,6 +180,13 @@ menu "App Claw Config"
                 confirms each one with a Telegram inline button. Requires
                 MBEDTLS_THREADING_C with MBEDTLS_THREADING_PTHREAD for libssh.
 
+        config APP_CLAW_CAP_WOL
+            bool "Enable Wake-on-LAN capability"
+            default y
+            help
+                Enable wol_wake: send a Wake-on-LAN magic packet to one of the
+                targets configured in wol_targets.
+
         config APP_CLAW_CAP_ROUTER_MGR
             bool "Enable router manager capability"
             select APP_CLAW_CAP_EVENT_ROUTER
