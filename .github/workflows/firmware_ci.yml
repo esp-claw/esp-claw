@@ -1,0 +1,110 @@
+# Host tests and an edge_agent build (esp32_S3_DevKitC_1) on every push and pull request to master.
+# The build mirrors firmware_release.yml; it never signs anything.
+name: Firmware CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    # The image provides IDF_PATH, which the tests use for cJSON.
+    container: espressif/idf:v5.5.4
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Run every test/host/run.sh
+        shell: bash
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find components application -path '*/test/host/run.sh' | sort)
+          [ "${#tests[@]}" -gt 0 ] || { echo "no host tests found"; exit 1; }
+          failed=0
+          for t in "${tests[@]}"; do
+            echo "::group::$t"
+            bash "$t" || { echo "::error file=$t::host test failed"; failed=1; }
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+  build:
+    name: Build edge_agent (esp32_S3_DevKitC_1)
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.5.4
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Build
+        shell: bash
+        working-directory: application/edge_agent
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          . "$IDF_PATH/export.sh"
+          pip install esp-bmgr-assist
+          idf.py bmgr -c ./boards -b esp32_S3_DevKitC_1
+          idf.py build
+          grep -q '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8MB_ota.csv"$' sdkconfig
+          sha256sum build/edge_agent.bin
+
+      - name: Size report and free app space check (>= 5%)
+        shell: bash
+        working-directory: application/edge_agent
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh" > /dev/null
+          idf.py size
+          python - <<'EOF'
+          import os, sys
+          sys.path.insert(0, os.path.join(os.environ["IDF_PATH"], "components", "partition_table"))
+          import gen_esp32part as g
+          with open("build/partition_table/partition-table.bin", "rb") as f:
+              table = g.PartitionTable.from_binary(f.read())
+          slot = min(p.size for p in table if p.type == g.APP_TYPE)
+          size = os.path.getsize("build/edge_agent.bin")
+          free = (slot - size) / slot
+          line = f"edge_agent.bin: {size} bytes, smallest app partition {slot} bytes, {free:.1%} free"
+          print(line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(line + "\n")
+          if free < 0.05:
+              print("::error::less than 5% of the app partition is free")
+              sys.exit(1)
+          EOF
+
+      - name: fwsign.py round trip with a throwaway key
+        shell: bash
+        run: |
+          set -euo pipefail
+          . "$IDF_PATH/export.sh" > /dev/null
+          tmp=$(mktemp -d)
+          openssl genpkey -algorithm ed25519 -out "$tmp/key.pem"
+          pub=$(python tools/fwsign.py pubkey "$tmp/key.pem" | cut -d' ' -f1)
+          python tools/fwsign.py sign application/edge_agent/build/edge_agent.bin --key "$tmp/key.pem" -o "$tmp/sig.json"
+          python tools/fwsign.py verify application/edge_agent/build/edge_agent.bin "$tmp/sig.json" --pub "$pub"
+          rm -rf "$tmp"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: edge_agent-${{ github.sha }}
+          path: application/edge_agent/build/edge_agent.bin
+          retention-days: 7
+          if-no-files-found: error
