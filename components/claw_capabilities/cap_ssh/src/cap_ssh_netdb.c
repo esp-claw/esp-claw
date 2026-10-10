@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "netdb_macros.h"
 
 static const char *TAG = "cap_ssh";
 
