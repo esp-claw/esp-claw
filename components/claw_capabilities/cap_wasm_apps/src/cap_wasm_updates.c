@@ -7,10 +7,15 @@
 /*
  * Update checks against the latest GitHub release of the firmware and of every app installed
  * from one (https://github.com/<owner>/<repo>/releases/download/...): /app updates, /app update
- * <name>|all and a daily Telegram notice at update_check_time (local time). Nothing is installed
- * without a confirmation. One HTTP request at a time, on the caller's task or a short-lived one.
+ * <name>|all and a Telegram notice from a background check: daily at update_check_time (local
+ * time), once per boot (after UPD_BOOT_DELAY_US) and when a new chat session starts
+ * (cap_wasm_updates_kick). One check at a time; boot and session checks at most once per
+ * UPD_THROTTLE_US (GitHub allows 60 unauthenticated requests per hour), and a notice repeats only
+ * for new versions (cap_wasm_should_notify). Nothing is installed without a confirmation. One HTTP
+ * request at a time, on the caller's task or a short-lived one.
  */
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -35,6 +40,8 @@ static const char *TAG = "cap_wasm_upd";
 #define UPD_NVS_NS      "upd"
 #define UPD_TICK_US     (30LL * 1000 * 1000)
 #define UPD_WINDOW_MIN  5          /* the daily check starts within this many minutes of update_check_time */
+#define UPD_BOOT_DELAY_US (120LL * 1000 * 1000)  /* uptime before the boot check: WiFi and Telegram settle */
+#define UPD_THROTTLE_US   (3600LL * 1000 * 1000) /* boot and session checks: at most one per hour */
 #define UPD_CLOCK_VALID 1767225600 /* 2026-01-01: an earlier clock is not set yet */
 #define UPD_TASK_STACK  (12 * 1024)
 #define UPD_TEXT_MAX    1024
@@ -65,6 +72,9 @@ typedef struct {
 
 static int s_check_min = -1; /* update_check_time in minutes after midnight, -1: off */
 static int s_last_yday = -1;
+static bool s_boot_checked;
+static atomic_bool s_running;                    /* a check task is running */
+static int64_t s_last_start_us = -UPD_THROTTLE_US; /* uptime of the last check; written with s_running held */
 
 /* Appends to the NUL-terminated `out`; output that does not fit is dropped. */
 static void upd_append(char *out, size_t size, const char *fmt, ...)
@@ -302,7 +312,7 @@ done:
     return ret;
 }
 
-/* ---------- Daily check ---------- */
+/* ---------- Background check ---------- */
 
 void cap_wasm_apps_set_update_check(const char *hhmm)
 {
@@ -320,7 +330,8 @@ void cap_wasm_apps_set_update_check(const char *hhmm)
     s_check_min = (int)(hour * 60 + min);
 }
 
-static void upd_daily_task(void *arg)
+/* arg: the trigger ("daily", "boot" or "session"), for the log. */
+static void upd_check_task(void *arg)
 {
     upd_daily_t *d = heap_caps_calloc(1, sizeof(*d), CAP_WASM_PSRAM_CAPS);
     int64_t last_at = 0;
@@ -333,9 +344,9 @@ static void upd_daily_task(void *arg)
     bool notify;
     esp_err_t sent = ESP_FAIL;
 
-    (void)arg;
     if (!d) {
-        ESP_LOGW(TAG, "daily update check: out of memory");
+        ESP_LOGW(TAG, "%s update check: out of memory", (const char *)arg);
+        atomic_store(&s_running, false);
         vTaskDeleteWithCaps(NULL);
         return;
     }
@@ -371,11 +382,39 @@ static void upd_daily_task(void *arg)
         nvs_commit(nvs);
         nvs_close(nvs);
     }
-    ESP_LOGI(TAG, "daily update check: %s%s%s", d->keys[0] ? d->keys : "nothing new",
+    ESP_LOGI(TAG, "%s update check: %s%s%s", (const char *)arg, d->keys[0] ? d->keys : "nothing new",
              !notify ? (d->keys[0] ? " (already announced)" : "") : sent == ESP_OK ? " (announced)" :
              " (announcement failed)", failed ? ", some lookups failed" : "");
     heap_caps_free(d);
+    atomic_store(&s_running, false);
     vTaskDeleteWithCaps(NULL);
+}
+
+/* Starts a check task unless checks are off, the clock is not set, one is running or (not daily)
+ * one started within UPD_THROTTLE_US. */
+static void upd_start(const char *why, bool daily)
+{
+    int64_t now_us = esp_timer_get_time();
+
+    if (s_check_min < 0 || time(NULL) < UPD_CLOCK_VALID || atomic_exchange(&s_running, true)) {
+        return;
+    }
+    if (!daily && now_us - s_last_start_us < UPD_THROTTLE_US) {
+        atomic_store(&s_running, false);
+        ESP_LOGD(TAG, "%s update check skipped: one ran within the hour", why);
+        return;
+    }
+    s_last_start_us = now_us;
+    if (xTaskCreateWithCaps(upd_check_task, "upd_check", UPD_TASK_STACK, (void *)why, 4, NULL,
+                            CAP_WASM_PSRAM_CAPS) != pdPASS) {
+        atomic_store(&s_running, false);
+        ESP_LOGW(TAG, "cannot start the %s update check", why);
+    }
+}
+
+void cap_wasm_updates_kick(void)
+{
+    upd_start("session", false);
 }
 
 static void upd_tick(void *arg)
@@ -388,15 +427,16 @@ static void upd_tick(void *arg)
     if (now < UPD_CLOCK_VALID || !localtime_r(&now, &tm)) {
         return;
     }
+    if (!s_boot_checked && esp_timer_get_time() >= UPD_BOOT_DELAY_US) {
+        s_boot_checked = true;
+        upd_start("boot", false);
+    }
     min = tm.tm_hour * 60 + tm.tm_min;
     if (min < s_check_min || min >= s_check_min + UPD_WINDOW_MIN || tm.tm_yday == s_last_yday) {
         return;
     }
     s_last_yday = tm.tm_yday;
-    if (xTaskCreateWithCaps(upd_daily_task, "upd_check", UPD_TASK_STACK, NULL, 4, NULL,
-                            CAP_WASM_PSRAM_CAPS) != pdPASS) {
-        ESP_LOGW(TAG, "cannot start the daily update check");
-    }
+    upd_start("daily", true);
 }
 
 void cap_wasm_updates_start(void)
@@ -405,14 +445,15 @@ void cap_wasm_updates_start(void)
     esp_timer_handle_t timer;
 
     if (s_check_min < 0) {
-        ESP_LOGI(TAG, "daily update check off");
+        ESP_LOGI(TAG, "update checks off");
         return;
     }
     if (esp_timer_create(&args, &timer) != ESP_OK || esp_timer_start_periodic(timer, UPD_TICK_US) != ESP_OK) {
         ESP_LOGE(TAG, "cannot start the daily update check timer");
         return;
     }
-    ESP_LOGI(TAG, "daily update check at %02d:%02d local time", s_check_min / 60, s_check_min % 60);
+    ESP_LOGI(TAG, "update check daily at %02d:%02d local time, at boot and on new sessions", s_check_min / 60,
+             s_check_min % 60);
 }
 
 /* ---------- Tools ---------- */

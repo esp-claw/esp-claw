@@ -57,11 +57,15 @@ typedef esp_err_t (*claw_session_mgr_delete_session_fn_t)(const char *session_id
                                                           bool *out_deleted_any,
                                                           void *user_ctx);
 
+/* Called after a chat session was created, outside the session lock. */
+typedef void (*claw_session_mgr_new_session_fn_t)(void *user_ctx);
+
 bool claw_session_mgr_alias_is_valid(const char *alias);
 bool claw_session_mgr_is_configured(void);
 esp_err_t claw_session_mgr_set_session_root_dir(const char *session_root_dir);
 esp_err_t claw_session_mgr_set_delete_session_handler(claw_session_mgr_delete_session_fn_t fn,
                                                       void *user_ctx);
+esp_err_t claw_session_mgr_set_new_session_handler(claw_session_mgr_new_session_fn_t fn, void *user_ctx);
 esp_err_t claw_session_mgr_build_session_id(const claw_session_build_context_t *ctx,
                                             char *buf,
                                             size_t buf_size,

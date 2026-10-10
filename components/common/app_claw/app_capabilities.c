@@ -72,6 +72,7 @@
 #endif
 #if CONFIG_APP_CLAW_CAP_WASM_APPS
 #include "cap_wasm_apps.h"
+#include "claw_session_mgr.h"
 #endif
 #include "claw_cap.h"
 #if CONFIG_APP_CLAW_CAP_MEMORY
@@ -774,6 +775,12 @@ static esp_err_t app_cap_register_wol(const app_claw_config_t *config,
 #endif
 
 #if CONFIG_APP_CLAW_CAP_WASM_APPS
+static void app_cap_new_session_update_check(void *user_ctx)
+{
+    (void)user_ctx;
+    cap_wasm_updates_kick();
+}
+
 static esp_err_t app_cap_register_wasm_apps(const app_claw_config_t *config,
                                             const app_claw_storage_paths_t *paths)
 {
@@ -781,6 +788,7 @@ static esp_err_t app_cap_register_wasm_apps(const app_claw_config_t *config,
                             strcmp(config->app_allow_unsigned, "true") == 0 ||
                             strcmp(config->app_allow_unsigned, "1") == 0);
     cap_wasm_apps_set_update_check(config->update_check_time);
+    claw_session_mgr_set_new_session_handler(app_cap_new_session_update_check, NULL);
     return cap_wasm_apps_register_group(paths->fatfs_base_path);
 }
 #endif
