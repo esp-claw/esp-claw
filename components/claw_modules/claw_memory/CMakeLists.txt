@@ -1,9 +1,12 @@
 idf_component_register(
     SRCS
         "src/claw_memory.c"
+        "src/claw_memory_algo.c"
         "src/claw_memory_cap.c"
+        "src/claw_memory_embed.c"
         "src/claw_memory_extract.c"
         "src/claw_memory_lightweight.c"
+        "src/claw_memory_pipeline.c"
         "src/claw_memory_profile.c"
         "src/claw_memory_session.c"
         "src/claw_memory_storage.c"
@@ -13,4 +16,9 @@ idf_component_register(
     REQUIRES
         claw_cap
         claw_core
+    PRIV_REQUIRES
+        claw_manager
+        esp_http_client
+        esp_timer
+        mbedtls
 )

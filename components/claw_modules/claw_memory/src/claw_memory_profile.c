@@ -9,7 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-static esp_err_t claw_memory_profile_dup_nonempty(const char *path, char **out_text)
+#define CLAW_MEMORY_PROFILE_PART_MAX 4096
+
+/* Reads a profile file, trimmed and capped at max_bytes on a line boundary. */
+static esp_err_t claw_memory_profile_dup_nonempty(const char *path, size_t max_bytes, char **out_text)
 {
     char *text = NULL;
     esp_err_t err;
@@ -24,6 +27,15 @@ static esp_err_t claw_memory_profile_dup_nonempty(const char *path, char **out_t
         return err;
     }
 
+    if (strlen(text) > max_bytes) {
+        char *cut;
+
+        text[max_bytes] = '\0';
+        cut = strrchr(text, '\n');
+        if (cut) {
+            *cut = '\0';
+        }
+    }
     trim_whitespace(text);
     if (!text[0]) {
         free(text);
@@ -104,11 +116,15 @@ static esp_err_t claw_memory_profile_collect(const claw_core_request_t *request,
         return ESP_ERR_INVALID_ARG;
     }
     memset(out_context, 0, sizeof(*out_context));
+    claw_memory_lock();
     for (i = 0; i < 3; i++) {
-        if (claw_memory_profile_dup_nonempty(paths[i], &parts[i]) == ESP_OK) {
+        if (claw_memory_profile_dup_nonempty(paths[i],
+                                             i == 0 ? CLAW_MEMORY_USER_MD_MAX : CLAW_MEMORY_PROFILE_PART_MAX,
+                                             &parts[i]) == ESP_OK) {
             total_len += strlen(titles[i]) + strlen(paths[i]) + strlen(parts[i]) + 12;
         }
     }
+    claw_memory_unlock();
 
     if (total_len == 0) {
         return ESP_ERR_NOT_FOUND;

@@ -86,12 +86,12 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
 #define APP_SYSTEM_PROMPT_SUFFIX \
     "When long-term memory is needed, activate the 'memory_ops' skill first and follow its instructions. " \
-    "Do not activate or use the memory skill for ordinary self-introductions or casual preferences unless the user explicitly asks to remember, save, update, or forget something. Automatic extraction will handle durable facts silently after the reply when appropriate. " \
+    "Do not activate or use the memory skill for ordinary self-introductions or casual preferences unless the user explicitly asks to remember, save, update, or forget something. Automatic extraction will handle durable facts silently in the background when appropriate. " \
     "Use memory tools only through that skill. " \
-    "Auto-injected memory context contains summary labels, not full memory bodies. " \
-    "When detailed long-term memory is needed, use exact summary labels with memory_recall. " \
+    "Auto-injected memory context contains a consolidated summary and summary labels, not every memory body. " \
+    "When detailed long-term memory is needed, call memory_recall with a free-text query and/or exact summary labels. " \
     "Do not ask whether the user wants you to remember ordinary profile or preference statements when automatic extraction can handle them. Do not offer memory-save help unless the user explicitly asks about memory management. " \
-    "Do not use memory_records.jsonl, memory_index.json, memory_digest.log, or MEMORY.md as direct decision input.\n"
+    "Do not read memory_records.jsonl, memory_index.json, memory_digest.log, or memory_vectors.bin directly.\n"
 #else
 #define APP_SYSTEM_PROMPT_SUFFIX "\n"
 #endif
@@ -536,6 +536,7 @@ static esp_err_t init_memory(const app_claw_config_t *config,
     claw_memory_config_t memory_config = {
         .session_root_dir = paths->memory_session_root,
         .memory_root_dir = paths->memory_root_dir,
+        .storage_root_dir = paths->fatfs_base_path,
         .max_message_chars = 4096,
         .max_tool_iterations = max_tool_iterations,
         .llm = {
@@ -552,10 +553,16 @@ static esp_err_t init_memory(const app_claw_config_t *config,
             .supports_vision = app_claw_bool_is_true(config->llm_supports_vision),
             .image_remote_url_only = app_claw_bool_is_true(config->llm_image_remote_url_only),
         },
+        .embed = {
+            .base_url = config->embed_base_url,
+            /* Same OpenAI account as speech-to-text unless a dedicated key is set. */
+            .api_key = config->embed_api_key[0] ? config->embed_api_key : config->stt_api_key,
+            .model = config->embed_model,
+        },
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
-        .enable_async_extract_stage_note = true,
+        .enable_background_pipeline = true,
 #else
-        .enable_async_extract_stage_note = false,
+        .enable_background_pipeline = false,
 #endif
     };
     esp_err_t err = claw_memory_init(&memory_config);

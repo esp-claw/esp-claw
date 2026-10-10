@@ -24,16 +24,16 @@ Use this skill when the user explicitly asks to remember, save, keep, or not for
 3. Do not write raw user quotes into memory content.
 4. Do not exceed the maximum number of retrieval terms.
 5. Keep retrieval terms in the same language as the memory fact unless the memory itself is primarily in another language.
-6. If the user asks what you remember, asks to verify a remembered fact, or asks for a personalized answer based on prior memory, inspect the injected summary labels first and call `memory_recall` when relevant labels are present.
+6. If the user asks what you remember, asks to verify a remembered fact, or asks for a personalized answer based on prior memory, check the injected consolidated summary and summary labels first, then call `memory_recall` when the summary does not already answer it.
 7. Do not place natural-language questions into `summary_labels`.
-8. `memory_recall` requires exact `summary_labels` chosen from the injected catalog.
-9. Use `query` only to narrow the search within the selected summary labels.
+8. `memory_recall` accepts a free-text `query` (ranked by keyword and semantic match, recency, usage and importance) and/or exact `summary_labels` chosen from the injected catalog.
+9. Prefer a short `query` naming the subject (e.g. `server hetzner`, `wohnort`); add `summary_labels` only to restrict the search to those labels.
 10. Use `memory_list` when the user wants to inspect stored memories.
 11. Use `memory_update` only when one existing memory should be modified.
 12. Use `memory_forget` only when one existing memory should be removed.
 13. Use `memory_recall` plus exact `memory_id` only when you are already doing an explicit memory-inspection or memory-editing flow and need to inspect the recalled memory bodies yourself.
 14. Do not use non-whitelisted or free-text values as summary labels.
-15. Do not read or write `memory_records.jsonl`, `memory_index.json`, `memory_digest.log`, or `MEMORY.md` to make decisions directly.
+15. Do not read or write `memory_records.jsonl`, `memory_index.json`, `memory_digest.log`, or `memory_vectors.bin` directly. `MEMORY.md` and `user.md` are rewritten nightly from the stored memories.
 16. Summary labels are not the memory body. Use `memory_recall` to obtain detailed stored content.
 17. Do not call `memory_store` for ordinary self-introductions or casual preference statements unless the user explicitly asks to save them. Let automatic extraction handle durable facts after the reply silently.
 18. Do not make the whole reply an operation log such as “I have remembered” or “deleted” unless the user explicitly asked only for a memory operation.
@@ -56,7 +56,8 @@ Use this skill when the user explicitly asks to remember, save, keep, or not for
 
 ## Typical flow
 - Explicit save request: call `memory_store`, then continue the main conversation naturally.
-- Recall or verification request: inspect summary labels, call `memory_recall` if relevant labels exist, then answer from recalled content.
+- Recall or verification request: check the consolidated summary, call `memory_recall` with a `query` (and labels if relevant), then answer from recalled content.
+- "Remember this conversation" / "update your memory now": call `memory_sync` (add `consolidate: true` to also refresh the summary).
 - Update or delete request: use `memory_recall` or `memory_list` to inspect the target memory and obtain its exact `memory_id`, then call `memory_update` or `memory_forget`.
 
 ## Examples

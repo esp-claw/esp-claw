@@ -31,13 +31,22 @@ typedef struct {
     bool image_remote_url_only;
 } claw_memory_llm_config_t;
 
+/* OpenAI-compatible embeddings endpoint; an empty api_key disables semantic recall. */
+typedef struct {
+    const char *base_url;
+    const char *api_key;
+    const char *model;
+} claw_memory_embed_config_t;
+
 typedef struct {
     const char *session_root_dir;
     const char *memory_root_dir;
+    const char *storage_root_dir; /* optional: swept for stale WebDAV temp files */
     size_t max_message_chars;
     uint32_t max_tool_iterations;
     claw_memory_llm_config_t llm;
-    bool enable_async_extract_stage_note;
+    claw_memory_embed_config_t embed;
+    bool enable_background_pipeline; /* session extraction, consolidation, session GC */
 } claw_memory_config_t;
 
 typedef struct {
@@ -52,12 +61,15 @@ typedef struct {
     uint32_t updated_at;
     uint16_t access_count;
     uint8_t deleted;
+    uint8_t importance; /* 1..5, 0 = default (3) */
+    uint8_t kind;       /* claw_memory_kind_t: other|profile|preference|device|project|event */
 } claw_memory_item_t;
 
 typedef struct {
     const char *const *summary_labels;
     size_t summary_label_count;
     size_t limit;
+    const char *query; /* optional free text, ranked by keyword (+ embedding) match */
 } claw_memory_query_t;
 
 esp_err_t claw_memory_init(const claw_memory_config_t *config);
@@ -87,7 +99,8 @@ esp_err_t claw_memory_request_gate_callback(const claw_core_request_t *request,
                                             void *user_ctx);
 esp_err_t claw_memory_request_start_callback(const claw_core_request_t *request,
                                              void *user_ctx);
-esp_err_t claw_memory_request_mark_manual_write(uint32_t request_id);
+/* Queue session extraction (and optionally consolidation) on the memory worker. */
+esp_err_t claw_memory_request_sync(const char *session_id, bool consolidate);
 esp_err_t claw_memory_stage_note_callback(const claw_core_request_t *request,
                                           char **out_note,
                                           void *user_ctx);

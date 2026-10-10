@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "esp_log.h"
 
@@ -366,6 +365,8 @@ static void claw_memory_item_from_json(cJSON *json, claw_memory_item_t *item)
     item->updated_at = (uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItem(json, "updated_at"));
     item->access_count = (uint16_t)cJSON_GetNumberValue(cJSON_GetObjectItem(json, "access_count"));
     item->deleted = (uint8_t)cJSON_IsTrue(cJSON_GetObjectItem(json, "deleted"));
+    item->importance = (uint8_t)cJSON_GetNumberValue(cJSON_GetObjectItem(json, "importance"));
+    item->kind = claw_memory_kind_from_name(cJSON_GetStringValue(cJSON_GetObjectItem(json, "kind")));
 
     summary_ids = cJSON_GetObjectItem(json, "summary_ids");
     if (cJSON_IsArray(summary_ids)) {
@@ -410,6 +411,8 @@ cJSON *claw_memory_item_to_json(const claw_memory_item_t *item, cJSON *index_roo
     cJSON_AddNumberToObject(json, "updated_at", item->updated_at);
     cJSON_AddNumberToObject(json, "access_count", item->access_count);
     cJSON_AddBoolToObject(json, "deleted", item->deleted != 0);
+    cJSON_AddNumberToObject(json, "importance", item->importance ? item->importance : 3);
+    cJSON_AddStringToObject(json, "kind", claw_memory_kind_name(item->kind));
 
     for (i = 0; i < item->summary_id_count && i < CLAW_MEMORY_MAX_SUMMARIES; i++) {
         cJSON *summary = index_root ? claw_memory_find_summary_by_id(index_root, item->summary_ids[i]) : NULL;
@@ -449,6 +452,8 @@ esp_err_t claw_memory_append_record(const claw_memory_item_t *item)
     cJSON_AddNumberToObject(json, "updated_at", item->updated_at);
     cJSON_AddNumberToObject(json, "access_count", item->access_count);
     cJSON_AddBoolToObject(json, "deleted", item->deleted != 0);
+    cJSON_AddNumberToObject(json, "importance", item->importance ? item->importance : 3);
+    cJSON_AddStringToObject(json, "kind", claw_memory_kind_name(item->kind));
     {
         cJSON *summary_ids = cJSON_CreateArray();
         size_t i;
@@ -563,28 +568,6 @@ int claw_memory_sort_by_priority_desc(const void *a, const void *b)
     return strcmp(ia->id, ib->id);
 }
 
-static void claw_memory_format_timestamp(uint32_t ts, char *buf, size_t buf_size)
-{
-    time_t raw_ts;
-    struct tm tm_info;
-
-    if (!buf || buf_size == 0) {
-        return;
-    }
-
-    buf[0] = '\0';
-    if (ts == 0) {
-        safe_copy(buf, buf_size, "-");
-        return;
-    }
-
-    raw_ts = (time_t)ts;
-    if (!localtime_r(&raw_ts, &tm_info) ||
-        strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", &tm_info) == 0) {
-        snprintf(buf, buf_size, "%" PRIu32, ts);
-    }
-}
-
 void claw_memory_append_digest_line(const char *action,
                                     const claw_memory_item_t *item,
                                     const char *extra)
@@ -604,6 +587,58 @@ void claw_memory_append_digest_line(const char *action,
     }
     append_file_text(s_memory.digest_path, line);
     free(line);
+}
+
+esp_err_t claw_memory_append_recall_deltas(const char *const *memory_ids,
+                                           const uint16_t *counts,
+                                           size_t count)
+{
+    char *text = NULL;
+    size_t cap = 0;
+    size_t off = 0;
+    size_t i;
+    uint16_t n;
+    esp_err_t err;
+
+    for (i = 0; i < count; i++) {
+        cap += (size_t)counts[i] * (strlen(memory_ids[i]) + 40);
+    }
+    if (cap == 0) {
+        return ESP_OK;
+    }
+    text = calloc(1, cap + 1);
+    if (!text) {
+        return ESP_ERR_NO_MEM;
+    }
+    /* Same line format as claw_memory_append_digest_line, replayed by compaction. */
+    for (i = 0; i < count; i++) {
+        for (n = 0; n < counts[i] && off < cap; n++) {
+            int written = snprintf(text + off, cap + 1 - off, "%" PRIu32 "\trecall\t%s\taccess_count+1\n",
+                                   claw_memory_now_sec(), memory_ids[i]);
+
+            if (written < 0) {
+                break;
+            }
+            off += (size_t)written;
+        }
+    }
+    err = append_file_text(s_memory.digest_path, text);
+    free(text);
+    return err;
+}
+
+cJSON *claw_memory_pipeline_state(cJSON *index_root)
+{
+    cJSON *state = cJSON_GetObjectItem(index_root, CLAW_MEMORY_PIPELINE_KEY);
+
+    if (!index_root) {
+        return NULL;
+    }
+    if (!cJSON_IsObject(state)) {
+        cJSON_DeleteItemFromObject(index_root, CLAW_MEMORY_PIPELINE_KEY);
+        state = cJSON_AddObjectToObject(index_root, CLAW_MEMORY_PIPELINE_KEY);
+    }
+    return state;
 }
 
 static void claw_memory_keyword_index_add_term(cJSON *keyword_index,
@@ -693,118 +728,6 @@ void claw_memory_rebuild_keyword_index(cJSON *index_root,
      * (consistent with claw_memory_load_index). */
     cJSON_DeleteItemFromObject(index_root, "keyword_index");
     cJSON_AddItemToObject(index_root, "keyword_index", keyword_index);
-}
-
-esp_err_t claw_memory_export_markdown_internal(char **out_markdown,
-                                               const claw_memory_item_list_t *items,
-                                               cJSON *index_root)
-{
-    cJSON *summaries = NULL;
-    cJSON *summary = NULL;
-    size_t buf_size;
-    size_t off = 0;
-    char *buf;
-    claw_memory_item_list_t sorted = {0};
-    size_t i;
-
-    if (!out_markdown) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_markdown = NULL;
-
-    buf_size = 1024 + ((items ? items->count : 0) * 512);
-    buf = calloc(1, buf_size);
-    if (!buf) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    off += snprintf(buf + off, buf_size - off, "# Long-term Memory\n\n");
-    summaries = index_root ? cJSON_GetObjectItem(index_root, "summaries") : NULL;
-    if (cJSON_IsArray(summaries) && cJSON_GetArraySize(summaries) > 0) {
-        off += snprintf(buf + off,
-                        buf_size - off,
-                        "## Summary Labels\n\n");
-        cJSON_ArrayForEach(summary, summaries) {
-            const char *label = cJSON_GetStringValue(cJSON_GetObjectItem(summary, "label"));
-            int ref_count = cJSON_GetObjectItem(summary, "ref_count") ?
-                cJSON_GetObjectItem(summary, "ref_count")->valueint : 0;
-
-            if (!label) {
-                continue;
-            }
-            off += snprintf(buf + off,
-                            buf_size - off,
-                            "- %s (refs=%d)\n",
-                            label,
-                            ref_count);
-            if (off >= buf_size) {
-                break;
-            }
-        }
-        off += snprintf(buf + off, buf_size - off, "\n");
-    }
-
-    if (!items || items->count == 0) {
-        off += snprintf(buf + off,
-                        buf_size - off,
-                        "(empty - Claw will write memories here as it learns)\n");
-        *out_markdown = buf;
-        return ESP_OK;
-    }
-
-    sorted.capacity = items->count;
-    sorted.count = items->count;
-    sorted.items = calloc(items->count, sizeof(*sorted.items));
-    if (!sorted.items) {
-        free(buf);
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(sorted.items, items->items, items->count * sizeof(*sorted.items));
-    qsort(sorted.items, sorted.count, sizeof(*sorted.items), claw_memory_sort_by_priority_desc);
-
-    off += snprintf(buf + off, buf_size - off, "## Active Memories\n\n");
-    for (i = 0; i < sorted.count && off + 64 < buf_size; i++) {
-        cJSON *item_json;
-        char *labels_json;
-        char updated_at_text[24];
-        const claw_memory_item_t *item = &sorted.items[i];
-
-        if (item->deleted) {
-            continue;
-        }
-        item_json = claw_memory_item_to_json(item, index_root);
-        labels_json = item_json ? cJSON_PrintUnformatted(cJSON_GetObjectItem(item_json, "summary_labels")) : NULL;
-        claw_memory_format_timestamp(item->updated_at, updated_at_text, sizeof(updated_at_text));
-        off += snprintf(buf + off,
-                        buf_size - off,
-                        "- `%s` %s\n"
-                        "  time=%s access=%u labels=%s\n",
-                        item->id,
-                        item->content,
-                        updated_at_text,
-                        item->access_count,
-                        labels_json ? labels_json : "[]");
-        free(labels_json);
-        cJSON_Delete(item_json);
-    }
-
-    claw_memory_item_list_free(&sorted);
-    *out_markdown = buf;
-    return ESP_OK;
-}
-
-esp_err_t claw_memory_sync_markdown(const claw_memory_item_list_t *items, cJSON *index_root)
-{
-    char *markdown = NULL;
-    esp_err_t err;
-
-    err = claw_memory_export_markdown_internal(&markdown, items, index_root);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = write_file_text(s_memory.markdown_path, markdown);
-    free(markdown);
-    return err;
 }
 
 static int claw_memory_capacity_score(const claw_memory_item_t *item)
@@ -1004,6 +927,9 @@ esp_err_t claw_memory_compact_internal(bool append_digest)
             if (scratch_item->access_count > dst->access_count) {
                 dst->access_count = scratch_item->access_count;
             }
+            if (scratch_item->importance > dst->importance) {
+                dst->importance = scratch_item->importance;
+            }
             if (scratch_item->updated_at > dst->updated_at) {
                 dst->updated_at = scratch_item->updated_at;
                 safe_copy(dst->content, sizeof(dst->content), scratch_item->content);
@@ -1060,6 +986,10 @@ esp_err_t claw_memory_compact_internal(bool append_digest)
     }
     claw_memory_rebuild_keyword_index(new_index, &compacted);
     claw_memory_set_index_last_compact_digest_size(new_index, digest_size);
+    if (old_index && cJSON_GetObjectItem(old_index, CLAW_MEMORY_PIPELINE_KEY)) {
+        cJSON_AddItemToObject(new_index, CLAW_MEMORY_PIPELINE_KEY,
+                              cJSON_DetachItemFromObject(old_index, CLAW_MEMORY_PIPELINE_KEY));
+    }
 
     {
         size_t est_size = (compacted.count * 512) + 16;
@@ -1093,9 +1023,6 @@ esp_err_t claw_memory_compact_internal(bool append_digest)
     err = write_file_text(s_memory.records_path, records_text ? records_text : "");
     if (err == ESP_OK) {
         err = claw_memory_save_index(new_index);
-    }
-    if (err == ESP_OK) {
-        err = claw_memory_sync_markdown(&compacted, new_index);
     }
     if (err == ESP_OK && append_digest) {
         claw_memory_append_digest_line("compact", NULL, "rebuild=index+markdown");

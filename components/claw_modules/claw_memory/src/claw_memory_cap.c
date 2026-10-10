@@ -294,9 +294,6 @@ static void cap_memory_record_pending_summary(const claw_cap_call_context_t *ctx
         return;
     }
 
-    if (ctx->request_id != 0) {
-        (void)claw_memory_request_mark_manual_write(ctx->request_id);
-    }
     if (!ctx->session_id || !ctx->session_id[0] || !summary || !summary[0]) {
         return;
     }
@@ -400,6 +397,7 @@ static esp_err_t cap_memory_recall_execute(const char *input_json,
     }
 
     query.limit = (size_t)cJSON_GetNumberValue(cJSON_GetObjectItem(root, "limit"));
+    query.query = cJSON_GetStringValue(cJSON_GetObjectItem(root, "query"));
     labels = cJSON_GetObjectItem(root, "summary_labels");
     if (cJSON_IsArray(labels)) {
         for (i = 0; i < cJSON_GetArraySize(labels) && label_count < 3; i++) {
@@ -410,15 +408,16 @@ static esp_err_t cap_memory_recall_execute(const char *input_json,
         }
     }
 
-    err = cap_memory_collect_summary_catalog(&catalog_json);
-    if (err != ESP_OK) {
-        cJSON_Delete(root);
-        return cap_memory_render_error("memory_summary_catalog_unavailable", output, output_size);
+    if (label_count > 0) {
+        err = cap_memory_collect_summary_catalog(&catalog_json);
+        if (err != ESP_OK) {
+            cJSON_Delete(root);
+            return cap_memory_render_error("memory_summary_catalog_unavailable", output, output_size);
+        }
+        invalid_label = cap_memory_find_invalid_summary_label(label_values,
+                                                              (size_t)label_count,
+                                                              catalog_json);
     }
-
-    invalid_label = cap_memory_find_invalid_summary_label(label_values,
-                                                          (size_t)label_count,
-                                                          catalog_json);
     if (invalid_label) {
         cJSON_Delete(root);
         err = cap_memory_render_invalid_summary_labels(invalid_label,
@@ -631,6 +630,23 @@ static esp_err_t cap_memory_forget_execute(const char *input_json,
     return err;
 }
 
+static esp_err_t cap_memory_sync_execute(const char *input_json,
+                                         const claw_cap_call_context_t *ctx,
+                                         char *output,
+                                         size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json ? input_json : "{}");
+    bool consolidate = cJSON_IsTrue(cJSON_GetObjectItem(root, "consolidate"));
+    esp_err_t err;
+
+    cJSON_Delete(root);
+    err = claw_memory_request_sync(ctx ? ctx->session_id : NULL, consolidate);
+    if (err != ESP_OK) {
+        return cap_memory_render_error("memory_sync_unavailable", output, output_size);
+    }
+    return cap_memory_render_result("memory_sync", NULL, NULL, true, NULL, output, output_size);
+}
+
 static const claw_cap_descriptor_t s_memory_descriptors[] = {
     {
         .id = "memory_store",
@@ -647,11 +663,11 @@ static const claw_cap_descriptor_t s_memory_descriptors[] = {
         .id = "memory_recall",
         .name = "memory_recall",
         .family = "memory",
-        .description = "Recall detailed long-term memories by exact summary_labels from the current catalog.",
+        .description = "Recall long-term memories ranked by relevance, recency, usage and importance. Pass a free-text query and/or exact summary_labels from the current catalog.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json =
-            "{\"type\":\"object\",\"properties\":{\"summary_labels\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"limit\":{\"type\":\"integer\"}}}",
+            "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"summary_labels\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"limit\":{\"type\":\"integer\"}}}",
         .execute = cap_memory_recall_execute,
     },
     {
@@ -685,6 +701,17 @@ static const claw_cap_descriptor_t s_memory_descriptors[] = {
         .input_schema_json =
             "{\"type\":\"object\",\"properties\":{\"memory_id\":{\"type\":\"string\"}},\"required\":[\"memory_id\"]}",
         .execute = cap_memory_forget_execute,
+    },
+    {
+        .id = "memory_sync",
+        .name = "memory_sync",
+        .family = "memory",
+        .description = "Extract durable facts from the current conversation into long-term memory now (runs in the background); consolidate=true also rewrites user.md and MEMORY.md.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{\"consolidate\":{\"type\":\"boolean\"}}}",
+        .execute = cap_memory_sync_execute,
     },
 };
 

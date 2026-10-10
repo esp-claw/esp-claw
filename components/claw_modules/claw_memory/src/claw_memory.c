@@ -11,10 +11,29 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+#define CLAW_MEMORY_RECALL_MIN_MATCH 0.15f
 
 static const char *TAG = "claw_memory";
 
 claw_memory_state_t s_memory = {0};
+static SemaphoreHandle_t s_memory_lock = NULL;
+
+void claw_memory_lock(void)
+{
+    if (s_memory_lock) {
+        xSemaphoreTakeRecursive(s_memory_lock, portMAX_DELAY);
+    }
+}
+
+void claw_memory_unlock(void)
+{
+    if (s_memory_lock) {
+        xSemaphoreGiveRecursive(s_memory_lock);
+    }
+}
 
 /* Append a formatted chunk into buf[off..buf_size) and return the number of
  * bytes ACTUALLY written (never the snprintf "would-have-written" value), so
@@ -50,18 +69,18 @@ static void claw_memory_fill_defaults(claw_memory_item_t *item)
     }
 }
 
+static esp_err_t claw_memory_store_prepared_item_locked(claw_memory_item_t *item,
+                                                        const char *digest_action,
+                                                        const char *digest_extra,
+                                                        const char *ignore_existing_id,
+                                                        bool *out_changed);
+
 static esp_err_t claw_memory_store_prepared_item_internal(claw_memory_item_t *item,
                                                           const char *digest_action,
                                                           const char *digest_extra,
                                                           const char *ignore_existing_id,
                                                           bool *out_changed)
 {
-    claw_memory_item_list_t items = {0};
-    cJSON *index_root = NULL;
-    char labels[CLAW_MEMORY_MAX_SUMMARIES][CLAW_MEMORY_MAX_LABEL_TEXT];
-    char item_key[48];
-    size_t label_count = 0;
-    size_t i;
     esp_err_t err;
 
     if (!item || !item->content[0]) {
@@ -71,6 +90,27 @@ static esp_err_t claw_memory_store_prepared_item_internal(claw_memory_item_t *it
     if (out_changed) {
         *out_changed = false;
     }
+
+    claw_memory_lock();
+    err = claw_memory_store_prepared_item_locked(item, digest_action, digest_extra,
+                                                 ignore_existing_id, out_changed);
+    claw_memory_unlock();
+    return err;
+}
+
+static esp_err_t claw_memory_store_prepared_item_locked(claw_memory_item_t *item,
+                                                        const char *digest_action,
+                                                        const char *digest_extra,
+                                                        const char *ignore_existing_id,
+                                                        bool *out_changed)
+{
+    claw_memory_item_list_t items = {0};
+    cJSON *index_root = NULL;
+    char labels[CLAW_MEMORY_MAX_SUMMARIES][CLAW_MEMORY_MAX_LABEL_TEXT];
+    char item_key[48];
+    size_t label_count = 0;
+    size_t i;
+    esp_err_t err;
 
     trim_whitespace(item->content);
     trim_whitespace(item->tags);
@@ -148,9 +188,6 @@ static esp_err_t claw_memory_store_prepared_item_internal(claw_memory_item_t *it
         err = claw_memory_save_index(index_root);
     }
     if (err == ESP_OK) {
-        err = claw_memory_sync_markdown(&items, index_root);
-    }
-    if (err == ESP_OK) {
         claw_memory_append_digest_line(digest_action, item, digest_extra);
         s_memory.write_changes_since_compact++;
         if (out_changed) {
@@ -196,6 +233,12 @@ static void claw_memory_apply_update_patch(claw_memory_item_t *dst,
     }
     if (patch->keywords[0]) {
         safe_copy(dst->keywords, sizeof(dst->keywords), patch->keywords);
+    }
+    if (patch->importance) {
+        dst->importance = patch->importance;
+    }
+    if (patch->kind) {
+        dst->kind = patch->kind;
     }
 }
 
@@ -282,13 +325,20 @@ static esp_err_t claw_memory_render_item_list_json(const claw_memory_item_list_t
     return ESP_OK;
 }
 
-static void claw_memory_append_recall_state_updates(const claw_memory_item_list_t *items)
-{
-    size_t i;
+typedef struct {
+    float score;
+    size_t index;
+} claw_memory_ranked_t;
 
-    for (i = 0; items && i < items->count; i++) {
-        claw_memory_append_digest_line("recall", &items->items[i], "access_count+1");
+static int claw_memory_ranked_desc(const void *a, const void *b)
+{
+    const claw_memory_ranked_t *ra = (const claw_memory_ranked_t *)a;
+    const claw_memory_ranked_t *rb = (const claw_memory_ranked_t *)b;
+
+    if (ra->score != rb->score) {
+        return ra->score < rb->score ? 1 : -1;
     }
+    return ra->index < rb->index ? -1 : (ra->index > rb->index);
 }
 
 esp_err_t claw_memory_init(const claw_memory_config_t *config)
@@ -304,7 +354,14 @@ esp_err_t claw_memory_init(const claw_memory_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (!s_memory_lock) {
+        s_memory_lock = xSemaphoreCreateRecursiveMutex();
+        if (!s_memory_lock) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     memset(&s_memory, 0, sizeof(s_memory));
+    safe_copy(s_memory.storage_root_dir, sizeof(s_memory.storage_root_dir), config->storage_root_dir);
     safe_copy(s_memory.session_root_dir, sizeof(s_memory.session_root_dir), config->session_root_dir);
     safe_copy(s_memory.memory_root_dir,
               sizeof(s_memory.memory_root_dir),
@@ -331,7 +388,11 @@ esp_err_t claw_memory_init(const claw_memory_config_t *config)
         claw_memory_join_path(s_memory.digest_path,
                               sizeof(s_memory.digest_path),
                               s_memory.memory_root_dir,
-                              CLAW_MEMORY_DIGEST_FILE) != ESP_OK) {
+                              CLAW_MEMORY_DIGEST_FILE) != ESP_OK ||
+        claw_memory_join_path(s_memory.vectors_path,
+                              sizeof(s_memory.vectors_path),
+                              s_memory.memory_root_dir,
+                              CLAW_MEMORY_VECTORS_FILE) != ESP_OK) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -352,14 +413,17 @@ esp_err_t claw_memory_init(const claw_memory_config_t *config)
     }
 
     s_memory.initialized = 1;
+    claw_memory_compact_internal(false);
     {
-        esp_err_t async_err = claw_memory_async_extract_init(config);
+        esp_err_t err = claw_memory_embed_init(&config->embed);
 
-        if (async_err != ESP_OK) {
-            return async_err;
+        if (err == ESP_OK) {
+            err = claw_memory_pipeline_init(config);
+        }
+        if (err != ESP_OK) {
+            return err;
         }
     }
-    claw_memory_compact_internal(false);
     ESP_LOGI(TAG, "Initialized memory root=%s", s_memory.memory_root_dir);
     return ESP_OK;
 }
@@ -393,13 +457,21 @@ esp_err_t claw_memory_store_with_result(claw_memory_item_t *item, bool *out_chan
 
 esp_err_t claw_memory_recall(const claw_memory_query_t *query, char **out_json)
 {
+    char tokens[CLAW_MEMORY_QUERY_MAX_TOKENS][CLAW_MEMORY_TOKEN_MAX];
     claw_memory_item_list_t items = {0};
     claw_memory_item_list_t matches = {0};
+    claw_memory_ranked_t *ranked = NULL;
     cJSON *index_root = NULL;
+    float *query_vec = NULL;
     int summary_ids[CLAW_MEMORY_MAX_SUMMARIES] = {0};
     size_t resolved_summary_count = 0;
+    size_t token_count = 0;
+    size_t ranked_count = 0;
     size_t limit;
     size_t i;
+    bool has_query = false;
+    bool has_query_vec = false;
+    uint32_t now = claw_memory_now_sec();
     esp_err_t err;
 
     if (!query || !out_json) {
@@ -409,9 +481,20 @@ esp_err_t claw_memory_recall(const claw_memory_query_t *query, char **out_json)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (query->query && query->query[0]) {
+        token_count = claw_memory_tokenize(query->query, tokens, CLAW_MEMORY_QUERY_MAX_TOKENS);
+        if (claw_memory_embed_enabled() && !claw_memory_text_has_secret(query->query)) {
+            query_vec = malloc(CLAW_MEMORY_EMBED_DIM * sizeof(float));
+            has_query_vec = query_vec && claw_memory_embed_query(query->query, query_vec) == ESP_OK;
+        }
+        /* A query made only of stop words ranks like no query at all. */
+        has_query = token_count > 0 || has_query_vec;
+    }
+
+    claw_memory_lock();
     err = claw_memory_load_index(&index_root);
     if (err != ESP_OK) {
-        return err;
+        goto cleanup;
     }
     for (i = 0; i < query->summary_label_count && i < CLAW_MEMORY_MAX_SUMMARIES; i++) {
         cJSON *summary = claw_memory_find_summary_by_label(index_root, query->summary_labels[i]);
@@ -422,49 +505,64 @@ esp_err_t claw_memory_recall(const claw_memory_query_t *query, char **out_json)
     }
     if (query->summary_label_count > 0 && resolved_summary_count == 0) {
         err = claw_memory_render_item_list_json(NULL, index_root, out_json);
-        cJSON_Delete(index_root);
-        return err;
+        goto cleanup;
     }
 
     err = claw_memory_load_current_items(&items);
     if (err != ESP_OK) {
-        cJSON_Delete(index_root);
-        return err;
+        goto cleanup;
     }
+    ranked = calloc(items.count ? items.count : 1, sizeof(*ranked));
+    if (!ranked) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    for (i = 0; i < items.count; i++) {
+        const claw_memory_item_t *item = &items.items[i];
+        float match = 1.0f;
+
+        if (item->deleted ||
+            !claw_memory_item_matches_summary_ids(item, summary_ids, resolved_summary_count)) {
+            continue;
+        }
+        if (has_query) {
+            const int8_t *vec = has_query_vec ? claw_memory_vectors_get(item->id) : NULL;
+            float keyword = claw_memory_keyword_match(tokens, token_count, item->content,
+                                                      item->tags, item->keywords);
+
+            match = claw_memory_hybrid_match(vec ? claw_memory_vec_cosine(vec, query_vec) : 0.0f,
+                                             keyword, vec != NULL);
+            if (match < CLAW_MEMORY_RECALL_MIN_MATCH) {
+                continue;
+            }
+        }
+        ranked[ranked_count].score = claw_memory_rank_score(match, now, item->updated_at,
+                                                            item->access_count, item->importance);
+        ranked[ranked_count++].index = i;
+    }
+    qsort(ranked, ranked_count, sizeof(*ranked), claw_memory_ranked_desc);
 
     limit = query->limit ? query->limit : CLAW_MEMORY_RECALL_DEFAULT_LIMIT;
-    for (i = 0; i < items.count; i++) {
-        claw_memory_item_t item = items.items[i];
-
-        if (item.deleted) {
-            continue;
+    for (i = 0; i < ranked_count && i < limit; i++) {
+        err = claw_memory_item_list_push(&matches, &items.items[ranked[i].index]);
+        if (err != ESP_OK) {
+            goto cleanup;
         }
-        if (!claw_memory_item_matches_summary_ids(&item, summary_ids, resolved_summary_count)) {
-            continue;
-        }
-        if (claw_memory_item_list_push(&matches, &item) != ESP_OK) {
-            cJSON_Delete(index_root);
-            claw_memory_item_list_free(&items);
-            claw_memory_item_list_free(&matches);
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (matches.count > 1) {
-        qsort(matches.items, matches.count, sizeof(*matches.items), claw_memory_sort_by_priority_desc);
-    }
-    if (matches.count > limit) {
-        matches.count = limit;
     }
 
     err = claw_memory_render_item_list_json(&matches, index_root, out_json);
-    if (err == ESP_OK) {
-        claw_memory_append_recall_state_updates(&matches);
+    for (i = 0; err == ESP_OK && i < matches.count; i++) {
+        claw_memory_pipeline_note_access(matches.items[i].id);
     }
 
+cleanup:
+    claw_memory_unlock();
     cJSON_Delete(index_root);
     claw_memory_item_list_free(&items);
     claw_memory_item_list_free(&matches);
+    free(ranked);
+    free(query_vec);
     return err;
 }
 
@@ -487,7 +585,19 @@ esp_err_t claw_memory_update(const claw_memory_item_t *item)
     return err;
 }
 
+static esp_err_t claw_memory_update_locked(claw_memory_item_t *item, bool *out_changed);
+
 esp_err_t claw_memory_update_with_result(claw_memory_item_t *item, bool *out_changed)
+{
+    esp_err_t err;
+
+    claw_memory_lock();
+    err = claw_memory_update_locked(item, out_changed);
+    claw_memory_unlock();
+    return err;
+}
+
+static esp_err_t claw_memory_update_locked(claw_memory_item_t *item, bool *out_changed)
 {
     claw_memory_item_list_t items = {0};
     claw_memory_item_t *replacement = NULL;
@@ -580,9 +690,25 @@ esp_err_t claw_memory_forget(const char *memory_id)
     return claw_memory_forget_with_result(memory_id, NULL, NULL);
 }
 
+static esp_err_t claw_memory_forget_locked(const char *memory_id,
+                                           claw_memory_item_t *out_item,
+                                           bool *out_changed);
+
 esp_err_t claw_memory_forget_with_result(const char *memory_id,
                                          claw_memory_item_t *out_item,
                                          bool *out_changed)
+{
+    esp_err_t err;
+
+    claw_memory_lock();
+    err = claw_memory_forget_locked(memory_id, out_item, out_changed);
+    claw_memory_unlock();
+    return err;
+}
+
+static esp_err_t claw_memory_forget_locked(const char *memory_id,
+                                           claw_memory_item_t *out_item,
+                                           bool *out_changed)
 {
     claw_memory_item_list_t items = {0};
     cJSON *index_root = NULL;
@@ -644,25 +770,7 @@ esp_err_t claw_memory_forget_with_result(const char *memory_id,
     claw_memory_rebuild_keyword_index(index_root, &items);
     err = claw_memory_save_index(index_root);
     if (err == ESP_OK) {
-        claw_memory_item_list_t active = {0};
-        size_t i;
-
-        for (i = 0; i < items.count; i++) {
-            if (!items.items[i].deleted) {
-                err = claw_memory_item_list_push(&active, &items.items[i]);
-                if (err != ESP_OK) {
-                    claw_memory_item_list_free(&active);
-                    cJSON_Delete(index_root);
-                    claw_memory_item_list_free(&items);
-                    free(forgotten);
-                    return err;
-                }
-            }
-        }
-        err = claw_memory_sync_markdown(&active, index_root);
-        claw_memory_item_list_free(&active);
-    }
-    if (err == ESP_OK) {
+        claw_memory_vectors_remove(memory_id);
         claw_memory_append_digest_line("forget", forgotten, NULL);
         s_memory.write_changes_since_compact++;
         if (out_changed) {
@@ -694,8 +802,10 @@ esp_err_t claw_memory_list(char **out_json)
         return ESP_ERR_INVALID_STATE;
     }
 
+    claw_memory_lock();
     err = claw_memory_load_current_items(&items);
     if (err != ESP_OK) {
+        claw_memory_unlock();
         return err;
     }
     for (i = 0; i < items.count; i++) {
@@ -703,6 +813,7 @@ esp_err_t claw_memory_list(char **out_json)
             continue;
         }
         if (claw_memory_item_list_push(&filtered, &items.items[i]) != ESP_OK) {
+            claw_memory_unlock();
             claw_memory_item_list_free(&items);
             claw_memory_item_list_free(&filtered);
             return ESP_ERR_NO_MEM;
@@ -716,6 +827,7 @@ esp_err_t claw_memory_list(char **out_json)
     if (err == ESP_OK) {
         err = claw_memory_render_item_list_json(&filtered, index_root, out_json);
     }
+    claw_memory_unlock();
 
     cJSON_Delete(index_root);
     claw_memory_item_list_free(&items);
@@ -728,21 +840,22 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
                                                void *user_ctx)
 {
     static const char k_long_term_preamble[] =
-        "The auto-injected long-term memory context only contains summary labels, not full memory bodies.\n"
-        "Use exact summary labels with memory_recall when you need detailed long-term memory.\n"
+        "Long-term memory has two parts: a consolidated summary (below, rewritten nightly from the stored memories) and the stored memory items, which are not injected.\n"
+        "Call memory_recall with a free-text query (and/or exact summary labels from the catalog) when you need details, exact memory_id values, or facts that are not in the summary.\n"
         "Summary labels must be copied verbatim from the catalog below. Do not invent new labels.\n"
-        "If the user asks what you remember about them, what they like or prefer, or asks you to verify a remembered fact, call memory_recall before answering when any relevant summary label is present.\n"
+        "If the user asks what you remember about them, what they like or prefer, or asks you to verify a remembered fact, call memory_recall before answering unless the summary already answers it.\n"
         "If the user asks you to forget a remembered item, first inspect memory_id with memory_recall or memory_list, then call memory_forget with that exact memory_id.\n"
-        "If the user asks you to update a remembered item and any relevant summary label exists, first choose the most relevant summary labels from this catalog, call memory_recall to inspect the original memory bodies and memory_id values, then call memory_update with the selected memory_id.\n"
+        "If the user asks you to update a remembered item, call memory_recall to inspect the original memory bodies and memory_id values, then call memory_update with the selected memory_id.\n"
         "Do not rely on session history alone for those recall questions, because long-term memory may contain additional facts not visible in the recent chat.\n"
-        "Do not treat /memory/MEMORY.md or raw memory files as the retrieval source of truth.\n"
         "Do not mention internal memory policy, storage behavior, auto-extraction, or whether you will or will not remember something unless the user explicitly asks about memory behavior.\n"
         "Summary label catalog:\n";
 
     cJSON *index_root = NULL;
     cJSON *summaries;
     cJSON *item;
+    char *markdown = NULL;
     size_t count = 0;
+    size_t markdown_len = 0;
     size_t buf_size;
     size_t off = 0;
     char *content;
@@ -756,8 +869,21 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
     }
     memset(out_context, 0, sizeof(*out_context));
 
+    claw_memory_lock();
     err = claw_memory_load_index(&index_root);
+    if (err == ESP_OK && read_file_dup(s_memory.markdown_path, &markdown) == ESP_OK) {
+        trim_whitespace(markdown);
+        markdown_len = strlen(markdown);
+        if (markdown_len > CLAW_MEMORY_MARKDOWN_MAX) {
+            markdown_len = CLAW_MEMORY_MARKDOWN_MAX;
+            while (markdown_len > 0 && ((unsigned char)markdown[markdown_len] & 0xC0) == 0x80) {
+                markdown_len--;
+            }
+        }
+    }
+    claw_memory_unlock();
     if (err != ESP_OK) {
+        free(markdown);
         return err;
     }
 
@@ -767,11 +893,13 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
     }
 
     /* Size for the full preamble plus one line per label (labels are bounded,
-     * long ones are truncated by the per-line snprintf below). */
-    buf_size = sizeof(k_long_term_preamble) + 64 + (count * 128);
+     * long ones are truncated by the per-line snprintf below) and the
+     * consolidated summary (capped). */
+    buf_size = sizeof(k_long_term_preamble) + 96 + (count * 128) + markdown_len;
     content = calloc(1, buf_size);
     if (!content) {
         cJSON_Delete(index_root);
+        free(markdown);
         return ESP_ERR_NO_MEM;
     }
 
@@ -779,7 +907,7 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
     cJSON_ArrayForEach(item, summaries) {
         const char *label = cJSON_GetStringValue(cJSON_GetObjectItem(item, "label"));
 
-        if (off + 32 >= buf_size) {
+        if (off + 32 + markdown_len >= buf_size) {
             break;
         }
         if (!label) {
@@ -790,11 +918,16 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
     if (count == 0) {
         off += claw_memory_append(content, buf_size, off, "- (empty)\n");
     }
+    if (markdown_len > 0) {
+        off += claw_memory_append(content, buf_size, off, "\nConsolidated long-term memory (MEMORY.md):\n%.*s\n",
+                                  (int)markdown_len, markdown);
+    }
 
     out_context->kind = CLAW_CORE_CONTEXT_KIND_SYSTEM_PROMPT;
     out_context->content = content;
 
     cJSON_Delete(index_root);
+    free(markdown);
     return ESP_OK;
 }
 
