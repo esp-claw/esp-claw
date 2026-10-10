@@ -129,7 +129,8 @@ typedef struct {
     SemaphoreHandle_t answered;
     char nonce[CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
     char chat_id[32];
-    bool approved;
+    int choice_count;
+    int choice;
 } cap_im_tg_confirm_t;
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
@@ -982,7 +983,7 @@ static void cap_im_tg_answer_callback(const char *query_id, const char *text)
     free(resp);
 }
 
-/* Inline button press on a cap_im_tg_confirm() prompt: "cf:<nonce>:y" or "cf:<nonce>:n". */
+/* Inline button press on a cap_im_tg_confirm() prompt: "cf:<nonce>:<button index>". */
 static void cap_im_tg_handle_callback_query(cJSON *query_json)
 {
     const char *query_id = cJSON_GetStringValue(cJSON_GetObjectItem(query_json, "id"));
@@ -994,6 +995,7 @@ static void cap_im_tg_handle_callback_query(cJSON *query_json)
     char chat_id[32] = "";
     char decision = '\0';
     bool matched = false;
+    bool rejected = false;
 
     if (!query_id) {
         return;
@@ -1012,31 +1014,32 @@ static void cap_im_tg_handle_callback_query(cJSON *query_json)
         decision = data[prefix_len + CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
     }
 
-    if (decision == 'y' || decision == 'n') {
+    if (decision >= '0' && decision <= '9') {
         taskENTER_CRITICAL(&s_confirm_mux);
-        if (s_confirm.nonce[0] &&
+        if (s_confirm.nonce[0] && decision - '0' < s_confirm.choice_count &&
                 strncmp(data + prefix_len, s_confirm.nonce, CAP_IM_TG_CONFIRM_NONCE_LEN) == 0 &&
                 strcmp(chat_id, s_confirm.chat_id) == 0) {
-            s_confirm.approved = decision == 'y';
+            s_confirm.choice = decision - '0';
             s_confirm.nonce[0] = '\0';
             matched = true;
+            rejected = s_confirm.choice == s_confirm.choice_count - 1;
         }
         taskEXIT_CRITICAL(&s_confirm_mux);
     }
 
     if (matched) {
         xSemaphoreGive(s_confirm.answered);
-        ESP_LOGI(TAG, "Telegram confirmation %s by user=%" PRId64 " chat=%s",
-                 decision == 'y' ? "approved" : "rejected", (int64_t)from_id_json->valuedouble, chat_id);
+        ESP_LOGI(TAG, "Telegram confirmation button %c by user=%" PRId64 " chat=%s",
+                 decision, (int64_t)from_id_json->valuedouble, chat_id);
     }
-    cap_im_tg_answer_callback(query_id, !matched ? "Abgelaufen" : decision == 'y' ? "Wird ausgeführt" : "Abgebrochen");
+    cap_im_tg_answer_callback(query_id, !matched ? "Abgelaufen" : rejected ? "Abgebrochen" : "Wird ausgeführt");
 }
 
 /* /ssh is answered here instead of by a router rule so it also works on devices whose
  * router_rules.json was seeded before the command existed. */
 static void cap_im_tg_handle_ssh_command(const char *chat_id, const char *text)
 {
-    const size_t output_size = 1024;
+    const size_t output_size = 4096;
     const char *args = text + strlen("/ssh");
     cJSON *input = NULL;
     char *input_json = NULL;
@@ -1992,7 +1995,7 @@ static void cap_im_tg_set_commands(void)
     } commands[] = {
         {"session", "Manage chat sessions (new, list, switch, delete)"},
         {"llm", "Configure the LLM model and endpoint"},
-        {"ssh", "SSH client (pubkey)"},
+        {"ssh", "SSH client (pubkey, allowed, allow, revoke)"},
     };
     cJSON *body = NULL;
     cJSON *list = NULL;
@@ -2581,21 +2584,66 @@ esp_err_t cap_im_tg_send_file(const char *chat_id, const char *path, const char 
     return cap_im_tg_send_media(chat_id, path, caption, false);
 }
 
-esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, uint32_t timeout_ms,
-                            cap_im_tg_confirm_result_t *out_result, int64_t *out_message_id)
+/* Sends `html` with optional inline keyboard rows (ownership passes here) and returns its message id. */
+static esp_err_t cap_im_tg_send_html_markup(const char *chat_id, const char *html, cJSON *rows,
+                                            int64_t *out_message_id)
 {
-    char nonce[CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
-    char approve_data[32];
-    char reject_data[32];
-    cJSON *body = NULL;
-    cJSON *buttons = NULL;
+    cJSON *body = cJSON_CreateObject();
+    cJSON *root = NULL;
     cJSON *message_id_json = NULL;
     char *body_json = NULL;
     char *resp = NULL;
-    bool answered;
     esp_err_t err;
 
-    if (!chat_id || !chat_id[0] || !html || !out_result || !out_message_id) {
+    cJSON_AddStringToObject(body, "chat_id", chat_id);
+    cJSON_AddStringToObject(body, "text", html);
+    cJSON_AddStringToObject(body, "parse_mode", "HTML");
+    if (rows) {
+        cJSON_AddItemToObject(cJSON_AddObjectToObject(body, "reply_markup"), "inline_keyboard", rows);
+    }
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = cap_im_tg_api_call("sendMessage", body_json, &resp);
+    free(body_json);
+    if (err == ESP_OK) {
+        root = cJSON_Parse(resp);
+        message_id_json = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "result"), "message_id");
+        if (cJSON_IsNumber(message_id_json)) {
+            *out_message_id = (int64_t)message_id_json->valuedouble;
+        } else {
+            err = ESP_FAIL;
+        }
+        cJSON_Delete(root);
+    }
+    free(resp);
+    return err;
+}
+
+esp_err_t cap_im_tg_send_html(const char *chat_id, const char *html, int64_t *out_message_id)
+{
+    if (!chat_id || !chat_id[0] || !html || !out_message_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return cap_im_tg_send_html_markup(chat_id, html, NULL, out_message_id);
+}
+
+esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *const *labels, size_t label_count,
+                            uint32_t timeout_ms, int *out_choice, int64_t *out_message_id)
+{
+    char nonce[CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
+    char data[32];
+    cJSON *rows = NULL;
+    esp_err_t err;
+
+    if (!chat_id || !chat_id[0] || !html || !labels || label_count < 1 || label_count > 10 || !out_choice ||
+            !out_message_id) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_tg_initialized || !s_confirm.lock || !s_confirm.answered) {
@@ -2606,26 +2654,17 @@ esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, uint32_t time
     }
 
     snprintf(nonce, sizeof(nonce), "%08" PRIx32 "%08" PRIx32, esp_random(), esp_random());
-    snprintf(approve_data, sizeof(approve_data), CAP_IM_TG_CONFIRM_PREFIX "%s:y", nonce);
-    snprintf(reject_data, sizeof(reject_data), CAP_IM_TG_CONFIRM_PREFIX "%s:n", nonce);
+    /* One button per row so long labels stay readable. */
+    rows = cJSON_CreateArray();
+    for (size_t i = 0; i < label_count; i++) {
+        cJSON *button = cJSON_CreateObject();
+        cJSON *row = cJSON_CreateArray();
 
-    body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "chat_id", chat_id);
-    cJSON_AddStringToObject(body, "text", html);
-    cJSON_AddStringToObject(body, "parse_mode", "HTML");
-    buttons = cJSON_CreateArray();
-    cJSON_AddItemToArray(buttons, cJSON_CreateObject());
-    cJSON_AddStringToObject(cJSON_GetArrayItem(buttons, 0), "text", "✅ Ausführen");
-    cJSON_AddStringToObject(cJSON_GetArrayItem(buttons, 0), "callback_data", approve_data);
-    cJSON_AddItemToArray(buttons, cJSON_CreateObject());
-    cJSON_AddStringToObject(cJSON_GetArrayItem(buttons, 1), "text", "❌ Abbrechen");
-    cJSON_AddStringToObject(cJSON_GetArrayItem(buttons, 1), "callback_data", reject_data);
-    cJSON_AddItemToArray(cJSON_AddArrayToObject(cJSON_AddObjectToObject(body, "reply_markup"), "inline_keyboard"),
-                         buttons);
-    body_json = cJSON_PrintUnformatted(body);
-    cJSON_Delete(body);
-    if (!body_json) {
-        return ESP_ERR_NO_MEM;
+        snprintf(data, sizeof(data), CAP_IM_TG_CONFIRM_PREFIX "%s:%u", nonce, (unsigned)i);
+        cJSON_AddStringToObject(button, "text", labels[i]);
+        cJSON_AddStringToObject(button, "callback_data", data);
+        cJSON_AddItemToArray(row, button);
+        cJSON_AddItemToArray(rows, row);
     }
 
     xSemaphoreTake(s_confirm.lock, portMAX_DELAY);
@@ -2634,33 +2673,18 @@ esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, uint32_t time
     taskENTER_CRITICAL(&s_confirm_mux);
     strlcpy(s_confirm.nonce, nonce, sizeof(s_confirm.nonce));
     strlcpy(s_confirm.chat_id, chat_id, sizeof(s_confirm.chat_id));
-    s_confirm.approved = false;
+    s_confirm.choice_count = (int)label_count;
+    s_confirm.choice = -1;
     taskEXIT_CRITICAL(&s_confirm_mux);
 
-    err = cap_im_tg_api_call("sendMessage", body_json, &resp);
-    free(body_json);
-    if (err == ESP_OK) {
-        cJSON *root = cJSON_Parse(resp);
-
-        message_id_json = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "result"), "message_id");
-        if (cJSON_IsNumber(message_id_json)) {
-            *out_message_id = (int64_t)message_id_json->valuedouble;
-        } else {
-            err = ESP_FAIL;
-        }
-        cJSON_Delete(root);
-    }
-    free(resp);
-
+    err = cap_im_tg_send_html_markup(chat_id, html, rows, out_message_id);
     if (err == ESP_OK) {
         xSemaphoreTake(s_confirm.answered, pdMS_TO_TICKS(timeout_ms));
     }
     /* The poll task clears the nonce when it accepts an answer, so this also catches an answer
      * that arrived just as the wait timed out. */
     taskENTER_CRITICAL(&s_confirm_mux);
-    answered = s_confirm.nonce[0] == '\0';
-    *out_result = !answered ? CAP_IM_TG_CONFIRM_TIMEOUT :
-                  s_confirm.approved ? CAP_IM_TG_CONFIRM_APPROVED : CAP_IM_TG_CONFIRM_REJECTED;
+    *out_choice = s_confirm.nonce[0] == '\0' ? s_confirm.choice : -1;
     s_confirm.nonce[0] = '\0';
     taskEXIT_CRITICAL(&s_confirm_mux);
     xSemaphoreGive(s_confirm.lock);
