@@ -919,12 +919,15 @@ static esp_err_t session_history_open_pair_for_append(const char *data_path,
     return ESP_OK;
 }
 
+/* Appends one record to data_file. Its index entry goes to idx_file, or to *out_entry when the
+ * caller commits the entries of several records at once. */
 static esp_err_t session_history_append_indexed_record(FILE *data_file,
                                                        FILE *idx_file,
                                                        claw_core_context_record_type_t record_type,
                                                        const char *json_text,
                                                        const char *role,
-                                                       const char *text)
+                                                       const char *text,
+                                                       claw_memory_session_index_entry_t *out_entry)
 {
     cJSON *record = NULL;
     char *normalized = NULL;
@@ -936,7 +939,7 @@ static esp_err_t session_history_append_indexed_record(FILE *data_file,
     size_t normalized_size;
     esp_err_t err;
 
-    if (!data_file || !idx_file ||
+    if (!data_file || (!idx_file && !out_entry) ||
             ((!json_text || !json_text[0]) && (!role || !text)) ||
             !session_history_record_type_valid((uint8_t)record_type)) {
         return ESP_ERR_INVALID_ARG;
@@ -985,7 +988,9 @@ static esp_err_t session_history_append_indexed_record(FILE *data_file,
     entry.length = length;
     entry.record_type = (uint8_t)record_type;
     entry.backend_format = (uint8_t)s_memory.backend_format;
-    if (fwrite(&entry, 1, sizeof(entry), idx_file) != sizeof(entry)) {
+    if (out_entry) {
+        *out_entry = entry;
+    } else if (fwrite(&entry, 1, sizeof(entry), idx_file) != sizeof(entry)) {
         ESP_LOGE(TAG, "write session history idx entry failed");
         err = ESP_FAIL;
         goto cleanup;
@@ -1387,6 +1392,7 @@ esp_err_t claw_memory_persist_context_callback(const claw_core_context_persist_b
     char *idx_path = NULL;
     FILE *data_file = NULL;
     FILE *idx_file = NULL;
+    claw_memory_session_index_entry_t *entries = NULL;
     esp_err_t err = ESP_OK;
     size_t i;
 
@@ -1423,7 +1429,18 @@ esp_err_t claw_memory_persist_context_callback(const claw_core_context_persist_b
     if (err != ESP_OK) {
         goto cleanup;
     }
+    entries = calloc(batch->record_count, sizeof(*entries));
+    if (!entries) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
 
+    /*
+     * A batch (e.g. an assistant tool call and its results) must become visible as a whole:
+     * write all data records first, then index them with a single write. A failed or
+     * interrupted write leaves only unindexed bytes, which loading ignores, instead of an
+     * indexed tool call whose output is missing (that history is rejected by every LLM API).
+     */
     for (i = 0; i < batch->record_count; i++) {
         const char *role = NULL;
         const char *text = NULL;
@@ -1441,10 +1458,20 @@ esp_err_t claw_memory_persist_context_callback(const claw_core_context_persist_b
                                                     batch->records[i].type,
                                                     batch->records[i].message_json,
                                                     role,
-                                                    text);
+                                                    text,
+                                                    &entries[i]);
         if (err != ESP_OK) {
             break;
         }
+    }
+    if (err == ESP_OK && fflush(data_file) != 0) {
+        ESP_LOGE(TAG, "flush session history records failed: errno=%d", errno);
+        err = ESP_FAIL;
+    }
+    if (err == ESP_OK &&
+            fwrite(entries, sizeof(*entries), batch->record_count, idx_file) != batch->record_count) {
+        ESP_LOGE(TAG, "write session history idx entries failed");
+        err = ESP_FAIL;
     }
 
 cleanup:
@@ -1461,6 +1488,7 @@ cleanup:
         claw_memory_pipeline_note_persist(batch->session_id, data_path);
     }
     claw_memory_unlock();
+    free(entries);
     free(data_path);
     free(idx_path);
     return err;
@@ -1799,11 +1827,11 @@ esp_err_t claw_memory_session_compact_with_summary(const char *data_path,
     }
     if (err == ESP_OK) {
         err = session_history_append_indexed_record(data_file, idx_file, CLAW_CORE_CONTEXT_RECORD_USER,
-                                                    NULL, "user", summary_text);
+                                                    NULL, "user", summary_text, NULL);
     }
     if (err == ESP_OK) {
         err = session_history_append_indexed_record(data_file, idx_file, CLAW_CORE_CONTEXT_RECORD_ASSISTANT_FINAL,
-                                                    NULL, "assistant", "Understood.");
+                                                    NULL, "assistant", "Understood.", NULL);
     }
     for (i = cut; err == ESP_OK && i < index.count; i++) {
         claw_memory_session_index_entry_t entry = index.entries[i];
