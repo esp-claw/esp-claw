@@ -8,9 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_log.h"
+#include "llm/claw_llm_history.h"
+
 #define CLAW_LLM_DEFAULT_TIMEOUT_MS (120 * 1000)
 #define CLAW_LLM_DEFAULT_MAX_TOKENS 8192
 #define CLAW_LLM_DEFAULT_IMAGE_MAX_BYTES (512 * 1024)
+
+static const char *TAG = "claw_llm";
 
 struct claw_llm_runtime {
     claw_llm_runtime_config_t config;
@@ -161,8 +166,20 @@ esp_err_t claw_llm_runtime_chat(claw_llm_runtime_t *runtime,
                                 claw_llm_response_t *out_response,
                                 char **out_error_message)
 {
+    claw_llm_tool_pair_repair_t repair = {0};
+
     if (!runtime || !runtime->backend || !runtime->backend->chat) {
         return ESP_ERR_INVALID_STATE;
+    }
+    /* Every backend rejects a tool call without its output (or the reverse); never send one. */
+    if (request && !claw_llm_history_repair_tool_pairs(request->messages, &repair)) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (repair.synthesized_outputs || repair.dropped_orphan_outputs || repair.dropped_duplicate_outputs) {
+        ESP_LOGW(TAG, "repaired tool history: synthesized=%u orphan_outputs_dropped=%u duplicate_outputs_dropped=%u",
+                 (unsigned)repair.synthesized_outputs,
+                 (unsigned)repair.dropped_orphan_outputs,
+                 (unsigned)repair.dropped_duplicate_outputs);
     }
 
     return runtime->backend->chat(runtime->backend_ctx,

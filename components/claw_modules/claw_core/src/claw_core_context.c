@@ -11,6 +11,12 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "llm/claw_llm_history.h"
+
+/* Longer tool outputs are stored and sent as head + tail around a truncation marker. */
+#ifndef CLAW_CORE_TOOL_OUTPUT_MAX_BYTES
+#define CLAW_CORE_TOOL_OUTPUT_MAX_BYTES (16 * 1024)
+#endif
 
 static const char *TAG = "claw_core";
 
@@ -291,6 +297,12 @@ esp_err_t claw_core_append_tool_results_messages(claw_core_state_t *core,
         if (!tool_output) {
             ret = ESP_ERR_NO_MEM;
             goto cleanup;
+        }
+        if (claw_llm_history_clip_text(tool_output, CLAW_CORE_TOOL_OUTPUT_MAX_BYTES)) {
+            ESP_LOGW(TAG, "tool_result request=%" PRIu32 " name=%s output clipped or UTF-8 repaired, now %u bytes",
+                     request->request_id,
+                     response->tool_calls[i].name ? response->tool_calls[i].name : "(null)",
+                     (unsigned)strlen(tool_output));
         }
 
         ESP_LOGI(TAG, "tool_result request=%" PRIu32 " name=%s err=%s output=%.*s%s",

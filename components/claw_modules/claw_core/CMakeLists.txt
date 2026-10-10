@@ -13,6 +13,7 @@ idf_component_register(
         "src/claw_task.c"
         "src/claw_core_llm.c"
         "src/llm/claw_llm_runtime.c"
+        "src/llm/claw_llm_history.c"
         "src/llm/claw_llm_http_transport.c"
         "src/llm/backends/claw_llm_backend_anthropic.c"
         "src/llm/backends/claw_llm_backend_openai_compatible.c"
