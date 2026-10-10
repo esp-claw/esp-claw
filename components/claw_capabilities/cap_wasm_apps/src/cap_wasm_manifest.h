@@ -31,12 +31,17 @@
 #define CAP_WASM_SETTING_DEFAULT_MAX 64  /* manifest default (normalized text) */
 #define CAP_WASM_SETTING_DESC_MAX    100
 
+#define CAP_WASM_TIMER_MIN_S         60  /* firmware floor of permissions.timer.min_interval_s */
+#define CAP_WASM_TIMER_MAX_S         (7 * 24 * 3600)
+
 typedef enum {
     CAP_WASM_PERM_LOG = 1 << 0,
     CAP_WASM_PERM_KV = 1 << 1,
     CAP_WASM_PERM_HTTP = 1 << 2,
     CAP_WASM_PERM_CONFIRM = 1 << 3,
     CAP_WASM_PERM_PING = 1 << 4,
+    CAP_WASM_PERM_NOTIFY = 1 << 5,
+    CAP_WASM_PERM_TIMER = 1 << 6,
 } cap_wasm_perm_t;
 
 typedef enum {
@@ -64,6 +69,7 @@ typedef struct {
     uint32_t http_profile_count;
     uint32_t memory_kb;
     uint32_t call_timeout_ms;
+    uint32_t timer_min_s;  /* permissions.timer.min_interval_s (>= CAP_WASM_TIMER_MIN_S) */
     cap_wasm_setting_t settings[CAP_WASM_MAX_SETTINGS];
     uint32_t setting_count;
 } cap_wasm_manifest_t;

@@ -23,6 +23,13 @@
  * drop below the reserve. Calls run one at a time on the WASM thread, which is also the only
  * place apps are unloaded, so an app with a call in progress is never evicted.
  *
+ * Timers: an app with permissions.timer calls claw_timer_set(interval) (kept in NVS) and exports
+ * on_timer(). The "wasm_timer" task wakes up every CAP_WASM_TIMER_TICK_MS and, when a timer is due,
+ * submits a request like any other requester (and watches its budget); the WASM thread loads the
+ * app if needed and calls on_timer() under limits.call_timeout_ms. Idle unload reclaims it as
+ * usual. After CAP_WASM_TIMER_MAX_FAILURES consecutive failed runs the timer stops (until reload
+ * or reboot) and the allowed Telegram users are told.
+ *
  * Capability groups: "cap_wasm_apps" holds the app tools; it is unregistered and re-registered
  * when the tool set changes. "cap_wasm_apps_mgr" holds the management tools and the restricted
  * /apps command handler, which must not live in the group they re-register (app_capabilities.c
@@ -73,6 +80,10 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_DRAIN_MS         10000
 #define CAP_WASM_IDLE_MS          (10 * 60 * 1000)
 #define CAP_WASM_SWEEP_MS         (30 * 1000)
+#define CAP_WASM_TIMER_TICK_MS    (15 * 1000) /* timer resolution; intervals are >= 60 s */
+#define CAP_WASM_TIMER_STACK      4096
+#define CAP_WASM_TIMER_MAX_FAILURES 3
+#define CAP_WASM_TIMER_PERSIST_S  3600 /* timers at least this long keep their last run across reboots */
 
 typedef struct {
     cap_wasm_req_type_t type;
@@ -102,6 +113,7 @@ static bool s_runtime_ok;
 static QueueHandle_t s_req_queue;
 static SemaphoreHandle_t s_done;
 static SemaphoreHandle_t s_call_lock;
+static atomic_uint s_timer_next_s = UINT32_MAX; /* uptime when the next timer is due */
 
 /* The app code currently running on the WASM thread, watched by the requester. */
 static struct {
@@ -111,6 +123,8 @@ static struct {
     int64_t paused_at_us;
     bool terminated;
 } s_exec;
+
+static void cap_wasm_timer_restore(cap_wasm_app_t *app);
 
 /* ---------- PSRAM allocator for the WAMR runtime and linear memory ---------- */
 
@@ -480,6 +494,7 @@ static void cap_wasm_teardown(cap_wasm_app_t *app)
     app->inst = NULL;
     app->fn_alloc = NULL;
     app->fn_call = NULL;
+    app->fn_timer = NULL;
 }
 
 /* Frees the module and instance; registered tools stay. */
@@ -526,10 +541,18 @@ static bool cap_wasm_instantiate(cap_wasm_app_t *app)
     app->env = wasm_runtime_create_exec_env(app->inst, CAP_WASM_EXEC_STACK);
     app->fn_alloc = wasm_runtime_lookup_function(app->inst, "app_alloc");
     app->fn_call = wasm_runtime_lookup_function(app->inst, "tool_call");
+    app->fn_timer = wasm_runtime_lookup_function(app->inst, "on_timer");
     fn_init = wasm_runtime_lookup_function(app->inst, "app_init");
     if (!app->env || !app->fn_alloc || !app->fn_call || !fn_init) {
         cap_wasm_set_error(app, "%s", app->env ? "missing export app_init, app_alloc or tool_call" :
                            "cannot create exec env");
+        cap_wasm_teardown(app);
+        return false;
+    }
+    if ((app->mf.perms & CAP_WASM_PERM_TIMER) &&
+            (!app->fn_timer || wasm_func_get_param_count(app->fn_timer, app->inst) != 0 ||
+             wasm_func_get_result_count(app->fn_timer, app->inst) != 0)) {
+        cap_wasm_set_error(app, "permissions.timer needs the export void on_timer(void)");
         cap_wasm_teardown(app);
         return false;
     }
@@ -779,6 +802,7 @@ static void cap_wasm_probe(cap_wasm_app_t *app, bool boot)
     } else if (cap_wasm_load(app, false, boot)) {
         cap_wasm_unload(app);
     }
+    cap_wasm_timer_restore(app);
 }
 
 /* Loads an unloaded app for a call or apps_load. */
@@ -942,10 +966,218 @@ static void cap_wasm_idle_sweep(void)
     }
 }
 
+/* ---------- Timers (WASM thread; the wasm_timer task only wakes it) ---------- */
+
+static uint32_t cap_wasm_uptime_s(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000000);
+}
+
+/* True once SNTP (or the RTC) set the wall clock. */
+static bool cap_wasm_clock_set(void)
+{
+    return time(NULL) > 1700000000;
+}
+
+static bool cap_wasm_timer_active(const cap_wasm_app_t *app)
+{
+    return app->name[0] && app->timer_s && !app->timer_off && app->enabled &&
+           (app->state == CAP_WASM_APP_LOADED || app->state == CAP_WASM_APP_UNLOADED);
+}
+
+/* Recomputes when the wasm_timer task next has to wake the WASM thread. */
+static void cap_wasm_timer_reschedule(void)
+{
+    uint32_t next = UINT32_MAX;
+
+    for (size_t i = 0; i < s_app_count; i++) {
+        if (cap_wasm_timer_active(&s_apps[i]) && s_apps[i].timer_due_s < next) {
+            next = s_apps[i].timer_due_s;
+        }
+    }
+    atomic_store(&s_timer_next_s, next);
+}
+
+/* Due time of a long timer from its last run, once the clock is set: overdue runs one minute from now. */
+static void cap_wasm_timer_resync(cap_wasm_app_t *app)
+{
+    uint32_t now_unix = (uint32_t)time(NULL);
+    uint32_t elapsed = now_unix > app->timer_last ? now_unix - app->timer_last : 0;
+    uint32_t wait = elapsed >= app->timer_s ? 0 : app->timer_s - elapsed;
+
+    app->timer_resync = false;
+    app->timer_due_s = cap_wasm_uptime_s() + (wait > CAP_WASM_TIMER_MIN_S ? wait : CAP_WASM_TIMER_MIN_S);
+}
+
+static void cap_wasm_timer_resync_all(void)
+{
+    bool changed = false;
+
+    for (size_t i = 0; i < s_app_count; i++) {
+        if (s_apps[i].timer_resync && s_apps[i].timer_s && cap_wasm_clock_set()) {
+            cap_wasm_timer_resync(&s_apps[i]);
+            changed = true;
+        }
+    }
+    if (changed) {
+        cap_wasm_timer_reschedule();
+    }
+}
+
+/* Loads the persisted timer of an app that was (re)loaded, enabled or installed; clears failures. */
+static void cap_wasm_timer_restore(cap_wasm_app_t *app)
+{
+    uint32_t last = 0;
+    uint32_t interval = app->mf.perms & CAP_WASM_PERM_TIMER ? cap_wasm_timer_load(app->name, &last) : 0;
+
+    if (!(app->mf.perms & CAP_WASM_PERM_TIMER)) {
+        cap_wasm_timer_store(app->name, 0); /* the update dropped the permission */
+    } else if (interval && (interval < app->mf.timer_min_s || interval > CAP_WASM_TIMER_MAX_S)) {
+        interval = interval < app->mf.timer_min_s ? app->mf.timer_min_s : CAP_WASM_TIMER_MAX_S;
+        cap_wasm_timer_store(app->name, interval);
+    }
+    app->timer_s = interval;
+    app->timer_off = false;
+    app->timer_failures = 0;
+    app->timer_error[0] = '\0';
+    app->timer_last = interval >= CAP_WASM_TIMER_PERSIST_S ? last : 0;
+    app->timer_due_s = cap_wasm_uptime_s() + interval;
+    app->timer_resync = app->timer_last != 0;
+    if (app->timer_resync && cap_wasm_clock_set()) {
+        cap_wasm_timer_resync(app);
+    }
+    cap_wasm_timer_reschedule();
+}
+
+int32_t cap_wasm_timer_set(cap_wasm_app_t *app, int32_t interval_s)
+{
+    size_t active = 0;
+
+    if (interval_s != 0 && (interval_s < (int32_t)app->mf.timer_min_s || interval_s > CAP_WASM_TIMER_MAX_S)) {
+        ESP_LOGW(TAG, "[%s] timer_set(%" PRId32 "): allowed are 0 or %" PRIu32 "-%d s", app->name, interval_s,
+                 app->mf.timer_min_s, CAP_WASM_TIMER_MAX_S);
+        return -CAP_WASM_EINVAL;
+    }
+    if ((uint32_t)interval_s == app->timer_s) {
+        return 0; /* app_init may set it on every load: keep the schedule and spare the flash */
+    }
+    for (size_t i = 0; i < s_app_count; i++) {
+        active += &s_apps[i] != app && s_apps[i].name[0] && s_apps[i].timer_s;
+    }
+    if (interval_s && !app->timer_s && active >= CAP_WASM_MAX_TIMERS) {
+        ESP_LOGW(TAG, "[%s] timer_set: %d apps have a timer already", app->name, CAP_WASM_MAX_TIMERS);
+        return -CAP_WASM_ENOSPC;
+    }
+    app->timer_s = (uint32_t)interval_s;
+    app->timer_due_s = cap_wasm_uptime_s() + app->timer_s;
+    app->timer_last = 0;
+    app->timer_resync = false;
+    cap_wasm_timer_store(app->name, app->timer_s);
+    cap_wasm_timer_reschedule();
+    ESP_LOGI(TAG, "[%s] timer %s%" PRIu32 "%s", app->name, interval_s ? "every " : "cancelled", app->timer_s,
+             interval_s ? " s" : "");
+    return 0;
+}
+
+/* Runs one app's on_timer() like a tool call (same budget), with a context that has no chat. */
+static void cap_wasm_run_timer(cap_wasm_app_t *app)
+{
+    static const claw_cap_call_context_t ctx = {
+        .caller = CLAW_CAP_CALLER_SYSTEM,
+        .source_cap = "cap_wasm_timer",
+    };
+    cap_wasm_call_t *call = &g_cap_wasm_call;
+    char output[64];
+    char msg[256];
+    bool ok = false;
+    bool terminated = false;
+
+    app->timer_due_s = cap_wasm_uptime_s() + app->timer_s;
+    app->timer_runs++;
+    if (!cap_wasm_ensure_loaded(app)) {
+        snprintf(app->timer_error, sizeof(app->timer_error), "cannot load: %.80s", app->last_error);
+    } else if (!app->inst) {
+        app->tools_frozen = true;
+        ok = cap_wasm_instantiate(app);
+        app->tools_frozen = false;
+        if (!ok) {
+            snprintf(app->timer_error, sizeof(app->timer_error), "cannot restart: %.78s", app->last_error);
+        }
+    } else {
+        ok = true;
+    }
+    if (ok) {
+        *call = (cap_wasm_call_t) {
+            .app = app,
+            .ctx = &ctx,
+            .output = output,
+            .output_size = sizeof(output),
+        };
+        cap_wasm_budget_begin(app, app->mf.call_timeout_ms);
+        ok = wasm_runtime_call_wasm(app->env, app->fn_timer, 0, NULL);
+        terminated = cap_wasm_budget_end();
+        heap_caps_free(call->resp);
+        *call = (cap_wasm_call_t) {0};
+        app->last_used_us = esp_timer_get_time();
+        if (!ok && terminated) {
+            snprintf(app->timer_error, sizeof(app->timer_error), "on_timer exceeded %" PRIu32 " ms",
+                     app->mf.call_timeout_ms);
+        } else if (!ok) {
+            snprintf(app->timer_error, sizeof(app->timer_error), "on_timer trapped: %.60s",
+                     wasm_runtime_get_exception(app->inst));
+        }
+        if (!ok || terminated) {
+            cap_wasm_teardown(app); /* a trapped or terminated instance is recreated on the next call */
+        }
+    }
+    if (app->tools_changed) {
+        cap_wasm_schedule_refresh(app);
+    }
+    if (ok) {
+        app->timer_failures = 0;
+        if (app->timer_s >= CAP_WASM_TIMER_PERSIST_S && cap_wasm_clock_set()) {
+            app->timer_last = (uint32_t)time(NULL);
+            cap_wasm_timer_store_last(app->name, app->timer_last);
+        }
+        return;
+    }
+    if (++app->timer_failures < CAP_WASM_TIMER_MAX_FAILURES) {
+        ESP_LOGW(TAG, "[%s] timer run failed (%u/%d): %s", app->name, app->timer_failures,
+                 CAP_WASM_TIMER_MAX_FAILURES, app->timer_error);
+        return;
+    }
+    app->timer_off = true;
+    ESP_LOGE(TAG, "[%s] timer stopped after %d failed runs: %s", app->name, CAP_WASM_TIMER_MAX_FAILURES,
+             app->timer_error);
+    snprintf(msg, sizeof(msg), "⏰ App `%s`: timer stopped after %d failed runs (%s). /apps reload %s restarts it.",
+             app->name, CAP_WASM_TIMER_MAX_FAILURES, app->timer_error, app->name);
+    cap_wasm_send_allowed(msg);
+}
+
+/* REQ_TIMER: runs the most overdue timer; ESP_ERR_NOT_FOUND when none is due. */
+static void cap_wasm_do_timer(cap_wasm_req_t *req)
+{
+    uint32_t now = cap_wasm_uptime_s();
+    cap_wasm_app_t *due = NULL;
+
+    for (size_t i = 0; i < s_app_count; i++) {
+        cap_wasm_app_t *app = &s_apps[i];
+
+        if (cap_wasm_timer_active(app) && app->timer_due_s <= now && (!due || app->timer_due_s < due->timer_due_s)) {
+            due = app;
+        }
+    }
+    req->err = due ? ESP_OK : ESP_ERR_NOT_FOUND;
+    if (due) {
+        cap_wasm_run_timer(due);
+    }
+}
+
 static void cap_wasm_render_status(char *out, size_t size, bool json)
 {
     cJSON *list = json ? cJSON_CreateArray() : NULL;
     int64_t now = esp_timer_get_time();
+    uint32_t now_s = cap_wasm_uptime_s();
     size_t len = 0;
     char *rendered;
 
@@ -991,6 +1223,21 @@ static void cap_wasm_render_status(char *out, size_t size, bool json)
             if (app->last_error[0]) {
                 cJSON_AddStringToObject(item, "last_error", app->last_error);
             }
+            if (app->timer_s) {
+                cJSON *timer = cJSON_AddObjectToObject(item, "timer");
+
+                cJSON_AddNumberToObject(timer, "interval_s", app->timer_s);
+                cJSON_AddStringToObject(timer, "state", app->timer_off ? "stopped" :
+                                        cap_wasm_timer_active(app) ? "active" : "inactive");
+                if (cap_wasm_timer_active(app)) {
+                    cJSON_AddNumberToObject(timer, "next_in_s", app->timer_due_s > now_s ? app->timer_due_s - now_s : 0);
+                }
+                cJSON_AddNumberToObject(timer, "runs", app->timer_runs);
+                cJSON_AddNumberToObject(timer, "failures", app->timer_failures);
+                if (app->timer_error[0]) {
+                    cJSON_AddStringToObject(timer, "last_error", app->timer_error);
+                }
+            }
             cJSON_AddItemToArray(list, item);
             continue;
         }
@@ -1013,6 +1260,18 @@ static void cap_wasm_render_status(char *out, size_t size, bool json)
         }
         if (app->last_error[0]) {
             len += snprintf(out + len, len < size ? size - len : 0, "  last error: %s\n", app->last_error);
+        }
+        if (app->timer_off) {
+            len += snprintf(out + len, len < size ? size - len : 0, "  timer every %" PRIu32 " s stopped after %u "
+                            "failures: %s\n", app->timer_s, app->timer_failures, app->timer_error);
+        } else if (cap_wasm_timer_active(app)) {
+            len += snprintf(out + len, len < size ? size - len : 0, "  timer every %" PRIu32 " s, next in %" PRIu32
+                            " s, %" PRIu32 " runs%s%s\n", app->timer_s,
+                            app->timer_due_s > now_s ? app->timer_due_s - now_s : 0, app->timer_runs,
+                            app->timer_error[0] ? ", last error: " : "", app->timer_error);
+        } else if (app->timer_s) {
+            len += snprintf(out + len, len < size ? size - len : 0, "  timer every %" PRIu32 " s (inactive)\n",
+                            app->timer_s);
         }
     }
     if (json) {
@@ -1204,6 +1463,7 @@ static bool cap_wasm_do_install(cap_wasm_app_t *app, const char *source, char *o
     if (cap_wasm_load(app, false, false)) {
         cap_wasm_rmdir(old_dir);
         cap_wasm_cfg_prune(app);
+        cap_wasm_timer_restore(app);
         app->installed_at = (uint32_t)time(NULL);
         strlcpy(app->source_url, source && strlen(source) < sizeof(app->source_url) ? source : "",
                 sizeof(app->source_url));
@@ -1323,6 +1583,7 @@ static void cap_wasm_do_admin(cap_wasm_req_t *req)
         cap_wasm_index_save();
     } else {
         cap_wasm_load(app, false, false);
+        cap_wasm_timer_restore(app);
     }
     if (app->state == CAP_WASM_APP_LOADED || app->state == CAP_WASM_APP_UNLOADED) {
         snprintf(req->output, req->output_size, "%s `%s` %s: %u tools.",
@@ -1365,6 +1626,7 @@ static void *cap_wasm_task(void *arg)
     while (true) {
         if (xQueueReceive(s_req_queue, &req, pdMS_TO_TICKS(CAP_WASM_SWEEP_MS)) != pdTRUE) {
             cap_wasm_idle_sweep();
+            cap_wasm_timer_resync_all();
             continue;
         }
         if (!s_runtime_ok) {
@@ -1374,14 +1636,18 @@ static void *cap_wasm_task(void *arg)
             cap_wasm_do_boot();
         } else if (req->type == CAP_WASM_REQ_CALL) {
             cap_wasm_do_call(req);
+        } else if (req->type == CAP_WASM_REQ_TIMER) {
+            cap_wasm_do_timer(req);
         } else if (req->type == CAP_WASM_REQ_STATUS) {
             cap_wasm_render_status(req->output, req->output_size, req->arg != NULL);
             req->err = ESP_OK;
         } else {
             cap_wasm_do_admin(req);
         }
+        cap_wasm_timer_reschedule(); /* any request may have changed an app's state or timer */
         xSemaphoreGive(s_done);
         cap_wasm_idle_sweep();
+        cap_wasm_timer_resync_all();
     }
     return NULL;
 }
@@ -1399,6 +1665,26 @@ static esp_err_t cap_wasm_submit(cap_wasm_req_t *req, TickType_t lock_wait)
     }
     xSemaphoreGive(s_call_lock);
     return req->err;
+}
+
+/* Wakes the WASM thread when a timer is due and watches the on_timer() budget like any requester. */
+static void cap_wasm_timer_task(void *arg)
+{
+    char unused[1];
+    cap_wasm_req_t req = {
+        .type = CAP_WASM_REQ_TIMER,
+        .output = unused,
+        .output_size = sizeof(unused),
+    };
+
+    (void)arg;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(CAP_WASM_TIMER_TICK_MS));
+        /* Several due timers run back to back; a busy runtime is retried on the next tick. */
+        while (cap_wasm_uptime_s() >= atomic_load(&s_timer_next_s) &&
+                cap_wasm_submit(&req, pdMS_TO_TICKS(CAP_WASM_DRAIN_MS)) == ESP_OK) {
+        }
+    }
 }
 
 /* ---------- claw_cap bridge ---------- */
@@ -1692,7 +1978,7 @@ static const claw_cap_descriptor_t s_mgr_descriptors[] = {
         .id = "apps_status",
         .name = "apps_status",
         .family = "wasm_app",
-        .description = "List installed WASM apps: version, state, enabled, loaded, PSRAM use, last use, tools, last error.",
+        .description = "List installed WASM apps: version, state, enabled, loaded, PSRAM use, last use, tools, last error, timer.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
@@ -1922,5 +2208,9 @@ esp_err_t cap_wasm_apps_register_group(const char *base_path)
     }
     cap_wasm_submit(&boot, portMAX_DELAY);
     cap_wasm_publish_tools();
+    if (xTaskCreateWithCaps(cap_wasm_timer_task, "wasm_timer", CAP_WASM_TIMER_STACK, NULL, 4, NULL,
+                            CAP_WASM_PSRAM_CAPS) != pdPASS) {
+        ESP_LOGE(TAG, "cannot start the app timer task; app timers do not run");
+    }
     return ESP_OK;
 }

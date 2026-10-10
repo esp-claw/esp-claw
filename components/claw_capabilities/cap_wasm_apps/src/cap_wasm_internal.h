@@ -72,6 +72,19 @@ typedef struct {
     uint32_t calls;
     uint8_t failures;   /* consecutive traps/timeouts */
     char last_error[128];
+    /* permissions.timer: on_timer() every timer_s seconds (set by claw_timer_set(), kept in NVS). */
+    wasm_function_inst_t fn_timer;
+    uint32_t timer_s;        /* 0: no timer */
+    uint32_t timer_due_s;    /* next run, seconds since boot */
+    uint32_t timer_last;     /* unix time of the last run (persisted for timers >= 1 h), 0 unknown */
+    bool timer_resync;       /* due time still to be derived from timer_last once the clock is set */
+    bool timer_off;          /* stopped after repeated failures, until reload/reboot */
+    uint8_t timer_failures;  /* consecutive */
+    uint32_t timer_runs;
+    char timer_error[96];
+    /* permissions.notify: messages in the current rate-limit hour */
+    uint32_t notify_window_s;
+    uint8_t notify_count;
 } cap_wasm_app_t;
 
 typedef struct {
@@ -131,6 +144,21 @@ void cap_wasm_cfg_prune(const cap_wasm_app_t *app);
 /* Deletes every stored setting of the app (on remove). */
 void cap_wasm_cfg_erase(const char *app_name);
 
+/* Timer state in the same namespace: interval (0 = none) and, for long intervals, the last run. */
+uint32_t cap_wasm_timer_load(const char *app_name, uint32_t *last_unix);
+void cap_wasm_timer_store(const char *app_name, uint32_t interval_s);
+void cap_wasm_timer_store_last(const char *app_name, uint32_t last_unix);
+
+/* ---------- Timers (cap_wasm_apps.c, WASM thread) ---------- */
+
+#define CAP_WASM_MAX_TIMERS 4 /* apps with an active timer */
+
+/* claw_timer_set(): 0 cancels; returns 0 or -errno. */
+int32_t cap_wasm_timer_set(cap_wasm_app_t *app, int32_t interval_s);
+
+/* Sends `text` to every allowed Telegram user; ESP_ERR_NOT_SUPPORTED without Telegram. */
+esp_err_t cap_wasm_send_allowed(const char *text);
+
 /* ---------- Runtime <-> installer (cap_wasm_install.c) ---------- */
 
 typedef enum {
@@ -141,6 +169,7 @@ typedef enum {
     CAP_WASM_REQ_UNLOAD,
     CAP_WASM_REQ_CONFIG,      /* `extra`: "/app config" arguments after the name */
     CAP_WASM_REQ_CONFIG_JSON, /* settings listing for the LLM */
+    CAP_WASM_REQ_TIMER,       /* runs the most overdue on_timer(), if any */
     /* The requests below can change the tool set. */
     CAP_WASM_REQ_RELOAD,
     CAP_WASM_REQ_ENABLE,

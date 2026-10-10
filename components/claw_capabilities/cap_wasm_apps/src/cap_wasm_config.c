@@ -229,6 +229,58 @@ void cap_wasm_cfg_prune(const cap_wasm_app_t *app)
     nvs_close(h);
 }
 
+uint32_t cap_wasm_timer_load(const char *app_name, uint32_t *last_unix)
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    uint32_t interval = 0;
+    nvs_handle_t h;
+
+    *last_unix = 0;
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, "_timer", &interval);
+        nvs_get_u32(h, "_tlast", last_unix);
+        nvs_close(h);
+    }
+    return interval;
+}
+
+void cap_wasm_timer_store(const char *app_name, uint32_t interval_s)
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    uint32_t old = 0;
+    nvs_handle_t h;
+
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] cannot store the timer; it does not survive a reboot", app_name);
+        return;
+    }
+    if (nvs_get_u32(h, "_timer", &old) != ESP_OK || old != interval_s) {
+        if (interval_s) {
+            nvs_set_u32(h, "_timer", interval_s);
+        } else {
+            nvs_erase_key(h, "_timer");
+        }
+        nvs_erase_key(h, "_tlast");
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+void cap_wasm_timer_store_last(const char *app_name, uint32_t last_unix)
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    nvs_handle_t h;
+
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, "_tlast", last_unix);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 void cap_wasm_cfg_erase(const char *app_name)
 {
     char ns[CAP_WASM_NVS_NS_LEN];

@@ -153,6 +153,49 @@ static void test_normalize(void)
     CHECK(!cap_wasm_setting_normalize(&flag, "", out, sizeof(out)));
 }
 
+static bool parse_perms(const char *perms_json)
+{
+    char json[512];
+
+    snprintf(json, sizeof(json), "{\"name\":\"a\",\"version\":\"1.0.0\",\"permissions\":%s}", perms_json);
+    return parse(json);
+}
+
+static void test_timer_notify(void)
+{
+    static const char *const bad[] = {
+        "{\"timer\":true}", "{\"timer\":60}", "{\"timer\":{\"min_interval_s\":59}}",
+        "{\"timer\":{\"min_interval_s\":604801}}", "{\"timer\":{\"min_interval_s\":90.5}}",
+        "{\"timer\":{\"interval_s\":60}}", "{\"notify\":1}", "{\"notify\":\"yes\"}",
+    };
+    cap_wasm_manifest_t old;
+    char text[256];
+
+    CHECK(parse_perms("{\"notify\":true,\"timer\":{}}"));
+    CHECK((s_mf.perms & CAP_WASM_PERM_NOTIFY) && (s_mf.perms & CAP_WASM_PERM_TIMER) &&
+          s_mf.timer_min_s == CAP_WASM_TIMER_MIN_S);
+    CHECK(parse_perms("{\"notify\":false,\"timer\":{\"min_interval_s\":3600}}"));
+    CHECK(!(s_mf.perms & CAP_WASM_PERM_NOTIFY) && s_mf.timer_min_s == 3600);
+    CHECK(parse_perms("{\"timer\":{\"min_interval_s\":604800}}"));
+    CHECK(parse_perms("{\"log\":true}"));
+    CHECK(!(s_mf.perms & CAP_WASM_PERM_TIMER) && s_mf.timer_min_s == 0);
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (parse_perms(bad[i])) {
+            printf("FAIL: accepted permissions %s\n", bad[i]);
+            s_failed++;
+        }
+    }
+
+    /* The install confirmation lists the new permissions and marks the added ones. */
+    CHECK(parse_perms("{\"log\":true}"));
+    old = s_mf;
+    CHECK(parse_perms("{\"log\":true,\"notify\":true,\"timer\":{}}"));
+    CHECK(cap_wasm_perms_describe(&s_mf, &old, text, sizeof(text)));
+    CHECK(strcmp(text, "log, <b>+notify</b>, <b>+timer</b>") == 0);
+    CHECK(!cap_wasm_perms_describe(&old, &s_mf, text, sizeof(text)));
+    CHECK(strcmp(text, "log; entfernt: <s>notify</s>, <s>timer</s>") == 0);
+}
+
 static void test_namespaces(void)
 {
     char a[CAP_WASM_NVS_NS_LEN];
@@ -172,6 +215,7 @@ int main(void)
     test_settings_valid();
     test_settings_invalid();
     test_normalize();
+    test_timer_notify();
     test_namespaces();
     if (s_failed) {
         printf("%d check(s) failed\n", s_failed);

@@ -85,7 +85,8 @@ static bool cap_wasm_parse_int(const cJSON *item, const char *field, uint32_t mi
 
 static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *out, char *err, size_t err_size)
 {
-    static const char *const keys[] = {"log", "kv", "http_profiles", "confirm", "ping"};
+    static const char *const keys[] = {"log", "kv", "http_profiles", "confirm", "ping", "notify", "timer"};
+    static const char *const timer_keys[] = {"min_interval_s"};
     static const struct {
         const char *key;
         uint32_t perm;
@@ -94,8 +95,10 @@ static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *
         {"kv", CAP_WASM_PERM_KV},
         {"confirm", CAP_WASM_PERM_CONFIRM},
         {"ping", CAP_WASM_PERM_PING},
+        {"notify", CAP_WASM_PERM_NOTIFY},
     };
     const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(perms, "http_profiles");
+    const cJSON *timer = cJSON_GetObjectItemCaseSensitive(perms, "timer");
     const cJSON *item = NULL;
 
     if (!perms) {
@@ -117,6 +120,20 @@ static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *
         if (cJSON_IsTrue(item)) {
             out->perms |= flags[i].perm;
         }
+    }
+    if (timer) {
+        out->timer_min_s = CAP_WASM_TIMER_MIN_S;
+        if (!cJSON_IsObject(timer)) {
+            snprintf(err, err_size, "permissions.timer must be an object");
+            return false;
+        }
+        if (!cap_wasm_keys_known(timer, timer_keys, 1, "permissions.timer key", err, err_size) ||
+                !cap_wasm_parse_int(cJSON_GetObjectItemCaseSensitive(timer, "min_interval_s"),
+                                    "permissions.timer.min_interval_s", CAP_WASM_TIMER_MIN_S, CAP_WASM_TIMER_MAX_S,
+                                    &out->timer_min_s, err, err_size)) {
+            return false;
+        }
+        out->perms |= CAP_WASM_PERM_TIMER;
     }
     if (!profiles) {
         return true;
@@ -329,6 +346,8 @@ static const struct {
     {CAP_WASM_PERM_KV, "kv"},
     {CAP_WASM_PERM_CONFIRM, "confirm"},
     {CAP_WASM_PERM_PING, "ping"},
+    {CAP_WASM_PERM_NOTIFY, "notify"},
+    {CAP_WASM_PERM_TIMER, "timer"},
 };
 #define PERM_NAME_COUNT (sizeof(s_perm_names) / sizeof(s_perm_names[0]))
 
