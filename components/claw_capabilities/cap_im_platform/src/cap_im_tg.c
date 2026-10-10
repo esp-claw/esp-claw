@@ -474,6 +474,22 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
         return err;
     }
 
+    if (caption && caption[0]) {
+        size_t content_len = strlen(caption) + strlen(saved_path) + 64;
+        char *content = malloc(content_len);
+
+        if (content) {
+            snprintf(content, content_len, "%s\n[Telegram %s saved at: %s]",
+                     caption, attachment_kind, saved_path);
+            err = cap_im_tg_publish_inbound_text(chat_id, sender_id, message_id, content);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Telegram attachment caption publish failed: message=%s err=%s",
+                         message_id, esp_err_to_name(err));
+            }
+            free(content);
+        }
+    }
+
     payload_json = cap_im_attachment_build_payload_json(
     &(cap_im_attachment_payload_config_t) {
         .platform = "telegram",
