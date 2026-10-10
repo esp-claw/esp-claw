@@ -99,6 +99,11 @@ dependencies:
       - if: $CONFIG{APP_CLAW_CAP_WOL} == True
     path: ../../claw_capabilities/cap_wol
 
+  cap_wasm_apps:
+    rules:
+      - if: $CONFIG{APP_CLAW_CAP_WASM_APPS} == True
+    path: ../../claw_capabilities/cap_wasm_apps
+
   claw_cap:
     path: ../../claw_modules/claw_cap
 

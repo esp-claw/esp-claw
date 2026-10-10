@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "src/cap_wasm_apps.c"
+        "src/cap_wasm_host.c"
+        "src/cap_wasm_manifest.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        claw_cap
+    PRIV_REQUIRES
+        cap_http_request
+        cap_im_platform
+        esp_hw_support
+        esp_timer
+        json
+        nvs_flash
+        pthread
+)

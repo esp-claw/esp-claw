@@ -1056,12 +1056,21 @@ static void cap_im_tg_handle_callback_query(cJSON *query_json)
     cap_im_tg_answer_callback(query_id, !matched ? "Abgelaufen" : rejected ? "Abgebrochen" : "Wird ausgeführt");
 }
 
-/* /ssh is answered here instead of by a router rule so it also works on devices whose
- * router_rules.json was seeded before the command existed. */
-static void cap_im_tg_handle_ssh_command(const char *chat_id, const char *text)
+/* "/<name>" or "/<name>@bot" alone or followed by a space. */
+static bool cap_im_tg_is_command(const char *text, const char *command)
+{
+    size_t len = strlen(command);
+
+    return strncmp(text, command, len) == 0 && (text[len] == '\0' || text[len] == ' ' || text[len] == '@');
+}
+
+/* /ssh and /apps are answered here instead of by a router rule so they also work on devices
+ * whose router_rules.json was seeded before the commands existed. */
+static void cap_im_tg_handle_cap_command(const char *chat_id, const char *text, const char *command,
+                                         const char *cap_name)
 {
     const size_t output_size = 4096;
-    const char *args = text + strlen("/ssh");
+    const char *args = text + strlen(command);
     cJSON *input = NULL;
     char *input_json = NULL;
     char *output = NULL;
@@ -1079,7 +1088,7 @@ static void cap_im_tg_handle_ssh_command(const char *chat_id, const char *text)
     cJSON_Delete(input);
     output = calloc(1, output_size);
     if (input_json && output) {
-        claw_cap_call("ssh_command", input_json,
+        claw_cap_call(cap_name, input_json,
                       &(claw_cap_call_context_t) {
                           .channel = "telegram",
                           .chat_id = chat_id,
@@ -1088,7 +1097,7 @@ static void cap_im_tg_handle_ssh_command(const char *chat_id, const char *text)
                       },
                       output, output_size);
         if (cap_im_tg_send_text(chat_id, output) != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send /ssh reply");
+            ESP_LOGW(TAG, "Failed to send %s reply", command);
         }
     }
     free(input_json);
@@ -1259,10 +1268,13 @@ static void cap_im_tg_handle_update(cJSON *update_json)
 
     text_json = cJSON_GetObjectItem(message_json, "text");
     if (cJSON_IsString(text_json) && text_json->valuestring &&
-            strncmp(text_json->valuestring, "/ssh", 4) == 0 &&
-            (text_json->valuestring[4] == '\0' || text_json->valuestring[4] == ' ' ||
-             text_json->valuestring[4] == '@')) {
-        cap_im_tg_handle_ssh_command(chat_id, text_json->valuestring);
+            cap_im_tg_is_command(text_json->valuestring, "/ssh")) {
+        cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/ssh", "ssh_command");
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+    } else if (cJSON_IsString(text_json) && text_json->valuestring &&
+               cap_im_tg_is_command(text_json->valuestring, "/apps")) {
+        cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/apps", "apps_command");
+#endif
     } else if (cJSON_IsString(text_json) && text_json->valuestring && text_json->valuestring[0]) {
         if (cap_im_tg_publish_inbound_text(chat_id,
                                            sender_id,
