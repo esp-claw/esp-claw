@@ -1064,7 +1064,7 @@ static bool cap_im_tg_is_command(const char *text, const char *command)
     return strncmp(text, command, len) == 0 && (text[len] == '\0' || text[len] == ' ' || text[len] == '@');
 }
 
-/* /ssh and /apps are answered here instead of by a router rule so they also work on devices
+/* /ssh, /apps and /app are answered here instead of by a router rule so they also work on devices
  * whose router_rules.json was seeded before the commands existed. */
 static void cap_im_tg_handle_cap_command(const char *chat_id, const char *text, const char *command,
                                          const char *cap_name)
@@ -1274,6 +1274,9 @@ static void cap_im_tg_handle_update(cJSON *update_json)
     } else if (cJSON_IsString(text_json) && text_json->valuestring &&
                cap_im_tg_is_command(text_json->valuestring, "/apps")) {
         cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/apps", "apps_command");
+    } else if (cJSON_IsString(text_json) && text_json->valuestring &&
+               cap_im_tg_is_command(text_json->valuestring, "/app")) {
+        cap_im_tg_handle_cap_command(chat_id, text_json->valuestring, "/app", "apps_command");
 #endif
     } else if (cJSON_IsString(text_json) && text_json->valuestring && text_json->valuestring[0]) {
         if (cap_im_tg_publish_inbound_text(chat_id,

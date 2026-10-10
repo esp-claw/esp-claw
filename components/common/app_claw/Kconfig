@@ -192,8 +192,9 @@ menu "App Claw Config"
             depends on APP_CLAW_CAP_HTTP_REQUEST
             default y
             help
-                Load sandboxed WASM apps (WAMR interpreter) from <storage>/apps/<name>/
-                at boot, expose the tools they register to the LLM and handle /apps.
+                Run signed, sandboxed WASM apps (WAMR interpreter) from <storage>/apps/<name>/
+                on demand, expose the tools they register to the LLM and handle /apps and
+                /app (install, update, remove).
 
         config APP_CLAW_CAP_ROUTER_MGR
             bool "Enable router manager capability"

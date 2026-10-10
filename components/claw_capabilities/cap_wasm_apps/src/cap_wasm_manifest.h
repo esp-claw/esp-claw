@@ -49,10 +49,17 @@ bool cap_wasm_name_valid(const char *name, size_t len, size_t max_len);
 
 /*
  * Parses and strictly validates manifest.json. `dir_name` is the app directory, which must equal
- * the manifest name. Unknown keys or permissions reject the manifest. On failure `err` says why.
+ * the manifest name (NULL skips that check). Unknown keys or permissions reject the manifest. On
+ * failure `err` says why.
  */
 bool cap_wasm_manifest_parse(const char *json, const char *dir_name, cap_wasm_manifest_t *out,
                              char *err, size_t err_size);
+
+struct cJSON;
+
+/* False (with `err` naming the key) when `obj` has a key that is not in `keys`. */
+bool cap_wasm_keys_known(const struct cJSON *obj, const char *const *keys, size_t key_count,
+                         const char *where, char *err, size_t err_size);
 
 bool cap_wasm_manifest_allows_profile(const cap_wasm_manifest_t *mf, const char *profile);
 

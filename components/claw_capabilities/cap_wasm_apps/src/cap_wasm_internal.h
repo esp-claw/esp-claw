@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "cap_wasm_manifest.h"
+#include "cap_wasm_pkg.h"
 #include "claw_cap.h"
 #include "wasm_export.h"
 
@@ -34,10 +35,11 @@ enum {
 };
 
 typedef enum {
-    CAP_WASM_APP_FAILED = 0, /* not loaded, see last_error */
-    CAP_WASM_APP_READY,      /* module loaded and instantiated */
-    CAP_WASM_APP_IDLE,       /* module loaded, instance torn down; re-instantiated on next call */
-    CAP_WASM_APP_DISABLED,   /* by /apps disable or after repeated failures, until reload/reboot */
+    CAP_WASM_APP_FAILED = 0, /* cannot load, see last_error; no tools registered */
+    CAP_WASM_APP_LOADED,     /* module in memory; inst NULL means re-instantiate on the next call */
+    CAP_WASM_APP_UNLOADED,   /* verified, tools registered, loaded on the next call */
+    CAP_WASM_APP_DISABLED,   /* by /apps disable (persisted) or after repeated failures (until reload/reboot) */
+    CAP_WASM_APP_UNSIGNED,   /* no valid signature by a trusted key and app_allow_unsigned is off */
 } cap_wasm_app_state_t;
 
 typedef struct {
@@ -51,7 +53,15 @@ typedef struct {
     wasm_function_inst_t fn_alloc;
     wasm_function_inst_t fn_call;
     bool initializing;  /* inside app_init(): tool_register allowed */
-    bool tools_frozen;  /* re-instantiation: tool_register must name existing tools */
+    bool tools_frozen;  /* tools already registered: tool_register must name existing tools */
+    bool tools_changed; /* a frozen app_init registered a different tool set */
+    uint8_t init_tools; /* existing tools named by the current frozen app_init */
+    bool enabled;       /* persisted in index.json */
+    uint32_t installed_at;
+    char key_id[9];     /* signing key, "" when unsigned */
+    char wasm_sha256[65];
+    char source_url[256]; /* where it was installed from, for /app update */
+    int64_t last_used_us; /* last call or load, for idle unload and LRU eviction */
     uint32_t wasm_size;
     uint32_t psram_bytes;
     uint32_t load_ms;
@@ -95,3 +105,50 @@ int32_t cap_wasm_tool_add(cap_wasm_app_t *app, const char *name, uint32_t name_l
 
 /* Stops the call budget clock while a host function blocks (HTTP, confirmation). */
 void cap_wasm_budget_pause(bool pause);
+
+/* ---------- Runtime <-> installer (cap_wasm_install.c) ---------- */
+
+typedef enum {
+    CAP_WASM_REQ_BOOT,
+    CAP_WASM_REQ_CALL,
+    CAP_WASM_REQ_STATUS,
+    CAP_WASM_REQ_LOAD,
+    CAP_WASM_REQ_UNLOAD,
+    /* The requests below can change the tool set. */
+    CAP_WASM_REQ_RELOAD,
+    CAP_WASM_REQ_ENABLE,
+    CAP_WASM_REQ_DISABLE,
+    CAP_WASM_REQ_INSTALL,  /* swaps <name>.new/ in; `extra` is the source URL */
+    CAP_WASM_REQ_REMOVE,
+} cap_wasm_req_type_t;
+
+extern char g_cap_wasm_apps_dir[64];
+extern cap_wasm_key_t g_cap_wasm_trusted[CAP_WASM_MAX_TRUSTED];
+extern size_t g_cap_wasm_trusted_count;
+
+/* Whole file in PSRAM, NUL-terminated; NULL when missing, empty or larger than max_size. */
+char *cap_wasm_read_file(const char *path, size_t max_size, size_t *out_size);
+bool cap_wasm_write_file(const char *path, const char *data, size_t len);
+/* Deletes an app directory (app directories hold only files); true when it is gone. */
+bool cap_wasm_rmdir(const char *path);
+
+/* Runs a request for app `name` on the WASM thread; re-registers the app tools when needed. */
+esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char *extra,
+                         char *output, size_t output_size);
+
+/* Telegram chat to confirm in for `ctx`, or NULL when it does not come from an allowed chat. */
+const char *cap_wasm_confirm_chat(const claw_cap_call_context_t *ctx);
+
+/*
+ * Downloads an .ecapp from an https URL, verifies it, asks for confirmation in the Telegram chat
+ * of `ctx` and installs it. `expect_name` (update) must match the package; an older version than
+ * the installed one needs `force`. Must not run on the WASM thread or the Telegram poll task.
+ */
+esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
+                           const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+
+/* Asks for confirmation, then deletes the app, its files and its key-value data. */
+esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+
+/* Runs "/app install|update|remove ..." on its own task and sends the result to `chat_id`. */
+esp_err_t cap_wasm_start_job(const char *command, const char *chat_id);
