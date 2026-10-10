@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -1258,6 +1259,56 @@ esp_err_t claw_session_mgr_switch_chat_session(uint32_t agent_id,
     return err;
 }
 
+/* Deletes an inactive alias of a chat: history first, then the alias map entry. */
+static esp_err_t claw_session_mgr_delete_alias_locked(const char *chat_key,
+                                                      const char *alias,
+                                                      bool *out_deleted_any)
+{
+    char session_id[CLAW_SESSION_MGR_ID_SIZE];
+    claw_session_mgr_alias_map_t *map = calloc(1, sizeof(*map));
+    size_t alias_index = CLAW_SESSION_MGR_MAX_SESSIONS;
+    esp_err_t err;
+
+    if (!map) {
+        return ESP_ERR_NO_MEM;
+    }
+    err = claw_session_mgr_load_mapping_locked(chat_key, map);
+    if (err == ESP_OK) {
+        for (size_t i = 0; i < map->session_count; i++) {
+            if (strcmp(map->sessions[i], alias) == 0) {
+                alias_index = i;
+                break;
+            }
+        }
+        if (alias_index == CLAW_SESSION_MGR_MAX_SESSIONS) {
+            err = ESP_ERR_NOT_FOUND;
+        } else if (strcmp(map->current_alias, alias) == 0) {
+            err = ESP_ERR_INVALID_STATE;
+        } else if (!s_session_mgr.delete_session) {
+            err = ESP_ERR_NOT_SUPPORTED;
+        }
+    }
+    if (err == ESP_OK) {
+        err = claw_session_mgr_build_alias_session_id(chat_key, alias, session_id, sizeof(session_id), NULL);
+    }
+    if (err == ESP_OK) {
+        err = s_session_mgr.delete_session(session_id, out_deleted_any, s_session_mgr.delete_session_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Delete session history failed for %s: %s", session_id, esp_err_to_name(err));
+        }
+    }
+    if (err == ESP_OK) {
+        for (size_t i = alias_index; i + 1 < map->session_count; i++) {
+            strlcpy(map->sessions[i], map->sessions[i + 1], sizeof(map->sessions[i]));
+        }
+        map->session_count--;
+        map->sessions[map->session_count][0] = '\0';
+        err = claw_session_mgr_write_mapping_locked(map);
+    }
+    free(map);
+    return err;
+}
+
 esp_err_t claw_session_mgr_delete_chat_session(uint32_t agent_id,
                                                const char *source_channel,
                                                const char *chat_id,
@@ -1266,10 +1317,7 @@ esp_err_t claw_session_mgr_delete_chat_session(uint32_t agent_id,
                                                size_t out_alias_size)
 {
     char chat_key[CLAW_SESSION_MGR_KEY_SIZE];
-    char session_id[CLAW_SESSION_MGR_ID_SIZE];
-    claw_session_mgr_alias_map_t map;
     bool deleted_any = false;
-    size_t alias_index = CLAW_SESSION_MGR_MAX_SESSIONS;
     esp_err_t err;
 
     if (!claw_session_mgr_alias_is_valid(alias)) {
@@ -1288,39 +1336,7 @@ esp_err_t claw_session_mgr_delete_chat_session(uint32_t agent_id,
         err = claw_session_mgr_build_chat_key(agent_id, source_channel, chat_id, chat_key, sizeof(chat_key));
     }
     if (err == ESP_OK) {
-        err = claw_session_mgr_load_mapping_locked(chat_key, &map);
-    }
-    if (err == ESP_OK) {
-        for (size_t i = 0; i < map.session_count; i++) {
-            if (strcmp(map.sessions[i], alias) == 0) {
-                alias_index = i;
-                break;
-            }
-        }
-        if (alias_index == CLAW_SESSION_MGR_MAX_SESSIONS) {
-            err = ESP_ERR_NOT_FOUND;
-        } else if (strcmp(map.current_alias, alias) == 0) {
-            err = ESP_ERR_INVALID_STATE;
-        } else if (!s_session_mgr.delete_session) {
-            err = ESP_ERR_NOT_SUPPORTED;
-        }
-    }
-    if (err == ESP_OK) {
-        err = claw_session_mgr_build_alias_session_id(chat_key, alias, session_id, sizeof(session_id), NULL);
-    }
-    if (err == ESP_OK) {
-        err = s_session_mgr.delete_session(session_id, &deleted_any, s_session_mgr.delete_session_ctx);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Delete session history failed for %s: %s", session_id, esp_err_to_name(err));
-        }
-    }
-    if (err == ESP_OK) {
-        for (size_t i = alias_index; i + 1 < map.session_count; i++) {
-            strlcpy(map.sessions[i], map.sessions[i + 1], sizeof(map.sessions[i]));
-        }
-        map.session_count--;
-        map.sessions[map.session_count][0] = '\0';
-        err = claw_session_mgr_write_mapping_locked(&map);
+        err = claw_session_mgr_delete_alias_locked(chat_key, alias, &deleted_any);
     }
     xSemaphoreGiveRecursive(s_session_mgr.mutex);
 
@@ -1335,5 +1351,141 @@ esp_err_t claw_session_mgr_delete_chat_session(uint32_t agent_id,
                  deleted_any ? "true" : "false");
     }
 
+    return err;
+}
+
+static esp_err_t claw_session_mgr_read_json_string(const char *path,
+                                                   const char *key,
+                                                   char *out,
+                                                   size_t out_size)
+{
+    FILE *file = fopen(path, "rb");
+    char *text = NULL;
+    long size;
+    cJSON *root;
+    const char *value;
+
+    if (!file) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (fseek(file, 0, SEEK_END) != 0 || (size = ftell(file)) < 0 || size > 16384 ||
+            fseek(file, 0, SEEK_SET) != 0 || !(text = calloc(1, (size_t)size + 1)) ||
+            fread(text, 1, (size_t)size, file) != (size_t)size) {
+        fclose(file);
+        free(text);
+        return ESP_FAIL;
+    }
+    fclose(file);
+    root = cJSON_Parse(text);
+    free(text);
+    value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, key));
+    if (value) {
+        strlcpy(out, value, out_size);
+    }
+    cJSON_Delete(root);
+    return value ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+static void claw_session_mgr_visit_dir_locked(const char *dir_path,
+                                              bool subagents,
+                                              claw_session_mgr_visit_fn_t fn,
+                                              void *user_ctx)
+{
+    char path[CLAW_SESSION_MGR_PATH_SIZE];
+    char key[CLAW_SESSION_MGR_ID_SIZE];
+    char session_id[CLAW_SESSION_MGR_ID_SIZE];
+    claw_session_mgr_alias_map_t *alias_map = NULL;
+    claw_session_mgr_subagent_map_t *subagent_map = NULL;
+    struct dirent *entry;
+    DIR *dir = opendir(dir_path);
+
+    if (!dir) {
+        return;
+    }
+    alias_map = subagents ? NULL : calloc(1, sizeof(*alias_map));
+    subagent_map = subagents ? calloc(1, sizeof(*subagent_map)) : NULL;
+    while ((alias_map || subagent_map) && (entry = readdir(dir)) != NULL) {
+        size_t len = strlen(entry->d_name);
+
+        if (len < 6 || strcmp(entry->d_name + len - 5, ".json") != 0 ||
+                snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name) >= (int)sizeof(path) ||
+                claw_session_mgr_read_json_string(path, subagents ? "parent_session_id" : "chat_key",
+                                                  key, sizeof(key)) != ESP_OK) {
+            continue;
+        }
+        if (subagents) {
+            if (claw_session_mgr_load_subagent_map_locked(key, subagent_map) != ESP_OK) {
+                continue;
+            }
+            for (size_t i = 0; i < subagent_map->child_count; i++) {
+                fn(subagent_map->child_ids[i], key, false, user_ctx);
+            }
+            continue;
+        }
+        if (claw_session_mgr_load_mapping_locked(key, alias_map) != ESP_OK) {
+            continue;
+        }
+        for (size_t i = 0; i < alias_map->session_count; i++) {
+            if (claw_session_mgr_build_alias_session_id(key, alias_map->sessions[i],
+                                                        session_id, sizeof(session_id), NULL) == ESP_OK) {
+                fn(session_id, NULL, strcmp(alias_map->sessions[i], alias_map->current_alias) == 0, user_ctx);
+            }
+        }
+    }
+    closedir(dir);
+    free(alias_map);
+    free(subagent_map);
+}
+
+esp_err_t claw_session_mgr_visit_sessions(claw_session_mgr_visit_fn_t fn, void *user_ctx)
+{
+    esp_err_t err;
+
+    if (!fn) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_session_mgr.configured || !s_session_mgr.mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTakeRecursive(s_session_mgr.mutex, portMAX_DELAY);
+    err = claw_session_mgr_require_configured_locked();
+    if (err == ESP_OK) {
+        claw_session_mgr_visit_dir_locked(s_session_mgr.mapping_root_dir, false, fn, user_ctx);
+        claw_session_mgr_visit_dir_locked(s_session_mgr.subagent_root_dir, true, fn, user_ctx);
+    }
+    xSemaphoreGiveRecursive(s_session_mgr.mutex);
+    return err;
+}
+
+esp_err_t claw_session_mgr_delete_session(const char *session_id, const char *parent_session_id)
+{
+    char chat_key[CLAW_SESSION_MGR_KEY_SIZE];
+    const char *alias;
+    bool deleted_any = false;
+    esp_err_t err;
+
+    if (!session_id || !session_id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (parent_session_id && parent_session_id[0]) {
+        return claw_session_mgr_delete_subagent_session(parent_session_id, session_id, NULL);
+    }
+    alias = strrchr(session_id, ':');
+    if (!alias || (size_t)(alias - session_id) >= sizeof(chat_key) ||
+            !claw_session_mgr_alias_is_valid(alias + 1)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(chat_key, session_id, (size_t)(alias - session_id));
+    chat_key[alias - session_id] = '\0';
+    if (!s_session_mgr.configured || !s_session_mgr.mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTakeRecursive(s_session_mgr.mutex, portMAX_DELAY);
+    err = claw_session_mgr_require_configured_locked();
+    if (err == ESP_OK) {
+        err = claw_session_mgr_delete_alias_locked(chat_key, alias + 1, &deleted_any);
+    }
+    xSemaphoreGiveRecursive(s_session_mgr.mutex);
     return err;
 }
