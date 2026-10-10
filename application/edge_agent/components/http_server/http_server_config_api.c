@@ -86,6 +86,10 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_SECRET_FIELD("stt",   stt_api_key),
     CONFIG_FIELD("stt",          stt_model),
 
+    CONFIG_FIELD("embed",        embed_base_url),
+    CONFIG_SECRET_FIELD("embed", embed_api_key),
+    CONFIG_FIELD("embed",        embed_model),
+
     CONFIG_FIELD("capabilities", enabled_cap_groups),
     CONFIG_FIELD("capabilities", llm_visible_cap_groups),
     CONFIG_FIELD("capabilities", ssh_hosts),
