@@ -1634,6 +1634,49 @@ static esp_err_t cap_im_tg_send_rich_chunk(const char *chat_id, const char *mark
     return err;
 }
 
+/* GFM joins single newlines into one paragraph: end every non-blank line that is followed by
+ * another line with two spaces (hard break), except inside ```/~~~ fences and on table rows.
+ * Trailing spaces at the end of a block are ignored, so this leaves no artifacts. */
+static char *cap_im_tg_md_hard_breaks(const char *text)
+{
+    const char *line = text;
+    const char *p;
+    size_t lines = 1;
+    size_t off = 0;
+    char fence = 0;
+    char *out;
+
+    for (p = text; *p; p++) {
+        lines += *p == '\n';
+    }
+    out = malloc((size_t)(p - text) + 2 * lines + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    while (*line) {
+        const char *nl = strchr(line, '\n');
+        size_t line_len = nl ? (size_t)(nl - line) + 1 : strlen(line);
+
+        p = line + strspn(line, " ");
+        memcpy(out + off, line, line_len);
+        off += line_len;
+        if ((*p == '`' || *p == '~') && p[1] == *p && p[2] == *p) {
+            if (!fence) {
+                fence = *p;
+            } else if (*p == fence) {
+                fence = 0;
+            }
+        } else if (!fence && nl && nl[1] && p < nl && *p != '|') {
+            memcpy(out + off - 1, "  \n", 3);
+            off += 2;
+        }
+        line += line_len;
+    }
+    out[off] = '\0';
+    return out;
+}
+
 /* Length of the next rich chunk: all of it if it fits, else the last paragraph break (or line
  * break) outside a ``` fence before the limits, else any line break, else a UTF-8 safe cut. */
 static size_t cap_im_tg_rich_chunk_len(const char *text, size_t len)
@@ -2541,7 +2584,11 @@ esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
 
         memcpy(chunk, text + offset, chunk_len);
         if (!s_tg_rich_unsupported) {
-            err = cap_im_tg_send_rich_chunk(chat_id, chunk, &status);
+            /* Adds at most 2 bytes per line: still within the rich limits after chunking. */
+            char *md = cap_im_tg_md_hard_breaks(chunk);
+
+            err = cap_im_tg_send_rich_chunk(chat_id, md ? md : chunk, &status);
+            free(md);
         }
         /* Fall back on Telegram rejecting the rich message (parse/feature error, unknown method).
          * Transport errors are not retried: Telegram may already have accepted the message. */
