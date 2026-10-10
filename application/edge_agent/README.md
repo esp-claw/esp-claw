@@ -87,7 +87,8 @@ idf.py flash monitor
 ## API credential profiles (`api_profiles`)
 
 `api_profiles` (device config, JSON array, at most 3583 bytes) holds credentials that `http_request`
-(with `"profile"`) and WASM apps use without ever seeing the secret:
+(with `"profile"`) and WASM apps use without ever seeing the secret (apps: see
+https://github.com/esp-claw/app-sdk and https://github.com/esp-claw/app-template):
 
 ```json
 [

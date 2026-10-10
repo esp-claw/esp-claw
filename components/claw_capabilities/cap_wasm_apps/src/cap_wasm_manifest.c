@@ -10,6 +10,9 @@
 
 #include "cJSON.h"
 
+/* github.com/esp-claw/app-sdk (include/claw.h, tools/manifest_check.py, tools/wasm_check.py) mirrors
+ * these manifest rules; update it together with this file. */
+
 bool cap_wasm_name_valid(const char *name, size_t len, size_t max_len)
 {
     if (!name || len == 0 || len > max_len || name[0] < 'a' || name[0] > 'z') {

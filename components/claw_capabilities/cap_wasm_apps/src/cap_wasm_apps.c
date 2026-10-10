@@ -580,7 +580,7 @@ static bool cap_wasm_check_imports(cap_wasm_app_t *app)
             return false;
         }
         if (!imp.linked) {
-            cap_wasm_set_error(app, "claw.%s has the wrong signature (rebuild with apps/sdk/include/claw.h)", imp.name);
+            cap_wasm_set_error(app, "claw.%s has the wrong signature (rebuild with the current esp-claw/app-sdk)", imp.name);
             return false;
         }
     }

@@ -195,6 +195,7 @@ menu "App Claw Config"
                 Run signed, sandboxed WASM apps (WAMR interpreter) from <storage>/apps/<name>/
                 on demand, expose the tools they register to the LLM and handle /apps and
                 /app (install, update, remove).
+                Apps: see https://github.com/esp-claw/app-sdk and https://github.com/esp-claw/app-template.
 
         config APP_CLAW_CAP_ROUTER_MGR
             bool "Enable router manager capability"
