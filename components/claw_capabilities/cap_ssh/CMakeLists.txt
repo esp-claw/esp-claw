@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "src/cap_ssh.c"
         "src/cap_ssh_netdb.c"
+        "src/cap_ssh_rules.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

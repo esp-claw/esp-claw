@@ -22,12 +22,6 @@ typedef struct {
     bool enable_inbound_attachments;
 } cap_im_tg_attachment_config_t;
 
-typedef enum {
-    CAP_IM_TG_CONFIRM_APPROVED = 0,
-    CAP_IM_TG_CONFIRM_REJECTED,
-    CAP_IM_TG_CONFIRM_TIMEOUT,
-} cap_im_tg_confirm_result_t;
-
 esp_err_t cap_im_tg_register_group(void);
 esp_err_t cap_im_tg_set_token(const char *bot_token);
 /* Comma-separated numeric Telegram user ids; an empty list drops every update. */
@@ -41,14 +35,17 @@ esp_err_t cap_im_tg_stop(void);
 esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text);
 esp_err_t cap_im_tg_send_image(const char *chat_id, const char *path, const char *caption);
 esp_err_t cap_im_tg_send_file(const char *chat_id, const char *path, const char *caption);
+/* Sends `html` (Telegram HTML) without buttons; `out_message_id` is for cap_im_tg_edit_message(). */
+esp_err_t cap_im_tg_send_html(const char *chat_id, const char *html, int64_t *out_message_id);
 /*
- * Sends `html` with approve/cancel inline buttons and blocks until an allowlisted user presses
- * one in that chat or `timeout_ms` passes. Calls are serialized. Must not run on the Telegram
+ * Sends `html` with one inline button per label (at most 10; the last one rejects) and blocks
+ * until an allowlisted user presses one in that chat or `timeout_ms` passes. `out_choice` is the
+ * pressed label's index, or -1 on timeout. Calls are serialized. Must not run on the Telegram
  * poll task, which delivers the answer. `out_message_id` identifies the prompt for
  * cap_im_tg_edit_message().
  */
-esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, uint32_t timeout_ms,
-                            cap_im_tg_confirm_result_t *out_result, int64_t *out_message_id);
+esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *const *labels, size_t label_count,
+                            uint32_t timeout_ms, int *out_choice, int64_t *out_message_id);
 /* Replaces a sent message with `html` and removes its inline buttons. */
 esp_err_t cap_im_tg_edit_message(const char *chat_id, int64_t message_id, const char *html);
 

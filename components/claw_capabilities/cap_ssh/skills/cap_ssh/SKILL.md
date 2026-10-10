@@ -1,7 +1,7 @@
 ---
 {
   "name": "cap_ssh",
-  "description": "Run shell commands on configured SSH hosts after the user confirms each command in Telegram.",
+  "description": "Run shell commands on configured SSH hosts after the user confirms them in Telegram or an allow rule covers them.",
   "metadata": {
     "cap_groups": [
       "cap_ssh"
@@ -29,9 +29,19 @@ Use this skill when the user asks to run a command on, inspect, or administer on
 ```
 
 - `host` must be one of the names listed in the `ssh_exec` tool description. Do not pass IP addresses or hostnames.
-- Every call sends the exact command to the user's Telegram chat and waits up to 60 seconds for the user to approve it. Tell the user what you are about to run and why before calling.
+- A call sends the exact command to the user's Telegram chat and waits up to 60 seconds for the user to approve it, unless the host's allow rules cover it. Tell the user what you are about to run and why before calling.
+- The tool description lists each host's allow rules ("no prompt: df *, free *, uptime"). Prefer commands in exactly those forms; they run at once and the user only gets a notice.
 - Only works for requests that came from Telegram. Other channels, scheduled jobs and sub-agents get an error.
 - Prefer one short, non-interactive command per call. Commands that wait for input or run longer than 30 seconds are cut off.
+
+## Allow rules
+- A rule is a program plus an args pattern for one host: exact args, `*` for any args, or a glob with `*` and `?` matched against the arguments joined by single spaces (`*` also matches spaces). The program is compared as typed: `/usr/bin/df` and `df` are different.
+- The command is tokenized like a shell (quotes, backslashes, collapsed whitespace) and split on `;`, `&&`, `||` and `|`. It runs without confirmation only if every part is covered by a rule and no part is hardline.
+- Never auto-approved and without rule buttons: `$`, backticks, `(`, `)`, `<`, heredocs, process substitution, a lone `&`, newlines, unbalanced quotes, `VAR=value` prefixes, globs or braces in the program name, more than 8 parts, and output redirection other than to `/dev/null`, `&1` or `&2`.
+- The confirmation offers "✅ Einmal", "🔁 Genau so" (an exact rule for each part not covered yet), "🔁 Immer: <prog> *" (a `*` rule per part) and "❌ Abbrechen".
+- Telegram `/ssh allowed`, `/ssh allow <host> <program> [args|*]`, `/ssh revoke <n>` and `/ssh revoke all` manage the rules (at most 32 for all hosts).
+- Hardline programs (compared by their name without path) always need confirmation, get no rule buttons, cannot get rules, and existing rules never match them: rm, rmdir, dd, mkfs*, shred, wipefs, fdisk, parted, chmod, chown, chattr, sudo, su, doas, pkexec, runuser, kill, killall, pkill, reboot, shutdown, poweroff, halt, init, telinit, mv, cp, tee, truncate, ln, tar, crontab, at, useradd, userdel, usermod, passwd, iptables, nft, ufw, firewall-cmd, apt, apt-get, dnf, yum, rpm, pip*, npm, snap, flatpak, curl, wget, nc, ncat, socat, ssh, scp, rsync, python*, perl, ruby, node, php, lua*, bash, sh, dash, zsh, ksh, fish, csh, tcsh, busybox, eval, exec, source, `.`, command, builtin, env, xargs, find, nohup, timeout, nice, ionice, stdbuf, time, watch, strace, chroot, setsid, unshare, nsenter, systemd-run, sed, awk, gawk, mawk, git, and the shell keywords and builtins `!`, if, then, else, elif, fi, case, esac, for, select, while, until, do, done, function, coproc, alias, export, declare, typeset, readonly, local, set, unset, shopt, hash, enable, trap.
+- Hardline except for some subcommands: `docker`/`podman` unless the first argument is ps, logs, inspect, images or stats; `systemctl` unless it is status, is-active, is-enabled or list-units; `service` unless the second argument is status. Rules for them name the subcommand, for example `systemctl status *`. `journalctl` is allowed.
 
 ## Output shape
 - On success: JSON with `host`, `exit_code`, `stdout`, `stderr`, `truncated` (output is capped at 8 KB) and `timed_out` when the 30 s limit was hit.
