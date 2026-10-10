@@ -182,6 +182,19 @@ typedef struct {
 typedef void (*claw_core_completion_observer_fn)(const claw_core_completion_summary_t *summary,
                                                  void *user_ctx);
 
+typedef enum {
+    CLAW_CORE_PROGRESS_REQUEST_START = 0,
+    CLAW_CORE_PROGRESS_TOOL_CALL,
+    CLAW_CORE_PROGRESS_REQUEST_END,
+} claw_core_progress_event_t;
+
+/* Runs on the agent task of every core, so it must return quickly.
+ * tool_name and args_json are set for CLAW_CORE_PROGRESS_TOOL_CALL only. */
+typedef void (*claw_core_progress_observer_fn)(claw_core_progress_event_t event,
+                                               const claw_core_request_t *request,
+                                               const char *tool_name,
+                                               const char *args_json);
+
 esp_err_t claw_core_create(const claw_core_config_t *config, claw_core_handle_t *out_core);
 esp_err_t claw_core_start(claw_core_handle_t core);
 esp_err_t claw_core_stop(claw_core_handle_t core, uint32_t timeout_ms);
@@ -194,6 +207,8 @@ esp_err_t claw_core_add_completion_observer(claw_core_handle_t core,
                                             claw_core_completion_observer_fn observer,
                                             void *user_ctx);
 esp_err_t claw_core_publish_stage_text(const claw_core_request_t *request, const char *text);
+/* Single global observer (NULL to clear) for request start/end and tool calls. */
+void claw_core_set_progress_observer(claw_core_progress_observer_fn observer);
 esp_err_t claw_core_submit(claw_core_handle_t core,
                            const claw_core_request_t *request,
                            uint32_t timeout_ms);

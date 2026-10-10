@@ -204,6 +204,7 @@ void claw_core_agent_loop_task(void *arg)
                          esp_err_to_name(err));
             }
         }
+        claw_core_notify_progress(CLAW_CORE_PROGRESS_REQUEST_START, &request.view, NULL, NULL);
 
         {
             const char *user_texts[1] = {request.view.user_text};
@@ -489,6 +490,7 @@ finish_request:
                 }
             }
         }
+        claw_core_notify_progress(CLAW_CORE_PROGRESS_REQUEST_END, &request.view, NULL, NULL);
         claw_core_publish_out_message_if_requested(&request, &response);
         if (request.view.flags & CLAW_CORE_REQUEST_FLAG_SKIP_RESPONSE_QUEUE) {
             claw_core_free_response_item(&response);

@@ -211,6 +211,10 @@ void claw_core_publish_stage_tool_calls(const claw_core_request_t *request,
 void claw_core_publish_stage_note_for_round(claw_core_state_t *core,
                                             const claw_core_request_t *request,
                                             uint32_t round_index);
+void claw_core_notify_progress(claw_core_progress_event_t event,
+                               const claw_core_request_t *request,
+                               const char *tool_name,
+                               const char *args_json);
 
 esp_err_t claw_core_persist_context_user_messages_if_configured(claw_core_state_t *core,
                                                                 const claw_core_request_t *request,

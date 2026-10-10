@@ -276,6 +276,10 @@ esp_err_t claw_core_append_tool_results_messages(claw_core_state_t *core,
                  claw_core_log_snippet(response->tool_calls[i].arguments_json),
                  claw_core_log_snippet_suffix(response->tool_calls[i].arguments_json));
 
+        claw_core_notify_progress(CLAW_CORE_PROGRESS_TOOL_CALL,
+                                  request,
+                                  response->tool_calls[i].name,
+                                  response->tool_calls[i].arguments_json);
         err = core->call_cap(response->tool_calls[i].name,
                              response->tool_calls[i].arguments_json,
                              request,

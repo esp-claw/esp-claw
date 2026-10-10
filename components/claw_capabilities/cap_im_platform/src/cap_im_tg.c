@@ -19,6 +19,7 @@
 #include <sys/types.h>
 
 #include "cJSON.h"
+#include "claw_core.h"
 #include "claw_task.h"
 #include "claw_event_publisher.h"
 #include "esp_crt_bundle.h"
@@ -59,6 +60,11 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_VOICE_PREFIX           "[Sprachnachricht]"
 #define CAP_IM_TG_CONFIRM_PREFIX         "cf:"
 #define CAP_IM_TG_CONFIRM_NONCE_LEN      16
+#define CAP_IM_TG_BUSY_LABEL_LEN         128
+#define CAP_IM_TG_BUSY_LABEL_MAX         120
+#define CAP_IM_TG_DRAFT_INTERVAL_MS      20000
+#define CAP_IM_TG_TYPING_INTERVAL_MS     4000
+#define CAP_IM_TG_BUSY_EXPIRY_MS         (5 * 60 * 1000)
 
 typedef struct {
     char *buf;
@@ -113,6 +119,7 @@ typedef struct {
     bool enable_inbound_attachments;
     TaskHandle_t poll_task;
     TaskHandle_t attachment_task;
+    TaskHandle_t busy_task;
     QueueHandle_t attachment_queue;
     volatile bool stop_requested;
     int64_t next_update_id;
@@ -137,6 +144,22 @@ static bool s_tg_initialized;
 static bool s_tg_rich_unsupported;
 static cap_im_tg_confirm_t s_confirm;
 static portMUX_TYPE s_confirm_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* What the agent is doing for chat_id (empty when idle), shown as a draft bubble or typing dots.
+ * request_id 0 marks work before the agent request exists (voice transcription). */
+typedef struct {
+    char chat_id[32];
+    char label[CAP_IM_TG_BUSY_LABEL_LEN];
+    uint32_t request_id;
+    int64_t draft_id;
+    int64_t expires_ms;
+    int64_t sent_ms;
+    bool dirty;
+} cap_im_tg_busy_t;
+
+static cap_im_tg_busy_t s_busy;
+static portMUX_TYPE s_busy_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_tg_draft_unsupported;
 
 static void cap_im_tg_init_defaults(void)
 {
@@ -627,7 +650,7 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     return copy;
 }
 
-static void cap_im_tg_send_typing(const char *chat_id);
+static void cap_im_tg_busy_show(const char *chat_id, bool start, uint32_t request_id, const char *label);
 
 /* Publishes a voice/audio message to the agent as text: optional caption line, then the prefixed body. */
 static void cap_im_tg_publish_voice_text(const char *chat_id,
@@ -653,9 +676,7 @@ static void cap_im_tg_publish_voice_text(const char *chat_id,
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Telegram voice text publish failed: message=%s err=%s",
                  message_id, esp_err_to_name(err));
-        return;
     }
-    cap_im_tg_send_typing(chat_id);
 }
 
 static void cap_im_tg_transcribe_and_publish(const char *chat_id,
@@ -670,7 +691,7 @@ static void cap_im_tg_transcribe_and_publish(const char *chat_id,
     char *text = NULL;
     esp_err_t err;
 
-    cap_im_tg_send_typing(chat_id);
+    cap_im_tg_busy_show(chat_id, true, 0, "🎙 Transkribiere Sprachnachricht…");
     err = cap_im_attachment_transcribe_file(TAG,
                                             s_tg.stt_base_url,
                                             s_tg.stt_api_key,
@@ -1244,7 +1265,6 @@ static void cap_im_tg_handle_update(cJSON *update_json)
                                            sender_id,
                                            message_id,
                                            text_json->valuestring) == ESP_OK) {
-            cap_im_tg_send_typing(chat_id);
             ESP_LOGI(TAG, "Telegram inbound %s: %.48s%s",
                      chat_id,
                      text_json->valuestring,
@@ -1727,6 +1747,195 @@ static const char *cap_im_tg_basename(const char *path)
     return slash ? slash + 1 : path;
 }
 
+/* The plain-text draft label for a tool call, cut UTF-8 safe to CAP_IM_TG_BUSY_LABEL_MAX bytes. */
+static void cap_im_tg_busy_tool_label(const char *tool, const char *args_json, char *out, size_t out_size)
+{
+    cJSON *args = args_json ? cJSON_Parse(args_json) : NULL;
+    const char *path = cJSON_GetStringValue(cJSON_GetObjectItem(args, "path"));
+    const char *arg = NULL;
+    const char *host = NULL;
+    char buf[256];
+    size_t len;
+
+    if (strcmp(tool, "web_search") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "query"));
+        snprintf(buf, sizeof(buf), "🔍 Websuche: „%s“", arg ? arg : "");
+    } else if (strcmp(tool, "http_request") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "url"));
+        arg = arg ? (strstr(arg, "://") ? strstr(arg, "://") + 3 : arg) : "";
+        snprintf(buf, sizeof(buf), "🌐 Rufe %.*s ab", (int)strcspn(arg, "/?#"), arg);
+    } else if (strcmp(tool, "ssh_exec") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "command"));
+        host = cJSON_GetStringValue(cJSON_GetObjectItem(args, "host"));
+        snprintf(buf, sizeof(buf), "🖥 SSH auf %s: %s", host ? host : "", arg ? arg : "");
+    } else if (strcmp(tool, "inspect_image") == 0) {
+        strlcpy(buf, "🖼 Analysiere Bild…", sizeof(buf));
+    } else if (strncmp(tool, "lua_run_script", 14) == 0) {
+        snprintf(buf, sizeof(buf), "⚙️ Lua: %s", cap_im_tg_basename(path));
+    } else if (strcmp(tool, "activate_skill") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "skill_id"));
+        snprintf(buf, sizeof(buf), "📚 Skill: %s", arg ? arg : "");
+    } else if (strcmp(tool, "wol_wake") == 0) {
+        arg = cJSON_GetStringValue(cJSON_GetObjectItem(args, "target"));
+        snprintf(buf, sizeof(buf), "⏰ Wecke %s", arg ? arg : "");
+    } else if (strcmp(tool, "write_file") == 0 || strcmp(tool, "read_file") == 0) {
+        snprintf(buf, sizeof(buf), "📄 %s", cap_im_tg_basename(path));
+    } else if (strcmp(tool, "spawn_agent") == 0) {
+        strlcpy(buf, "🤖 Starte Subagent", sizeof(buf));
+    } else {
+        snprintf(buf, sizeof(buf), "🛠 %s", tool);
+    }
+    cJSON_Delete(args);
+
+    len = claw_utils_utf8_prefix_len(buf, CAP_IM_TG_BUSY_LABEL_MAX);
+    snprintf(out, out_size, "%.*s%s", (int)len, buf, buf[len] ? "…" : "");
+}
+
+static void cap_im_tg_busy_show(const char *chat_id, bool start, uint32_t request_id, const char *label)
+{
+    bool notify = false;
+    bool idle;
+    bool same_chat;
+
+    taskENTER_CRITICAL(&s_busy_mux);
+    idle = !s_busy.chat_id[0] || cap_im_tg_now_ms() >= s_busy.expires_ms;
+    same_chat = !idle && strcmp(s_busy.chat_id, chat_id) == 0;
+    /* A start never takes over from a running request; an update only touches the busy chat. */
+    if (start ? (idle || s_busy.request_id == 0) : same_chat) {
+        if (start) {
+            /* Keep the transcription draft id so Telegram animates into the request's draft. */
+            if (!same_chat || s_busy.request_id != 0 || request_id == 0) {
+                s_busy.draft_id = (int64_t)(esp_random() & 0x7fffffff) | 1;
+            }
+            s_busy.request_id = request_id;
+            strlcpy(s_busy.chat_id, chat_id, sizeof(s_busy.chat_id));
+        }
+        strlcpy(s_busy.label, label, sizeof(s_busy.label));
+        s_busy.expires_ms = cap_im_tg_now_ms() + CAP_IM_TG_BUSY_EXPIRY_MS;
+        s_busy.dirty = true;
+        notify = true;
+    }
+    taskEXIT_CRITICAL(&s_busy_mux);
+    if (notify && s_tg.busy_task) {
+        xTaskNotifyGive(s_tg.busy_task);
+    }
+}
+
+/* claw_core progress observer: runs on the agent task, so it only updates s_busy. */
+static void cap_im_tg_busy_progress(claw_core_progress_event_t event,
+                                    const claw_core_request_t *request,
+                                    const char *tool_name,
+                                    const char *args_json)
+{
+    bool targeted = request->target_channel && request->target_channel[0];
+    const char *channel = targeted ? request->target_channel : request->source_channel;
+    const char *chat_id = targeted ? request->target_chat_id : request->source_chat_id;
+    char label[CAP_IM_TG_BUSY_LABEL_LEN];
+
+    if (!channel || strcmp(channel, "telegram") != 0 || !chat_id || !chat_id[0]) {
+        return;
+    }
+    if (event == CLAW_CORE_PROGRESS_REQUEST_END) {
+        taskENTER_CRITICAL(&s_busy_mux);
+        if (s_busy.request_id == request->request_id) {
+            s_busy.chat_id[0] = '\0';
+        }
+        taskEXIT_CRITICAL(&s_busy_mux);
+        return;
+    }
+    if (event == CLAW_CORE_PROGRESS_TOOL_CALL && tool_name) {
+        cap_im_tg_busy_tool_label(tool_name, args_json, label, sizeof(label));
+    } else {
+        strlcpy(label, "💭 Denke nach…", sizeof(label));
+    }
+    cap_im_tg_busy_show(chat_id, event == CLAW_CORE_PROGRESS_REQUEST_START, request->request_id, label);
+}
+
+/* sendRichMessageDraft works in private chats only; the first rejection (other than rate
+ * limiting) switches to typing dots. */
+static void cap_im_tg_send_busy(const char *chat_id, int64_t draft_id, const char *label)
+{
+    cap_im_tg_html_buf_t html = {.buf = malloc(256), .cap = 256};
+    cJSON *body = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err = ESP_ERR_NO_MEM;
+    int status = 0;
+
+    if (!s_tg_draft_unsupported && html.buf &&
+            cap_im_tg_html_put(&html, "<tg-thinking>", strlen("<tg-thinking>")) &&
+            cap_im_tg_html_put_escaped(&html, label, strlen(label), false) &&
+            cap_im_tg_html_put(&html, "</tg-thinking>", strlen("</tg-thinking>")) &&
+            (body = cJSON_CreateObject()) != NULL) {
+        cJSON_AddNumberToObject(body, "chat_id", strtod(chat_id, NULL));
+        cJSON_AddNumberToObject(body, "draft_id", (double)draft_id);
+        cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "rich_message"), "html", html.buf);
+        body_json = cJSON_PrintUnformatted(body);
+        cJSON_Delete(body);
+        if (body_json) {
+            err = cap_im_tg_api_call_status("sendRichMessageDraft", body_json, &resp, &status);
+        }
+        free(body_json);
+        free(resp);
+        if (err == ESP_FAIL && status != 429) {
+            s_tg_draft_unsupported = true;
+            ESP_LOGI(TAG, "sendRichMessageDraft rejected, using typing dots until reboot");
+        }
+    }
+    free(html.buf);
+    if (s_tg_draft_unsupported) {
+        cap_im_tg_send_typing(chat_id);
+    }
+}
+
+static void cap_im_tg_busy_task(void *arg)
+{
+    char chat_id[sizeof(s_busy.chat_id)];
+    char label[CAP_IM_TG_BUSY_LABEL_LEN];
+    int64_t draft_id = 0;
+
+    (void)arg;
+
+    while (!s_tg.stop_requested) {
+        int64_t now;
+        bool confirm_pending;
+        bool due = false;
+
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        taskENTER_CRITICAL(&s_confirm_mux);
+        confirm_pending = s_confirm.nonce[0] != '\0';
+        taskEXIT_CRITICAL(&s_confirm_mux);
+
+        now = cap_im_tg_now_ms();
+        taskENTER_CRITICAL(&s_busy_mux);
+        if (s_busy.chat_id[0] && now >= s_busy.expires_ms) {
+            s_busy.chat_id[0] = '\0';
+        }
+        if (s_busy.chat_id[0] && confirm_pending) {
+            /* Sending the prompt removed the draft: show it again right after the answer. */
+            s_busy.dirty = true;
+        } else if (s_busy.chat_id[0] &&
+                   (s_busy.dirty || now - s_busy.sent_ms >= (s_tg_draft_unsupported ?
+                                                             CAP_IM_TG_TYPING_INTERVAL_MS :
+                                                             CAP_IM_TG_DRAFT_INTERVAL_MS))) {
+            strlcpy(chat_id, s_busy.chat_id, sizeof(chat_id));
+            strlcpy(label, s_busy.label, sizeof(label));
+            draft_id = s_busy.draft_id;
+            s_busy.sent_ms = now;
+            s_busy.dirty = false;
+            due = true;
+        }
+        taskEXIT_CRITICAL(&s_busy_mux);
+
+        if (due) {
+            cap_im_tg_send_busy(chat_id, draft_id, label);
+        }
+    }
+
+    s_tg.busy_task = NULL;
+    claw_task_delete(NULL);
+}
+
 static const char *cap_im_tg_guess_mime_type(const char *path, bool is_image)
 {
     const char *ext = NULL;
@@ -2166,6 +2375,23 @@ static esp_err_t cap_im_tg_gateway_start(void)
         s_tg.attachment_queue = NULL;
         return ESP_FAIL;
     }
+    /* The busy indicator is cosmetic: run without it if the task cannot be created. */
+    ok = claw_task_create(&(claw_task_config_t){
+                              .name = "tg_busy",
+                              .stack_size = 6144,
+                              .priority = 4,
+                              .core_id = tskNO_AFFINITY,
+                              .stack_policy = CLAW_TASK_STACK_PREFER_PSRAM,
+                          },
+                          cap_im_tg_busy_task,
+                          NULL,
+                          &s_tg.busy_task);
+    if (ok == pdPASS) {
+        claw_core_set_progress_observer(cap_im_tg_busy_progress);
+    } else {
+        s_tg.busy_task = NULL;
+        ESP_LOGW(TAG, "Telegram busy indicator task not started");
+    }
 
     return ESP_OK;
 }
@@ -2178,6 +2404,7 @@ static esp_err_t cap_im_tg_gateway_stop(void)
         return ESP_OK;
     }
 
+    claw_core_set_progress_observer(NULL);
     s_tg.stop_requested = true;
     while (s_tg.poll_task && xTaskGetTickCount() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -2192,6 +2419,14 @@ static esp_err_t cap_im_tg_gateway_stop(void)
     }
 
     if (s_tg.attachment_task) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    while (s_tg.busy_task && xTaskGetTickCount() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    if (s_tg.busy_task) {
         return ESP_ERR_TIMEOUT;
     }
 
