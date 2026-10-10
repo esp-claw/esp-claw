@@ -473,6 +473,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
         free(remote_path);
         return err;
     }
+    cap_im_attachment_prune_inbox(TAG, s_tg.attachment_root_dir, "telegram", saved_path);
 
     if (caption && caption[0]) {
         size_t content_len = strlen(caption) + strlen(saved_path) + 64;

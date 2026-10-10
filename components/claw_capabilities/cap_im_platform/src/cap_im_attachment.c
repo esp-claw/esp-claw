@@ -6,6 +6,7 @@
 #include "cap_im_attachment.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -14,19 +15,27 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_vfs_fat.h"
 
 #define CAP_IM_ATTACHMENT_PATH_BUF_SIZE 256
+#define CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES (512 * 1024)
+#define CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS 64
+#define CAP_IM_ATTACHMENT_MIN_FREE_BYTES (256 * 1024)
+/* 2020-01-01 UTC. Earlier wall-clock time means the clock was never set, so mtimes are not ordered. */
+#define CAP_IM_ATTACHMENT_MIN_VALID_EPOCH 1577836800
 
 typedef struct {
     FILE *file;
     size_t bytes_written;
     size_t max_bytes;
     bool limit_hit;
+    bool write_failed;
 } cap_im_attachment_download_t;
 
 static uint64_t cap_im_attachment_fnv1a64(const char *text)
@@ -343,10 +352,29 @@ static esp_err_t cap_im_attachment_download_event_handler(esp_http_client_event_
     }
 
     if (fwrite(event->data, 1, (size_t)event->data_len, dl->file) != (size_t)event->data_len) {
+        dl->write_failed = true;
         return ESP_FAIL;
     }
 
     dl->bytes_written += (size_t)event->data_len;
+    return ESP_OK;
+}
+
+static esp_err_t cap_im_attachment_check_free_space(const char *log_tag, const char *path)
+{
+    uint64_t total = 0;
+    uint64_t free_bytes = 0;
+    esp_err_t err = esp_vfs_fat_info(path, &total, &free_bytes);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(log_tag, "attachment free space query failed: path=%s err=%s", path, esp_err_to_name(err));
+        return ESP_OK;
+    }
+    if (free_bytes < CAP_IM_ATTACHMENT_MIN_FREE_BYTES) {
+        ESP_LOGW(log_tag, "attachment skipped, storage low: free=%u min=%u path=%s",
+                 (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES, path);
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }
 
@@ -365,6 +393,11 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
 
     if (!url || !url[0] || !dest_path || !dest_path[0]) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    err = cap_im_attachment_check_free_space(log_tag, dest_path);
+    if (err != ESP_OK) {
+        return err;
     }
 
     if (cap_im_attachment_ensure_parent_dirs(dest_path) != ESP_OK) {
@@ -399,7 +432,16 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
     err = esp_http_client_perform(client);
     status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
-    fclose(file);
+    if (fclose(file) != 0) {
+        dl.write_failed = true;
+    }
+
+    if (dl.write_failed) {
+        ESP_LOGW(log_tag, "attachment write failed, storage full? path=%s bytes=%u",
+                 dest_path, (unsigned int)dl.bytes_written);
+        remove(dest_path);
+        return ESP_ERR_NO_MEM;
+    }
 
     if (err != ESP_OK || status < 200 || status >= 300 || dl.limit_hit || dl.bytes_written == 0) {
         ESP_LOGW(log_tag,
@@ -454,6 +496,129 @@ esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
 
     fclose(file);
     return ESP_OK;
+}
+
+/* Retention order: true when (mtime, path) should be removed before the current oldest candidate.
+ * An empty oldest_path means no candidate yet. Ties on mtime fall back to path order. */
+static bool cap_im_attachment_is_older(time_t mtime,
+                                       const char *path,
+                                       time_t oldest_mtime,
+                                       const char *oldest_path)
+{
+    if (oldest_path[0] == '\0') {
+        return true;
+    }
+    if (mtime != oldest_mtime) {
+        return mtime < oldest_mtime;
+    }
+    return strcmp(path, oldest_path) < 0;
+}
+
+static bool cap_im_attachment_join_path(char *dst, size_t dst_size, const char *dir, const char *name)
+{
+    int written = snprintf(dst, dst_size, "%s/%s", dir, name);
+
+    return written > 0 && (size_t)written < dst_size;
+}
+
+/* Scans <platform_path>/<chat>/<file>. Sets total_bytes to the sum of all regular files (keep_path
+ * included) and oldest_path to the oldest file other than keep_path (empty if there is none).
+ * Returns -1 if the platform directory cannot be opened. */
+static int cap_im_attachment_find_oldest(const char *platform_path,
+                                         const char *keep_path,
+                                         char *oldest_path,
+                                         size_t oldest_size,
+                                         uint64_t *total_bytes)
+{
+    DIR *platform_dir = NULL;
+    struct dirent *chat_entry = NULL;
+    time_t oldest_mtime = 0;
+
+    oldest_path[0] = '\0';
+    *total_bytes = 0;
+    platform_dir = opendir(platform_path);
+    if (!platform_dir) {
+        return -1;
+    }
+
+    while ((chat_entry = readdir(platform_dir)) != NULL) {
+        char chat_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
+        struct dirent *file_entry = NULL;
+        struct stat st = {0};
+        DIR *chat_dir = NULL;
+
+        if (chat_entry->d_name[0] == '.' ||
+                !cap_im_attachment_join_path(chat_path, sizeof(chat_path), platform_path, chat_entry->d_name) ||
+                stat(chat_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+
+        chat_dir = opendir(chat_path);
+        if (!chat_dir) {
+            continue;
+        }
+        while ((file_entry = readdir(chat_dir)) != NULL) {
+            char file_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
+
+            if (file_entry->d_name[0] == '.' ||
+                    !cap_im_attachment_join_path(file_path, sizeof(file_path), chat_path, file_entry->d_name) ||
+                    stat(file_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+
+            *total_bytes += (uint64_t)st.st_size;
+            if (strcmp(file_path, keep_path) == 0) {
+                continue;
+            }
+            if (cap_im_attachment_is_older(st.st_mtime, file_path, oldest_mtime, oldest_path)) {
+                strlcpy(oldest_path, file_path, oldest_size);
+                oldest_mtime = st.st_mtime;
+            }
+        }
+        closedir(chat_dir);
+    }
+
+    closedir(platform_dir);
+    return 0;
+}
+
+void cap_im_attachment_prune_inbox(const char *log_tag,
+                                   const char *root_dir,
+                                   const char *platform_dir,
+                                   const char *keep_path)
+{
+    char platform_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
+    char oldest_path[CAP_IM_ATTACHMENT_PATH_BUF_SIZE];
+    uint64_t total_bytes = 0;
+
+    if (!log_tag || !root_dir || !platform_dir || !keep_path ||
+            !cap_im_attachment_join_path(platform_path, sizeof(platform_path), root_dir, platform_dir)) {
+        return;
+    }
+
+    /* Without a valid clock, mtimes are not ordered and the names carry no time, so the
+     * save order is unknown. Skip pruning rather than delete arbitrary attachments. */
+    if (time(NULL) < CAP_IM_ATTACHMENT_MIN_VALID_EPOCH) {
+        ESP_LOGW(log_tag, "attachment retention skipped: system clock not set, save order unknown");
+        return;
+    }
+
+    for (int removed = 0; removed < CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS; removed++) {
+        if (cap_im_attachment_find_oldest(platform_path, keep_path, oldest_path, sizeof(oldest_path),
+                                          &total_bytes) != 0) {
+            ESP_LOGW(log_tag, "attachment retention scan failed: dir=%s errno=%d", platform_path, errno);
+            return;
+        }
+        if (total_bytes <= CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES || oldest_path[0] == '\0') {
+            return;
+        }
+        if (remove(oldest_path) != 0) {
+            ESP_LOGW(log_tag, "attachment retention remove failed: path=%s errno=%d", oldest_path, errno);
+            return;
+        }
+        ESP_LOGI(log_tag, "attachment retention removed oldest file: %s (inbox %u bytes, budget %u)",
+                 oldest_path, (unsigned int)total_bytes, (unsigned int)CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES);
+    }
 }
 
 char *cap_im_attachment_build_payload_json(
