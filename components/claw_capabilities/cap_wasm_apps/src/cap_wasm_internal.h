@@ -192,7 +192,7 @@ esp_err_t cap_wasm_update(const char *name, const claw_cap_call_context_t *ctx, 
 /* "/app update all": one confirmation for every app update, then installs them in turn until one fails. */
 esp_err_t cap_wasm_update_all(const claw_cap_call_context_t *ctx, char *output, size_t output_size);
 
-/* Starts the daily update check when update_check_time is set. */
+/* Starts the daily and boot update checks when update_check_time is set. */
 void cap_wasm_updates_start(void);
 
 /* Tool handlers in the cap_wasm_apps_mgr group. */
