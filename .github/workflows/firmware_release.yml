@@ -17,7 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     container: espressif/idf:v5.5.4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Build edge_agent (esp32_S3_DevKitC_1)
         shell: bash
@@ -39,7 +41,7 @@ jobs:
           sha256sum build/edge_agent.bin
 
       - name: Attach the unsigned image to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: application/edge_agent/build/edge_agent.bin
           fail_on_unmatched_files: true
