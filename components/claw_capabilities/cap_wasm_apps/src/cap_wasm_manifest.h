@@ -63,6 +63,14 @@ bool cap_wasm_keys_known(const struct cJSON *obj, const char *const *keys, size_
 
 bool cap_wasm_manifest_allows_profile(const cap_wasm_manifest_t *mf, const char *profile);
 
+/*
+ * Lists the permissions of `mf` ("log, kv, http: <profile>", "keine" when none) for a Telegram
+ * HTML confirmation. With `old` (the installed manifest), permissions it lacks are shown as
+ * <b>+name</b> and the ones only it has are appended as "; entfernt: <s>name</s>". True when `mf`
+ * has a permission `old` lacks (any permission when `old` is NULL).
+ */
+bool cap_wasm_perms_describe(const cap_wasm_manifest_t *mf, const cap_wasm_manifest_t *old, char *out, size_t size);
+
 /* Replaces every byte that is not part of a valid UTF-8 sequence with '?', so app-supplied text
  * cannot make the JSON sent to the LLM provider invalid. */
 void cap_wasm_utf8_sanitize(char *text, size_t len);

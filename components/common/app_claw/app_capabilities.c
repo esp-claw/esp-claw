@@ -780,6 +780,7 @@ static esp_err_t app_cap_register_wasm_apps(const app_claw_config_t *config,
     cap_wasm_apps_set_trust(config->app_trusted_keys,
                             strcmp(config->app_allow_unsigned, "true") == 0 ||
                             strcmp(config->app_allow_unsigned, "1") == 0);
+    cap_wasm_apps_set_update_check(config->update_check_time);
     return cap_wasm_apps_register_group(paths->fatfs_base_path);
 }
 #endif

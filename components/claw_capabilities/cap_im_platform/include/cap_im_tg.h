@@ -33,6 +33,8 @@ esp_err_t cap_im_tg_set_attachment_config(
 esp_err_t cap_im_tg_start(void);
 esp_err_t cap_im_tg_stop(void);
 esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text);
+/* Sends `text` to every allowed user's private chat; ESP_OK when it reached at least one. */
+esp_err_t cap_im_tg_send_text_to_allowed(const char *text);
 esp_err_t cap_im_tg_send_image(const char *chat_id, const char *path, const char *caption);
 esp_err_t cap_im_tg_send_file(const char *chat_id, const char *path, const char *caption);
 /* Sends `html` (Telegram HTML) without buttons; `out_message_id` is for cap_im_tg_edit_message(). */
