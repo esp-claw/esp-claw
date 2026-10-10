@@ -94,6 +94,7 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("capabilities", llm_visible_cap_groups),
     CONFIG_FIELD("capabilities", ssh_hosts),
     CONFIG_FIELD("capabilities", wol_targets),
+    CONFIG_SECRET_FIELD("capabilities", api_profiles),
 
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
@@ -379,7 +380,8 @@ static esp_err_t config_post_handler(httpd_req_t *req)
                                        HTTPD_400_BAD_REQUEST,
                                        "LLM boolean fields must be true/false");
         }
-        if ((strcmp(field->name, "ssh_hosts") == 0 || strcmp(field->name, "wol_targets") == 0) &&
+        if ((strcmp(field->name, "ssh_hosts") == 0 || strcmp(field->name, "wol_targets") == 0 ||
+                strcmp(field->name, "api_profiles") == 0) &&
                 item->valuestring[0]) {
             /* Truncated JSON would silently drop entries, so reject instead of clipping. */
             cJSON *hosts = cJSON_Parse(item->valuestring);
@@ -392,6 +394,8 @@ static esp_err_t config_post_handler(httpd_req_t *req)
                 return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                            strcmp(field->name, "ssh_hosts") == 0 ?
                                                "ssh_hosts must be a JSON array of at most 1535 bytes" :
+                                           strcmp(field->name, "api_profiles") == 0 ?
+                                               "api_profiles must be a JSON array of at most 3583 bytes" :
                                                "wol_targets must be a JSON array of at most 1023 bytes");
             }
         }

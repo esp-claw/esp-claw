@@ -13,6 +13,8 @@ extern "C" {
 
 esp_err_t cap_http_request_register_group(void);
 esp_err_t cap_http_request_set_allowlist(const char *allowlist_csv);
+/* Sets the credential profiles (JSON array, see api_profiles); the string holds secrets. */
+esp_err_t cap_http_request_set_profiles(const char *profiles_json);
 
 #ifdef __cplusplus
 }
