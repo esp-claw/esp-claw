@@ -285,6 +285,15 @@ static bool append_dav_href(char *buf, size_t size, size_t *pos, const char *rel
            (!is_dir || append_fmt(buf, size, pos, "/"));
 }
 
+/* Files written before SNTP sync carry FAT's zero date (1980), the FAT root has no
+ * timestamp at all (1970); such dates are omitted rather than shown. */
+#define DAV_MIN_VALID_EPOCH 1577836800 /* 2020-01-01 */
+
+static bool dav_time_valid(time_t t)
+{
+    return t >= DAV_MIN_VALID_EPOCH;
+}
+
 static void format_http_date(time_t t, char *out, size_t size)
 {
     struct tm tm;
@@ -340,10 +349,13 @@ static esp_err_t propfind_send_entry(httpd_req_t *req, char *buf, const char *re
               append_fmt(buf, size, &pos, "</D:href><D:propstat><D:prop><D:displayname>") &&
               append_xml_text(buf, size, &pos, name) &&
               append_fmt(buf, size, &pos,
-                         "</D:displayname><D:resourcetype>%s</D:resourcetype>"
-                         "<D:getlastmodified>%s</D:getlastmodified>"
-                         "<D:creationdate>%s</D:creationdate>",
-                         is_dir ? "<D:collection/>" : "", date, created) &&
+                         "</D:displayname><D:resourcetype>%s</D:resourcetype>",
+                         is_dir ? "<D:collection/>" : "") &&
+              (!dav_time_valid(st->st_mtime) ||
+               append_fmt(buf, size, &pos,
+                          "<D:getlastmodified>%s</D:getlastmodified>"
+                          "<D:creationdate>%s</D:creationdate>",
+                          date, created)) &&
               (is_dir || append_fmt(buf, size, &pos,
                                     "<D:getcontentlength>%ld</D:getcontentlength>"
                                     "<D:getcontenttype>%s</D:getcontenttype>"
@@ -581,13 +593,17 @@ static esp_err_t dav_get(httpd_req_t *req, const char *rel, const char *full)
     /* Headers are written by hand: esp_http_server only streams chunked
      * bodies and would add its own Content-Length to an empty HEAD reply. */
     char date[40];
+    char last_modified[64] = "";
     char etag[40];
-    format_http_date(st.st_mtime, date, sizeof(date));
+    if (dav_time_valid(st.st_mtime)) {
+        format_http_date(st.st_mtime, date, sizeof(date));
+        snprintf(last_modified, sizeof(last_modified), "Last-Modified: %s\r\n", date);
+    }
     format_etag(&st, etag, sizeof(etag));
     int n = snprintf(buf, HTTP_SERVER_SCRATCH_SIZE,
                      "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
-                     "Last-Modified: %s\r\nETag: %s\r\n\r\n",
-                     content_type_for(rel), (long)st.st_size, date, etag);
+                     "%sETag: %s\r\n\r\n",
+                     content_type_for(rel), (long)st.st_size, last_modified, etag);
     esp_err_t err = dav_send_raw(req, buf, n);
 
     while (err == ESP_OK && fd >= 0) {
