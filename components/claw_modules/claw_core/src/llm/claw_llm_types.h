@@ -109,4 +109,5 @@ typedef struct {
 typedef struct {
     char *body;
     int status_code;
+    int retry_after_s;
 } claw_llm_http_response_t;

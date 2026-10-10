@@ -10,13 +10,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <time.h>
+
 #include "cJSON.h"
 #include "claw_cap.h"
+#include "claw_event_publisher.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "llm/backends/claw_llm_backend_openai_codex.h"
+#include "llm/claw_llm_codex_auth.h"
 
 static const char *TAG = "cap_llm_config";
+
+#define CODEX_LOGIN_TASK_STACK 8192
+#define CODEX_API_KEY_MARKER "chatgpt-oauth"
 
 static cap_llm_config_provider_t s_provider;
 
@@ -95,6 +105,20 @@ static const cap_llm_preset_t s_presets[] = {
     },
 };
 
+/* Applied by /llm codex login on success. The OAuth tokens live in the codex_oauth NVS namespace. */
+static const cap_llm_preset_t s_codex_preset = {
+    .id = "codex",
+    .backend_type = CLAW_LLM_BACKEND_OPENAI_CODEX_ID,
+    .base_url = CLAW_LLM_BACKEND_OPENAI_CODEX_BASE_URL,
+    .auth_type = "bearer",
+    .model = CLAW_LLM_BACKEND_OPENAI_CODEX_DEFAULT_MODEL,
+    .max_tokens_field = "max_tokens",
+    .default_image_max_bytes = "524288",
+    .supports_tools = "true",
+    .supports_vision = "true",
+    .image_remote_url_only = "false",
+};
+
 static const char *s_usage =
     "Usage:\n"
     "/llm status\n"
@@ -103,11 +127,22 @@ static const char *s_usage =
     "/llm setup qwen <api_token> [model]\n"
     "/llm setup anthropic <api_token> [model]\n"
     "/llm setup custom backend=<backend> url=<base_url> model=<model> token=<api_token>\n"
+    "/llm codex login\n"
+    "/llm codex status\n"
+    "/llm codex logout\n"
     "/llm token <api_token>\n"
     "/llm model <model>\n"
     "/llm backend <backend>\n"
     "/llm base-url <base_url>\n"
-    "/llm reset\n";
+    "/llm reset\n"
+    "Codex login uses your ChatGPT account (backend openai_codex, model "
+    CLAW_LLM_BACKEND_OPENAI_CODEX_DEFAULT_MODEL ").\n";
+
+typedef struct {
+    claw_llm_codex_device_t device;
+    char channel[CAP_LLM_CONFIG_SHORT_STR_LEN];
+    char chat_id[CAP_LLM_CONFIG_SHORT_STR_LEN];
+} codex_login_t;
 
 static bool is_space(char ch)
 {
@@ -340,6 +375,114 @@ static esp_err_t save_config(cap_llm_config_t *config, char *output, size_t outp
     return ESP_OK;
 }
 
+static esp_err_t save_codex_login_config(void)
+{
+    cap_llm_config_t *config = calloc(1, sizeof(*config));
+    esp_err_t err = ESP_ERR_NO_MEM;
+
+    if (!config) {
+        return err;
+    }
+    err = s_provider.get_config(config, s_provider.user_ctx);
+    if (err == ESP_OK) {
+        apply_preset(config, &s_codex_preset);
+        strlcpy(config->api_key, CODEX_API_KEY_MARKER, sizeof(config->api_key));
+        err = s_provider.apply_config(config, s_provider.user_ctx);
+    }
+    free(config);
+    return err;
+}
+
+static void codex_login_task(void *arg)
+{
+    codex_login_t *login = arg;
+    char *error = NULL;
+    char message[256];
+    esp_err_t err = claw_llm_codex_device_wait(&login->device, &error);
+
+    if (err == ESP_OK) {
+        err = save_codex_login_config();
+    }
+    if (err == ESP_OK) {
+        snprintf(message,
+                 sizeof(message),
+                 "Codex login complete. Backend is now %s (model %s).",
+                 CLAW_LLM_BACKEND_OPENAI_CODEX_ID,
+                 CLAW_LLM_BACKEND_OPENAI_CODEX_DEFAULT_MODEL);
+    } else {
+        snprintf(message, sizeof(message), "Codex login failed: %s", error ? error : esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "%s", message);
+    if (login->chat_id[0]) {
+        claw_event_router_publish_message("llm_config", login->channel, login->chat_id, message, "system", NULL);
+    }
+    free(error);
+    claw_llm_codex_device_free(&login->device);
+    free(login);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_codex_login(const claw_cap_call_context_t *ctx, char *output, size_t output_size)
+{
+    codex_login_t *login = calloc(1, sizeof(*login));
+    char *error = NULL;
+    esp_err_t err;
+
+    if (!login) {
+        snprintf(output, output_size, "Codex login failed: out of memory.");
+        return ESP_ERR_NO_MEM;
+    }
+    err = claw_llm_codex_device_start(&login->device, &error);
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "Codex login failed: %s", error ? error : esp_err_to_name(err));
+        free(error);
+        free(login);
+        return err;
+    }
+    if (ctx && ctx->channel) {
+        strlcpy(login->channel, ctx->channel, sizeof(login->channel));
+    }
+    if (ctx && ctx->chat_id) {
+        strlcpy(login->chat_id, ctx->chat_id, sizeof(login->chat_id));
+    }
+    /* Build the reply before the task starts; the task frees the device code. */
+    snprintf(output,
+             output_size,
+             "Open https://auth.openai.com/codex/device and enter the code %s.\n"
+             "I will report here when sign-in finishes (15 minute limit).",
+             login->device.user_code);
+    if (xTaskCreate(codex_login_task, "codex_login", CODEX_LOGIN_TASK_STACK, login, 5, NULL) != pdPASS) {
+        snprintf(output, output_size, "Codex login failed: could not start the login task.");
+        claw_llm_codex_device_free(&login->device);
+        free(login);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static void write_codex_status(char *output, size_t output_size)
+{
+    int64_t expires_at = 0;
+    bool logged_in = claw_llm_codex_is_logged_in(&expires_at);
+    char expiry[32] = "n/a";
+
+    if (logged_in) {
+        time_t when = (time_t)expires_at;
+        struct tm utc;
+
+        if (expires_at > 0 && gmtime_r(&when, &utc)) {
+            strftime(expiry, sizeof(expiry), "%Y-%m-%d %H:%M UTC", &utc);
+        } else {
+            strlcpy(expiry, "unknown", sizeof(expiry));
+        }
+    }
+    snprintf(output,
+             output_size,
+             "Codex login: %s\nAccess token expires: %s",
+             logged_in ? "yes" : "no",
+             expiry);
+}
+
 static esp_err_t llm_config_execute(const char *input_json,
                                     const claw_cap_call_context_t *ctx,
                                     char *output,
@@ -396,6 +539,33 @@ static esp_err_t llm_config_execute(const char *input_json,
     if (strcmp(subcommand, "status") == 0 || strcmp(subcommand, "show") == 0) {
         write_status(config, output, output_size);
         err = ESP_OK;
+        goto cleanup;
+    }
+
+    if (strcmp(subcommand, "codex") == 0) {
+        char action[32];
+        bool has_action = false;
+
+        err = read_token(&cursor, action, sizeof(action), &has_action);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "codex action parse failed: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+        if (has_action && strcmp(action, "login") == 0) {
+            err = start_codex_login(ctx, output, output_size);
+        } else if (has_action && strcmp(action, "status") == 0) {
+            write_codex_status(output, output_size);
+            err = ESP_OK;
+        } else if (has_action && strcmp(action, "logout") == 0) {
+            err = claw_llm_codex_logout();
+            snprintf(output,
+                     output_size,
+                     "%s",
+                     err == ESP_OK ? "Codex login removed." : "Codex logout failed.");
+        } else {
+            strlcpy(output, s_usage, output_size);
+            err = ESP_OK;
+        }
         goto cleanup;
     }
 
@@ -565,7 +735,9 @@ static esp_err_t llm_config_execute(const char *input_json,
             goto cleanup;
         }
         if (!has_backend) {
-            strlcpy(output, "Usage: /llm backend <openai_compatible|anthropic_compatible>", output_size);
+            strlcpy(output,
+                    "Usage: /llm backend <openai_compatible|anthropic_compatible|openai_codex>",
+                    output_size);
             err = ESP_OK;
             goto cleanup;
         }

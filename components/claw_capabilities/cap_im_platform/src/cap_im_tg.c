@@ -42,6 +42,12 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_PATH_BUF_SIZE       256
 #define CAP_IM_TG_NAME_BUF_SIZE       96
 #define CAP_IM_TG_MULTIPART_BOUNDARY  "----cap_im_tg_boundary"
+#define CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS 4
+#define CAP_IM_TG_MEDIA_GROUP_MAX_ITEMS  10
+#define CAP_IM_TG_MEDIA_GROUP_WINDOW_MS  1500
+#define CAP_IM_TG_MEDIA_GROUP_ID_LEN     32
+#define CAP_IM_TG_MEDIA_KIND_LEN         16
+#define CAP_IM_TG_MEDIA_CAPTION_LEN      256
 
 typedef struct {
     char *buf;
@@ -66,7 +72,25 @@ typedef struct {
     char *mime;
     char *caption;
     char *content_type;
+    char *media_group_id;
 } cap_im_tg_attachment_job_t;
+
+typedef struct {
+    char path[CAP_IM_TG_PATH_BUF_SIZE];
+    char kind[CAP_IM_TG_MEDIA_KIND_LEN];
+    char caption[CAP_IM_TG_MEDIA_CAPTION_LEN];
+} cap_im_tg_media_item_t;
+
+/* An open album; item_count == 0 marks the slot as free. */
+typedef struct {
+    char media_group_id[CAP_IM_TG_MEDIA_GROUP_ID_LEN];
+    char chat_id[32];
+    char sender_id[32];
+    char message_id[32];
+    size_t item_count;
+    int64_t last_seen_ms;
+    cap_im_tg_media_item_t items[CAP_IM_TG_MEDIA_GROUP_MAX_ITEMS];
+} cap_im_tg_media_group_t;
 
 typedef struct {
     char bot_token[192];
@@ -80,6 +104,7 @@ typedef struct {
     int64_t next_update_id;
     uint64_t seen_update_keys[CAP_IM_TG_DEDUP_CACHE_SIZE];
     size_t seen_update_idx;
+    cap_im_tg_media_group_t media_groups[CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS];
 } cap_im_tg_state_t;
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
@@ -295,6 +320,150 @@ static esp_err_t cap_im_tg_publish_attachment_event(const char *chat_id,
     return claw_event_router_publish(&event);
 }
 
+static cap_im_tg_media_group_t *cap_im_tg_media_group_find(const char *media_group_id)
+{
+    size_t i;
+
+    for (i = 0; i < CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS; i++) {
+        cap_im_tg_media_group_t *group = &s_tg.media_groups[i];
+
+        if (group->item_count > 0 && strcmp(group->media_group_id, media_group_id) == 0) {
+            return group;
+        }
+    }
+
+    return NULL;
+}
+
+static char *cap_im_tg_media_group_format(const cap_im_tg_media_group_t *group)
+{
+    const char *caption = "";
+    size_t content_len;
+    size_t offset;
+    size_t i;
+    char *content = NULL;
+
+    for (i = 0; i < group->item_count && !caption[0]; i++) {
+        caption = group->items[i].caption;
+    }
+    if (!caption[0]) {
+        return NULL;
+    }
+
+    content_len = strlen(caption) + 1;
+    for (i = 0; i < group->item_count; i++) {
+        content_len += strlen(group->items[i].kind) + strlen(group->items[i].path) + 24;
+    }
+    content = malloc(content_len);
+    if (!content) {
+        ESP_LOGW(TAG, "Telegram media group text alloc failed message=%s", group->message_id);
+        return NULL;
+    }
+
+    offset = (size_t)snprintf(content, content_len, "%s", caption);
+    for (i = 0; i < group->item_count; i++) {
+        offset += (size_t)snprintf(content + offset, content_len - offset,
+                                   "\n[Telegram %s saved at: %s]",
+                                   group->items[i].kind,
+                                   group->items[i].path);
+    }
+    return content;
+}
+
+static void cap_im_tg_media_group_flush(cap_im_tg_media_group_t *group)
+{
+    char *content = cap_im_tg_media_group_format(group);
+
+    if (content) {
+        esp_err_t err = cap_im_tg_publish_inbound_text(group->chat_id,
+                                                       group->sender_id,
+                                                       group->message_id,
+                                                       content);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Telegram media group publish failed: message=%s err=%s",
+                     group->message_id, esp_err_to_name(err));
+        }
+        free(content);
+    } else {
+        ESP_LOGI(TAG, "Telegram media group without caption not published: message=%s photos=%u",
+                 group->message_id, (unsigned int)group->item_count);
+    }
+    group->item_count = 0;
+}
+
+/* Returns a free slot, or flushes the least recently active group to make one. */
+static cap_im_tg_media_group_t *cap_im_tg_media_group_take_slot(void)
+{
+    cap_im_tg_media_group_t *oldest = NULL;
+    size_t i;
+
+    for (i = 0; i < CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS; i++) {
+        cap_im_tg_media_group_t *group = &s_tg.media_groups[i];
+
+        if (group->item_count == 0) {
+            return group;
+        }
+        if (!oldest || group->last_seen_ms < oldest->last_seen_ms) {
+            oldest = group;
+        }
+    }
+
+    ESP_LOGI(TAG, "Telegram media group buffer full, flushing message=%s", oldest->message_id);
+    cap_im_tg_media_group_flush(oldest);
+    return oldest;
+}
+
+static void cap_im_tg_media_group_flush_expired(void)
+{
+    int64_t now = cap_im_tg_now_ms();
+    size_t i;
+
+    for (i = 0; i < CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS; i++) {
+        cap_im_tg_media_group_t *group = &s_tg.media_groups[i];
+
+        if (group->item_count > 0 && now - group->last_seen_ms >= CAP_IM_TG_MEDIA_GROUP_WINDOW_MS) {
+            cap_im_tg_media_group_flush(group);
+        }
+    }
+}
+
+/* Returns false when the item cannot be grouped; the caller then publishes it on its own. */
+static bool cap_im_tg_media_group_add(const char *media_group_id,
+                                      const char *chat_id,
+                                      const char *sender_id,
+                                      const char *message_id,
+                                      const char *attachment_kind,
+                                      const char *saved_path,
+                                      const char *caption)
+{
+    cap_im_tg_media_group_t *group = NULL;
+    cap_im_tg_media_item_t *item = NULL;
+
+    if (strlen(media_group_id) >= CAP_IM_TG_MEDIA_GROUP_ID_LEN) {
+        return false;
+    }
+
+    group = cap_im_tg_media_group_find(media_group_id);
+    if (group && group->item_count == CAP_IM_TG_MEDIA_GROUP_MAX_ITEMS) {
+        cap_im_tg_media_group_flush(group);
+        group = NULL;
+    }
+    if (!group) {
+        group = cap_im_tg_media_group_take_slot();
+        strlcpy(group->media_group_id, media_group_id, sizeof(group->media_group_id));
+        strlcpy(group->chat_id, chat_id, sizeof(group->chat_id));
+        strlcpy(group->sender_id, sender_id, sizeof(group->sender_id));
+        strlcpy(group->message_id, message_id, sizeof(group->message_id));
+    }
+
+    item = &group->items[group->item_count++];
+    strlcpy(item->path, saved_path, sizeof(item->path));
+    strlcpy(item->kind, attachment_kind, sizeof(item->kind));
+    strlcpy(item->caption, caption ? caption : "", sizeof(item->caption));
+    group->last_seen_ms = cap_im_tg_now_ms();
+    return true;
+}
+
 static void cap_im_tg_log_stack_watermark(const char *label)
 {
     UBaseType_t words = uxTaskGetStackHighWaterMark(NULL);
@@ -317,6 +486,7 @@ static void cap_im_tg_free_attachment_job(cap_im_tg_attachment_job_t *job)
     free(job->mime);
     free(job->caption);
     free(job->content_type);
+    free(job->media_group_id);
     free(job);
 }
 
@@ -334,7 +504,8 @@ static cap_im_tg_attachment_job_t *cap_im_tg_make_attachment_job(
     const char *original_filename,
     const char *mime,
     const char *caption,
-    const char *content_type)
+    const char *content_type,
+    const char *media_group_id)
 {
     cap_im_tg_attachment_job_t *job = calloc(1, sizeof(*job));
 
@@ -351,9 +522,10 @@ static cap_im_tg_attachment_job_t *cap_im_tg_make_attachment_job(
     job->mime = cap_im_tg_strdup_or_empty(mime);
     job->caption = cap_im_tg_strdup_or_empty(caption);
     job->content_type = cap_im_tg_strdup_or_empty(content_type);
+    job->media_group_id = cap_im_tg_strdup_or_empty(media_group_id);
     if (!job->chat_id || !job->sender_id || !job->message_id || !job->attachment_kind ||
             !job->file_id || !job->original_filename || !job->mime || !job->caption ||
-            !job->content_type) {
+            !job->content_type || !job->media_group_id) {
         cap_im_tg_free_attachment_job(job);
         return NULL;
     }
@@ -422,7 +594,8 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                            const char *original_filename,
                                            const char *mime,
                                            const char *caption,
-                                           const char *content_type)
+                                           const char *content_type,
+                                           const char *media_group_id)
 {
     char saved_dir[CAP_IM_TG_PATH_BUF_SIZE];
     char saved_name[CAP_IM_TG_NAME_BUF_SIZE];
@@ -432,6 +605,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     const char *extension = NULL;
     size_t bytes = 0;
     char *payload_json = NULL;
+    bool grouped = false;
     esp_err_t err;
 
     if (!s_tg.enable_inbound_attachments || !s_tg.attachment_root_dir[0] ||
@@ -472,6 +646,31 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     if (err != ESP_OK) {
         free(remote_path);
         return err;
+    }
+    cap_im_attachment_prune_inbox(TAG, s_tg.attachment_root_dir, "telegram", saved_path);
+
+    grouped = media_group_id && media_group_id[0] &&
+              cap_im_tg_media_group_add(media_group_id,
+                                        chat_id,
+                                        sender_id,
+                                        message_id,
+                                        attachment_kind,
+                                        saved_path,
+                                        caption);
+    if (!grouped && caption && caption[0]) {
+        size_t content_len = strlen(caption) + strlen(saved_path) + 64;
+        char *content = malloc(content_len);
+
+        if (content) {
+            snprintf(content, content_len, "%s\n[Telegram %s saved at: %s]",
+                     caption, attachment_kind, saved_path);
+            err = cap_im_tg_publish_inbound_text(chat_id, sender_id, message_id, content);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Telegram attachment caption publish failed: message=%s err=%s",
+                         message_id, esp_err_to_name(err));
+            }
+            free(content);
+        }
     }
 
     payload_json = cap_im_attachment_build_payload_json(
@@ -523,6 +722,8 @@ static void cap_im_tg_attachment_task(void *arg)
     (void)arg;
 
     while (1) {
+        cap_im_tg_media_group_flush_expired();
+
         if (xQueueReceive(s_tg.attachment_queue, &job, pdMS_TO_TICKS(200)) == pdTRUE) {
             if (job) {
                 esp_err_t err = cap_im_tg_save_attachment(job->chat_id,
@@ -533,7 +734,8 @@ static void cap_im_tg_attachment_task(void *arg)
                                                           job->original_filename,
                                                           job->mime,
                                                           job->caption,
-                                                          job->content_type);
+                                                          job->content_type,
+                                                          job->media_group_id);
                 if (err != ESP_OK) {
                     ESP_LOGW(TAG,
                              "Failed to save Telegram %s message=%s err=%s",
@@ -564,7 +766,8 @@ static void cap_im_tg_queue_attachment(const char *chat_id,
                                        const char *original_filename,
                                        const char *mime,
                                        const char *caption,
-                                       const char *content_type)
+                                       const char *content_type,
+                                       const char *media_group_id)
 {
     cap_im_tg_attachment_job_t *job = NULL;
 
@@ -580,7 +783,8 @@ static void cap_im_tg_queue_attachment(const char *chat_id,
                                         original_filename,
                                         mime,
                                         caption,
-                                        content_type);
+                                        content_type,
+                                        media_group_id);
     if (!job) {
         ESP_LOGW(TAG, "Telegram attachment queue alloc failed message=%s", message_id);
         return;
@@ -638,6 +842,7 @@ static void cap_im_tg_handle_update(cJSON *update_json)
     cJSON *document_json;
     cJSON *photo_json;
     const char *caption = NULL;
+    const char *media_group_id = NULL;
     char update_key[32];
     char chat_id[32];
     char sender_id[32];
@@ -686,6 +891,7 @@ static void cap_im_tg_handle_update(cJSON *update_json)
     snprintf(message_id, sizeof(message_id), "%" PRId64, (int64_t)message_id_json->valuedouble);
 
     caption = cJSON_GetStringValue(cJSON_GetObjectItem(message_json, "caption"));
+    media_group_id = cJSON_GetStringValue(cJSON_GetObjectItem(message_json, "media_group_id"));
     photo_json = cap_im_tg_select_best_photo(message_json);
     if (s_tg.enable_inbound_attachments && photo_json) {
         const char *file_id = cJSON_GetStringValue(cJSON_GetObjectItem(photo_json, "file_id"));
@@ -701,7 +907,8 @@ static void cap_im_tg_handle_update(cJSON *update_json)
                                        "photo.jpg",
                                        "image/jpeg",
                                        caption,
-                                       "image");
+                                       "image",
+                                       media_group_id);
         }
     }
 
@@ -726,7 +933,8 @@ static void cap_im_tg_handle_update(cJSON *update_json)
                                        file_name,
                                        mime,
                                        caption,
-                                       "file");
+                                       "file",
+                                       media_group_id);
         }
     }
 

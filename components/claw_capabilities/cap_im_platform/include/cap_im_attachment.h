@@ -58,6 +58,10 @@ esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
                                                 const char *dest_path,
                                                 const unsigned char *buf,
                                                 size_t buf_len);
+void cap_im_attachment_prune_inbox(const char *log_tag,
+                                   const char *root_dir,
+                                   const char *platform_dir,
+                                   const char *keep_path);
 char *cap_im_attachment_build_payload_json(
     const cap_im_attachment_payload_config_t *config);
 
