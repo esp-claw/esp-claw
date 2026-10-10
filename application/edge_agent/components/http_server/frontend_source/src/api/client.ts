@@ -28,6 +28,7 @@ export type AppConfig = {
   feishu_app_id: string;
   feishu_app_secret: string;
   tg_bot_token: string;
+  tg_allowed_user_ids: string;
   wechat_token: string;
   wechat_base_url: string;
   wechat_cdn_base_url: string;
@@ -68,6 +69,7 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
     'feishu_app_id',
     'feishu_app_secret',
     'tg_bot_token',
+    'tg_allowed_user_ids',
     'wechat_token',
     'wechat_base_url',
     'wechat_cdn_base_url',

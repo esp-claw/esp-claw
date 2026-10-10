@@ -28,21 +28,32 @@
     sizeof(((app_config_t *)0)->field) \
 }
 
+/* Secret fields are masked in GET; posting the mask back keeps the stored value. */
+#define CONFIG_SECRET_FIELD(group, field) { \
+    #field, (group), \
+    offsetof(app_config_t, field), \
+    sizeof(((app_config_t *)0)->field), \
+    true \
+}
+
+#define CONFIG_SECRET_MASK "********"
+
 typedef struct {
     const char *name;
     const char *group;
     size_t offset;
     size_t size;
+    bool secret;
 } config_field_def_t;
 
 static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("wifi",         wifi_ssid),
-    CONFIG_FIELD("wifi",         wifi_password),
+    CONFIG_SECRET_FIELD("wifi",  wifi_password),
     CONFIG_FIELD("wifi",         ap_ssid),
-    CONFIG_FIELD("wifi",         ap_password),
+    CONFIG_SECRET_FIELD("wifi",  ap_password),
     CONFIG_FIELD("wifi",         ap_behavior),
 
-    CONFIG_FIELD("llm",          llm_api_key),
+    CONFIG_SECRET_FIELD("llm",   llm_api_key),
     CONFIG_FIELD("llm",          llm_backend_type),
     CONFIG_FIELD("llm",          llm_model),
     CONFIG_FIELD("llm",          llm_base_url),
@@ -56,18 +67,19 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("llm",          llm_image_remote_url_only),
 
     CONFIG_FIELD("im",           qq_app_id),
-    CONFIG_FIELD("im",           qq_app_secret),
+    CONFIG_SECRET_FIELD("im",    qq_app_secret),
     CONFIG_FIELD("im",           qq_msg_type),
     CONFIG_FIELD("im",           feishu_app_id),
-    CONFIG_FIELD("im",           feishu_app_secret),
-    CONFIG_FIELD("im",           tg_bot_token),
-    CONFIG_FIELD("im",           wechat_token),
+    CONFIG_SECRET_FIELD("im",    feishu_app_secret),
+    CONFIG_SECRET_FIELD("im",    tg_bot_token),
+    CONFIG_FIELD("im",           tg_allowed_user_ids),
+    CONFIG_SECRET_FIELD("im",    wechat_token),
     CONFIG_FIELD("im",           wechat_base_url),
     CONFIG_FIELD("im",           wechat_cdn_base_url),
     CONFIG_FIELD("im",           wechat_account_id),
 
-    CONFIG_FIELD("search",       search_brave_key),
-    CONFIG_FIELD("search",       search_tavily_key),
+    CONFIG_SECRET_FIELD("search", search_brave_key),
+    CONFIG_SECRET_FIELD("search", search_tavily_key),
     CONFIG_FIELD("search",       search_http_allowlist),
 
     CONFIG_FIELD("capabilities", enabled_cap_groups),
@@ -195,7 +207,11 @@ static esp_err_t emit_config(httpd_req_t *req,
         if (!field_matches_filter(field, groups_csv, fields_csv)) {
             continue;
         }
-        http_server_json_add_string(root, field->name, field_value(config, field));
+        const char *value = field_value(config, field);
+        if (field->secret && value[0]) {
+            value = CONFIG_SECRET_MASK;
+        }
+        http_server_json_add_string(root, field->name, value);
     }
 
     if (extra_meta) {
@@ -321,6 +337,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         const config_field_def_t *field = &CONFIG_FIELDS[i];
         cJSON *item = cJSON_GetObjectItemCaseSensitive(root, field->name);
         if (!cJSON_IsString(item)) {
+            continue;
+        }
+        if (field->secret && strcmp(item->valuestring, CONFIG_SECRET_MASK) == 0) {
+            /* Masked value echoed back by the WebUI: keep the stored secret. */
+            applied_count++;
             continue;
         }
         if (strcmp(field->name, "llm_max_tokens") == 0 ||

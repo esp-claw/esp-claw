@@ -48,6 +48,7 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_MEDIA_GROUP_ID_LEN     32
 #define CAP_IM_TG_MEDIA_KIND_LEN         16
 #define CAP_IM_TG_MEDIA_CAPTION_LEN      256
+#define CAP_IM_TG_MAX_ALLOWED_USERS      16
 
 typedef struct {
     char *buf;
@@ -105,6 +106,8 @@ typedef struct {
     uint64_t seen_update_keys[CAP_IM_TG_DEDUP_CACHE_SIZE];
     size_t seen_update_idx;
     cap_im_tg_media_group_t media_groups[CAP_IM_TG_MEDIA_GROUP_MAX_GROUPS];
+    int64_t allowed_user_ids[CAP_IM_TG_MAX_ALLOWED_USERS];
+    size_t allowed_user_count;
 } cap_im_tg_state_t;
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
@@ -835,6 +838,16 @@ static void cap_im_tg_send_typing(const char *chat_id)
     }
 }
 
+static bool cap_im_tg_user_allowed(int64_t user_id)
+{
+    for (size_t i = 0; i < s_tg.allowed_user_count; i++) {
+        if (s_tg.allowed_user_ids[i] == user_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void cap_im_tg_handle_update(cJSON *update_json)
 {
     cJSON *update_id_json;
@@ -893,6 +906,13 @@ static void cap_im_tg_handle_update(cJSON *update_json)
         snprintf(sender_id, sizeof(sender_id), "%" PRId64, (int64_t)from_id_json->valuedouble);
     } else {
         sender_id[0] = '\0';
+    }
+    /* Gate before any download, typing indicator or publish. */
+    if (!cJSON_IsNumber(from_id_json) ||
+            !cap_im_tg_user_allowed((int64_t)from_id_json->valuedouble)) {
+        ESP_LOGW(TAG, "Telegram update dropped, sender not allowed: user=%s chat=%s",
+                 sender_id[0] ? sender_id : "(none)", chat_id);
+        return;
     }
     snprintf(message_id, sizeof(message_id), "%" PRId64, (int64_t)message_id_json->valuedouble);
 
@@ -1712,6 +1732,11 @@ static esp_err_t cap_im_tg_gateway_start(void)
     if (s_tg.poll_task) {
         return ESP_OK;
     }
+    if (s_tg.allowed_user_count == 0) {
+        ESP_LOGW(TAG, "tg_allowed_user_ids empty: all Telegram messages will be ignored");
+    } else {
+        ESP_LOGI(TAG, "Telegram allowlist: %u user(s)", (unsigned)s_tg.allowed_user_count);
+    }
 
     s_tg.stop_requested = false;
     if (!s_tg.attachment_queue) {
@@ -1998,6 +2023,50 @@ esp_err_t cap_im_tg_set_token(const char *bot_token)
     s_tg.next_update_id = 0;
     memset(s_tg.seen_update_keys, 0, sizeof(s_tg.seen_update_keys));
     s_tg.seen_update_idx = 0;
+    return ESP_OK;
+}
+
+esp_err_t cap_im_tg_set_allowed_user_ids(const char *user_ids_csv)
+{
+    const char *cursor = user_ids_csv;
+
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!user_ids_csv) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_tg.allowed_user_count = 0;
+    while (*cursor) {
+        char *end = NULL;
+        long long id;
+
+        while (*cursor == ',' || isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+
+        errno = 0;
+        id = strtoll(cursor, &end, 10);
+        if (end == cursor || errno == ERANGE || id <= 0 ||
+                (*end && *end != ',' && !isspace((unsigned char)*end))) {
+            ESP_LOGW(TAG, "Ignoring invalid entry in tg_allowed_user_ids");
+            cursor += strcspn(cursor, ",");
+            continue;
+        }
+        if (s_tg.allowed_user_count >= CAP_IM_TG_MAX_ALLOWED_USERS) {
+            ESP_LOGW(TAG, "tg_allowed_user_ids exceeds %d entries, ignoring the rest",
+                     CAP_IM_TG_MAX_ALLOWED_USERS);
+            break;
+        }
+        s_tg.allowed_user_ids[s_tg.allowed_user_count++] = (int64_t)id;
+        cursor = end;
+    }
+
     return ESP_OK;
 }
 

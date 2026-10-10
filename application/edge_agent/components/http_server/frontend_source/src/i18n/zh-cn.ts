@@ -159,6 +159,8 @@ export const zhCn: Dict = {
   feishuAppId: '飞书 App ID',
   feishuAppSecret: '飞书 App Secret',
   tgBotToken: 'Telegram Bot Token',
+  tgAllowedUserIds: '允许的 Telegram 用户 ID',
+  tgAllowedUserIdsHint: '以逗号分隔的数字用户 ID。其他用户的消息将被忽略；留空则忽略所有消息。',
   wechatToken: '微信 Token',
   wechatBaseUrl: '微信 Base URL',
   wechatBaseUrlPlaceholder: 'https://ilinkai.weixin.qq.com',

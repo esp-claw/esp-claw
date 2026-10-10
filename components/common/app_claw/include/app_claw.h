@@ -42,6 +42,7 @@ typedef struct {
     char feishu_app_id[APP_CLAW_MODEL_LEN];
     char feishu_app_secret[APP_CLAW_STR_LEN];
     char tg_bot_token[APP_CLAW_STR_LEN];
+    char tg_allowed_user_ids[APP_CLAW_STR_LEN];
     char wechat_token[APP_CLAW_STR_LEN];
     char wechat_base_url[APP_CLAW_STR_LEN];
     char wechat_cdn_base_url[APP_CLAW_STR_LEN];

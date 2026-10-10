@@ -33,6 +33,7 @@ type ImForm = {
   feishu_app_id: string;
   feishu_app_secret: string;
   tg_bot_token: string;
+  tg_allowed_user_ids: string;
 };
 
 /* ── Shared styles ──────────────────────────────────────────────────── */
@@ -351,6 +352,7 @@ export const ImPage: Component = () => {
       feishu_app_id: config.feishu_app_id ?? '',
       feishu_app_secret: config.feishu_app_secret ?? '',
       tg_bot_token: config.tg_bot_token ?? '',
+      tg_allowed_user_ids: config.tg_allowed_user_ids ?? '',
     }),
     fromForm: (form) => ({
       wechat_token: form.wechat_token,
@@ -363,6 +365,7 @@ export const ImPage: Component = () => {
       feishu_app_id: form.feishu_app_id.trim(),
       feishu_app_secret: form.feishu_app_secret,
       tg_bot_token: form.tg_bot_token.trim(),
+      tg_allowed_user_ids: form.tg_allowed_user_ids.trim(),
     }),
   });
   const [validationError, setValidationError] = createSignal<string | null>(null);
@@ -378,6 +381,7 @@ export const ImPage: Component = () => {
     void tab.form.feishu_app_id;
     void tab.form.feishu_app_secret;
     void tab.form.tg_bot_token;
+    void tab.form.tg_allowed_user_ids;
     setValidationError(null);
   });
 
@@ -583,13 +587,21 @@ export const ImPage: Component = () => {
           onToggle={() => toggle('telegram')}
           onDelete={() => clearPlatform('telegram', ['tg_bot_token'], setField)}
         >
-          <div class="pt-2">
+          <div class="grid gap-3 pt-2">
             <TextInput
               full
               type="password"
               label={t('tgBotToken')}
               value={tab.form.tg_bot_token}
               onInput={(e) => tab.setForm('tg_bot_token', e.currentTarget.value)}
+            />
+            <TextInput
+              full
+              label={t('tgAllowedUserIds')}
+              hint={t('tgAllowedUserIdsHint')}
+              placeholder="123456789,987654321"
+              value={tab.form.tg_allowed_user_ids}
+              onInput={(e) => tab.setForm('tg_allowed_user_ids', e.currentTarget.value)}
             />
           </div>
         </PlatformRow>
