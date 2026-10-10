@@ -36,6 +36,8 @@ typedef struct {
     SemaphoreHandle_t mutex;
     claw_session_mgr_delete_session_fn_t delete_session;
     void *delete_session_ctx;
+    claw_session_mgr_new_session_fn_t new_session;
+    void *new_session_ctx;
 } claw_session_mgr_state_t;
 
 typedef struct {
@@ -612,6 +614,8 @@ esp_err_t claw_session_mgr_set_session_root_dir(const char *session_root_dir)
     SemaphoreHandle_t mutex = s_session_mgr.mutex;
     claw_session_mgr_delete_session_fn_t delete_session = s_session_mgr.delete_session;
     void *delete_session_ctx = s_session_mgr.delete_session_ctx;
+    claw_session_mgr_new_session_fn_t new_session = s_session_mgr.new_session;
+    void *new_session_ctx = s_session_mgr.new_session_ctx;
 
     if (!session_root_dir || !session_root_dir[0]) {
         return ESP_ERR_INVALID_ARG;
@@ -621,6 +625,8 @@ esp_err_t claw_session_mgr_set_session_root_dir(const char *session_root_dir)
     s_session_mgr.mutex = mutex;
     s_session_mgr.delete_session = delete_session;
     s_session_mgr.delete_session_ctx = delete_session_ctx;
+    s_session_mgr.new_session = new_session;
+    s_session_mgr.new_session_ctx = new_session_ctx;
     strlcpy(s_session_mgr.session_root_dir, session_root_dir, sizeof(s_session_mgr.session_root_dir));
     written = snprintf(s_session_mgr.mapping_root_dir,
                        sizeof(s_session_mgr.mapping_root_dir),
@@ -663,6 +669,20 @@ esp_err_t claw_session_mgr_set_delete_session_handler(claw_session_mgr_delete_se
     }
     s_session_mgr.delete_session = fn;
     s_session_mgr.delete_session_ctx = user_ctx;
+    if (s_session_mgr.mutex) {
+        xSemaphoreGiveRecursive(s_session_mgr.mutex);
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t claw_session_mgr_set_new_session_handler(claw_session_mgr_new_session_fn_t fn, void *user_ctx)
+{
+    if (s_session_mgr.mutex) {
+        xSemaphoreTakeRecursive(s_session_mgr.mutex, portMAX_DELAY);
+    }
+    s_session_mgr.new_session = fn;
+    s_session_mgr.new_session_ctx = user_ctx;
     if (s_session_mgr.mutex) {
         xSemaphoreGiveRecursive(s_session_mgr.mutex);
     }
@@ -1131,6 +1151,8 @@ esp_err_t claw_session_mgr_new_chat_session(uint32_t agent_id,
     char chat_key[CLAW_SESSION_MGR_KEY_SIZE];
     claw_session_mgr_alias_map_t map;
     char new_alias[CLAW_SESSION_MGR_ALIAS_MAX + 1];
+    claw_session_mgr_new_session_fn_t new_session = NULL;
+    void *new_session_ctx = NULL;
     esp_err_t err;
 
     if (has_requested_alias && !claw_session_mgr_alias_is_valid(requested_alias)) {
@@ -1176,10 +1198,15 @@ esp_err_t claw_session_mgr_new_chat_session(uint32_t agent_id,
         strlcpy(map.current_alias, new_alias, sizeof(map.current_alias));
         err = claw_session_mgr_write_mapping_locked(&map);
     }
+    new_session = s_session_mgr.new_session;
+    new_session_ctx = s_session_mgr.new_session_ctx;
     xSemaphoreGiveRecursive(s_session_mgr.mutex);
 
     if (err == ESP_OK && out_alias && out_alias_size > 0) {
         strlcpy(out_alias, new_alias, out_alias_size);
+    }
+    if (err == ESP_OK && new_session) {
+        new_session(new_session_ctx);
     }
 
     return err;

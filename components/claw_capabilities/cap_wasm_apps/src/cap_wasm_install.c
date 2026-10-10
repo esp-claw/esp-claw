@@ -35,7 +35,7 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_HTTP_MS       30000
 #define CAP_WASM_CONFIRM_MS    120000
 #define CAP_WASM_JOB_STACK     (12 * 1024)
-#define CAP_WASM_OUTPUT_MAX    1024
+#define CAP_WASM_OUTPUT_MAX    2048
 #define CAP_WASM_MAX_REDIRECTS 5
 
 atomic_flag g_cap_wasm_busy = ATOMIC_FLAG_INIT;
@@ -163,47 +163,41 @@ esp_err_t cap_wasm_stream(const char *url, cap_wasm_sink_t sink, void *ctx, char
     return cap_wasm_fetch(url, &dl, err, err_size);
 }
 
-/* Version from <apps>/<name>/manifest.json into `out` ("" when not installed or unreadable). */
-static void cap_wasm_installed_version(const char *name, char out[CAP_WASM_VERSION_MAX + 1])
+bool cap_wasm_installed_manifest(const char *name, cap_wasm_manifest_t *mf)
 {
     char path[96];
     char err[96];
     size_t size = 0;
     char *json;
-    cap_wasm_manifest_t mf;
+    bool ok;
 
     snprintf(path, sizeof(path), "%s/%s/manifest.json", g_cap_wasm_apps_dir, name);
     json = cap_wasm_read_file(path, CAP_WASM_MANIFEST_MAX, &size);
-    out[0] = '\0';
-    if (json && cap_wasm_manifest_parse(json, name, &mf, err, sizeof(err))) {
-        strcpy(out, mf.version);
-    }
+    ok = json && cap_wasm_manifest_parse(json, name, mf, err, sizeof(err));
     heap_caps_free(json);
+    return ok;
 }
 
-/* Where `name` was installed from, per index.json ("" when unknown). */
-static void cap_wasm_source_url(const char *name, char out[CAP_WASM_URL_MAX])
+static bool cap_wasm_release_sink(void *ctx, const uint8_t *data, size_t len)
 {
-    char path[96];
-    size_t size = 0;
-    char *json;
-    cJSON *root;
-    const cJSON *item = NULL;
+    cap_wasm_rel_scan_feed(ctx, (const char *)data, len);
+    return true;
+}
 
-    snprintf(path, sizeof(path), "%s/index.json", g_cap_wasm_apps_dir);
-    json = cap_wasm_read_file(path, 16 * 1024, &size);
-    root = json ? cJSON_Parse(json) : NULL;
-    heap_caps_free(json);
-    out[0] = '\0';
-    cJSON_ArrayForEach(item, cJSON_GetObjectItem(root, "apps")) {
-        const char *item_name = cJSON_GetStringValue(cJSON_GetObjectItem(item, "name"));
-        const char *source = cJSON_GetStringValue(cJSON_GetObjectItem(item, "source"));
+bool cap_wasm_release_latest(const char *repo, cap_wasm_rel_scan_t *scan, char *err, size_t err_size)
+{
+    char url[CAP_WASM_GH_REPO_MAX + 48];
 
-        if (item_name && source && strcmp(item_name, name) == 0) {
-            strlcpy(out, source, CAP_WASM_URL_MAX);
-        }
+    snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases/latest", repo);
+    if (cap_wasm_stream(url, cap_wasm_release_sink, scan, err, err_size) == ESP_OK) {
+        return true;
     }
-    cJSON_Delete(root);
+    if (strstr(err, "HTTP 403")) {
+        snprintf(err, err_size, "GitHub API rate limit reached (HTTP 403), try again later");
+    } else if (strstr(err, "HTTP 404")) {
+        snprintf(err, err_size, "github.com/%s has no release (HTTP 404)", repo);
+    }
+    return false;
 }
 
 static size_t cap_wasm_html_escape(char *dst, size_t size, const char *src)
@@ -249,34 +243,6 @@ esp_err_t cap_wasm_ask(const char *chat, char *html, size_t html_size, const cha
 #endif
 }
 
-static void cap_wasm_describe_perms(const cap_wasm_manifest_t *mf, char *out, size_t size)
-{
-    static const struct {
-        uint32_t perm;
-        const char *name;
-    } names[] = {
-        {CAP_WASM_PERM_LOG, "log"},
-        {CAP_WASM_PERM_KV, "kv"},
-        {CAP_WASM_PERM_CONFIRM, "confirm"},
-        {CAP_WASM_PERM_PING, "ping"},
-    };
-    size_t len = 0;
-
-    out[0] = '\0';
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        if (mf->perms & names[i].perm) {
-            len += snprintf(out + len, len < size ? size - len : 0, "%s%s", len ? ", " : "", names[i].name);
-        }
-    }
-    for (uint32_t i = 0; i < mf->http_profile_count; i++) {
-        len += snprintf(out + len, len < size ? size - len : 0, "%s%s%s", len ? ", " : "", i ? "" : "http: ",
-                        mf->http_profiles[i]);
-    }
-    if (!len) {
-        snprintf(out, size, "keine");
-    }
-}
-
 /* Writes the package entries to <apps>/<name>.new/. */
 static bool cap_wasm_stage(const char *name, const cap_wasm_pkg_t *pkg)
 {
@@ -306,15 +272,13 @@ static bool cap_wasm_stage(const char *name, const cap_wasm_pkg_t *pkg)
     return true;
 }
 
-esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
+esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force, bool confirmed,
                            const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
     const char *chat = cap_im_tg_confirm_chat(ctx);
     const size_t html_size = 1536;
-    char source[CAP_WASM_URL_MAX];
-    char installed[CAP_WASM_VERSION_MAX + 1];
     char key_id[CAP_WASM_KEY_ID_LEN + 1];
-    char perms[160];
+    char perms[320];
     char err[128];
     char *manifest = NULL;
     char *sig = NULL;
@@ -322,17 +286,16 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     uint8_t *buf = NULL;
     size_t len = 0;
     cap_wasm_manifest_t mf;
+    cap_wasm_manifest_t old;
     cap_wasm_pkg_t pkg;
     esp_err_t ret = ESP_FAIL;
+    bool installed;
+    bool added;
     int cmp = 0;
 
     if (!chat) {
         snprintf(output, output_size, "Error: installing needs a confirmation in a Telegram chat");
         return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (expect_name && !url[0]) {
-        cap_wasm_source_url(expect_name, source);
-        url = source;
     }
     if (strncmp(url, "https://", 8) != 0 || strlen(url) >= CAP_WASM_URL_MAX) {
         snprintf(output, output_size, "Error: %s", expect_name && !url[0] ?
@@ -373,23 +336,28 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
         snprintf(output, output_size, "Error: the package contains app '%s', not '%s'", mf.name, expect_name);
         goto done;
     }
-    cap_wasm_installed_version(mf.name, installed);
-    if (installed[0] && cap_wasm_version_cmp(mf.version, installed, &cmp) && cmp < 0 && !force) {
+    installed = cap_wasm_installed_manifest(mf.name, &old);
+    if (installed && cap_wasm_version_cmp(mf.version, old.version, &cmp) && cmp < 0 && !force) {
         snprintf(output, output_size, "Error: %s %s is older than the installed %s; /app install --force <url> "
-                 "downgrades", mf.name, mf.version, installed);
+                 "downgrades", mf.name, mf.version, old.version);
         goto done;
     }
 
-    cap_wasm_describe_perms(&mf, perms, sizeof(perms));
-    len = (size_t)snprintf(html, html_size, "<b>WASM-App installieren?</b>\n<b>%s</b> %s (%s%s)%s\n", mf.name,
-                           mf.version, installed[0] ? "installiert: " : "neu", installed,
-                           installed[0] && cmp < 0 ? " ⚠️ Downgrade" : "");
+    added = cap_wasm_perms_describe(&mf, installed ? &old : NULL, perms, sizeof(perms));
+    if (installed) {
+        len = (size_t)snprintf(html, html_size, "<b>WASM-App aktualisieren?</b>\n<b>%s</b> %s → %s%s\n", mf.name,
+                               old.version, mf.version, cmp < 0 ? " ⚠️ Downgrade" : "");
+    } else {
+        len = (size_t)snprintf(html, html_size, "<b>WASM-App installieren?</b>\n<b>%s</b> %s (neu)\n", mf.name,
+                               mf.version);
+    }
     len += cap_wasm_html_escape(html + len, html_size - len, mf.description);
     snprintf(html + len, html_size - len, "\nRechte: %s\nLimits: %u KB Speicher, %u ms pro Aufruf\n"
              "Signiert: Schlüssel <code>%s</code>, app.wasm %u Bytes", perms, (unsigned)mf.memory_kb,
              (unsigned)mf.call_timeout_ms, key_id, (unsigned)pkg.wasm.len);
     cap_im_tg_confirm_note(ctx, html, html_size);
-    ret = cap_wasm_ask(chat, html, html_size, "✅ Installieren");
+    /* An update confirmed in a list (/app update all) is asked again only for new permissions. */
+    ret = confirmed && installed && !added && cmp >= 0 ? ESP_OK : cap_wasm_ask(chat, html, html_size, "✅ Installieren");
     if (ret != ESP_OK) {
         snprintf(output, output_size, "Not installed: %s", ret == ESP_ERR_TIMEOUT ? "the confirmation timed out" :
                  ret == ESP_ERR_INVALID_STATE ? "cancelled by the user" : esp_err_to_name(ret));
@@ -400,7 +368,7 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
         ret = ESP_FAIL;
         goto done;
     }
-    ESP_LOGI(TAG, "installing %s %s (key %s, was %s)", mf.name, mf.version, key_id, installed[0] ? installed : "-");
+    ESP_LOGI(TAG, "installing %s %s (key %s, was %s)", mf.name, mf.version, key_id, installed ? old.version : "-");
     ret = cap_wasm_admin(CAP_WASM_REQ_INSTALL, mf.name, url, output, output_size);
 
 done:
@@ -415,7 +383,7 @@ done:
 esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
     const char *chat = cap_im_tg_confirm_chat(ctx);
-    char installed[CAP_WASM_VERSION_MAX + 1];
+    cap_wasm_manifest_t mf;
     char html[320];
     esp_err_t ret;
 
@@ -427,9 +395,8 @@ esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, 
         snprintf(output, output_size, "Error: invalid app name");
         return ESP_ERR_INVALID_ARG;
     }
-    cap_wasm_installed_version(name, installed);
     snprintf(html, sizeof(html), "<b>WASM-App entfernen?</b>\n<b>%s</b> %s\nLöscht die App und ihre gespeicherten Daten.",
-             name, installed[0] ? installed : "(ohne gültiges Manifest)");
+             name, cap_wasm_installed_manifest(name, &mf) ? mf.version : "(ohne gültiges Manifest)");
     cap_im_tg_confirm_note(ctx, html, sizeof(html));
     ret = cap_wasm_ask(chat, html, sizeof(html), "🗑 Entfernen");
     if (ret != ESP_OK) {
@@ -468,13 +435,19 @@ static void cap_wasm_job_task(void *arg)
     } else if (strcmp(verb, "fw") == 0) {
         cap_wasm_fw_command(job->command + 2, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "install") == 0) {
-        cap_wasm_install(force ? b : a, NULL, force, &ctx, output, CAP_WASM_OUTPUT_MAX);
+        cap_wasm_install(force ? b : a, NULL, force, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
+    } else if (strcmp(verb, "updates") == 0) {
+        cap_wasm_check_updates(output, CAP_WASM_OUTPUT_MAX);
+    } else if (strcmp(verb, "update") == 0 && strcmp(a, "all") == 0) {
+        cap_wasm_update_all(&ctx, output, CAP_WASM_OUTPUT_MAX);
+    } else if (strcmp(verb, "update") == 0 && b[0]) {
+        cap_wasm_install(b, a, false, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "update") == 0 && a[0]) {
-        cap_wasm_install(b, a, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
+        cap_wasm_update(a, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "remove") == 0 && a[0]) {
         cap_wasm_remove(a, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else {
-        snprintf(output, CAP_WASM_OUTPUT_MAX, "Usage: /app install [--force] <https-url> | update <name> [url] | "
+        snprintf(output, CAP_WASM_OUTPUT_MAX, "Usage: /app install [--force] <https-url> | updates | update <name>|all [url] | "
                  "remove <name>");
     }
     if (output && cap_im_tg_send_text(job->chat_id, output) != ESP_OK) {

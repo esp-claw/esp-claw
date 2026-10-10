@@ -99,6 +99,7 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_SECRET_FIELD("capabilities", api_profiles),
     CONFIG_FIELD("capabilities", app_trusted_keys),
     CONFIG_FIELD("capabilities", app_allow_unsigned),
+    CONFIG_FIELD("capabilities", update_check_time),
 
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
@@ -198,6 +199,14 @@ static bool is_boolean_string(const char *value)
             strcmp(value, "false") == 0 ||
             strcmp(value, "1") == 0 ||
             strcmp(value, "0") == 0);
+}
+
+/* "HH:MM", 24-hour clock. */
+static bool is_time_of_day_string(const char *value)
+{
+    return strlen(value) == 5 && isdigit((unsigned char)value[0]) && isdigit((unsigned char)value[1]) &&
+           value[2] == ':' && isdigit((unsigned char)value[3]) && isdigit((unsigned char)value[4]) &&
+           atoi(value) < 24 && atoi(value + 3) < 60;
 }
 
 /* app_trusted_keys: "" or a JSON array of base64 raw 32-byte Ed25519 public keys. */
@@ -404,6 +413,13 @@ static esp_err_t config_post_handler(httpd_req_t *req)
             return httpd_resp_send_err(req,
                                        HTTPD_400_BAD_REQUEST,
                                        "Boolean fields must be true/false");
+        }
+        if (strcmp(field->name, "update_check_time") == 0 && item->valuestring[0] &&
+                !is_time_of_day_string(item->valuestring)) {
+            cJSON_Delete(root);
+            free(config);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "update_check_time must be HH:MM (24-hour) or empty");
         }
         if (strcmp(field->name, "app_trusted_keys") == 0 && item->valuestring[0] &&
                 !is_trusted_keys_json(item->valuestring, field->size)) {

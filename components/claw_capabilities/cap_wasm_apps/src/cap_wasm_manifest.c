@@ -224,6 +224,72 @@ bool cap_wasm_manifest_allows_profile(const cap_wasm_manifest_t *mf, const char 
     return false;
 }
 
+static const struct {
+    uint32_t perm;
+    const char *name;
+} s_perm_names[] = {
+    {CAP_WASM_PERM_LOG, "log"},
+    {CAP_WASM_PERM_KV, "kv"},
+    {CAP_WASM_PERM_CONFIRM, "confirm"},
+    {CAP_WASM_PERM_PING, "ping"},
+};
+#define PERM_NAME_COUNT (sizeof(s_perm_names) / sizeof(s_perm_names[0]))
+
+/* Permission `i` of `mf` ("" when that flag is not set); false past the last one. */
+static bool perm_at(const cap_wasm_manifest_t *mf, size_t i, char *out, size_t size)
+{
+    if (i < PERM_NAME_COUNT) {
+        snprintf(out, size, "%s", mf->perms & s_perm_names[i].perm ? s_perm_names[i].name : "");
+        return true;
+    }
+    if (i - PERM_NAME_COUNT >= mf->http_profile_count) {
+        return false;
+    }
+    snprintf(out, size, "http: %s", mf->http_profiles[i - PERM_NAME_COUNT]);
+    return true;
+}
+
+static bool perm_has(const cap_wasm_manifest_t *mf, const char *perm)
+{
+    char item[CAP_WASM_PROFILE_NAME_MAX + 8];
+
+    for (size_t i = 0; perm_at(mf, i, item, sizeof(item)); i++) {
+        if (item[0] && strcmp(item, perm) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cap_wasm_perms_describe(const cap_wasm_manifest_t *mf, const cap_wasm_manifest_t *old, char *out, size_t size)
+{
+    char item[CAP_WASM_PROFILE_NAME_MAX + 8];
+    bool added_any = false;
+    bool removed_any = false;
+    size_t len = 0;
+
+    out[0] = '\0';
+    for (size_t i = 0; perm_at(mf, i, item, sizeof(item)) && len < size; i++) {
+        bool added = item[0] && (!old || !perm_has(old, item));
+
+        if (item[0]) {
+            len += snprintf(out + len, size - len, "%s%s%s%s", len ? ", " : "", added && old ? "<b>+" : "", item,
+                            added && old ? "</b>" : "");
+            added_any |= added;
+        }
+    }
+    if (!len) {
+        len = snprintf(out, size, "keine");
+    }
+    for (size_t i = 0; old && perm_at(old, i, item, sizeof(item)) && len < size; i++) {
+        if (item[0] && !perm_has(mf, item)) {
+            len += snprintf(out + len, size - len, "%s<s>%s</s>", removed_any ? ", " : "; entfernt: ", item);
+            removed_any = true;
+        }
+    }
+    return added_any;
+}
+
 void cap_wasm_utf8_sanitize(char *text, size_t len)
 {
     size_t i = 0;

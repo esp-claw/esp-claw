@@ -24,6 +24,20 @@ extern "C" {
 void cap_wasm_apps_set_trust(const char *trusted_keys_json, bool allow_unsigned);
 
 /**
+ * @brief  Set the local time ("HH:MM", update_check_time) of the daily check for firmware and app
+ *         updates, which tells the allowed Telegram users about new ones; it also runs once per
+ *         boot and on cap_wasm_updates_kick(). "" or an invalid value turns all of them off. Call
+ *         before cap_wasm_apps_register_group().
+ */
+void cap_wasm_apps_set_update_check(const char *hhmm);
+
+/**
+ * @brief  Start the update check in the background (e.g. when a chat session starts), unless
+ *         checks are off, one is running or one ran within the last hour. Does not block.
+ */
+void cap_wasm_updates_kick(void);
+
+/**
  * @brief  Start the WASM app runtime and register the tools of every enabled, validly signed
  *         app in <base_path>/apps/<name>/ in the "cap_wasm_apps" group (apps load on their first
  *         call), plus the management tools and the /apps and /app command handler in

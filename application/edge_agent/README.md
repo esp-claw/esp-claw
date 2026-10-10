@@ -48,6 +48,13 @@ next to it. A new image must have WiFi and Telegram working within 5 minutes and
 otherwise the device rolls back to the previous one. Moving an existing board to this layout
 keeps NVS and `/fatfs`: `tools/migrate_ota_layout.sh -p <port>`.
 
+`/updates` (or `/app updates`, the `apps_check_updates` tool) compares the firmware and every app
+installed from a GitHub release URL with the latest release of its repository; `/app update <name>`
+and `/app update all` (the `apps_update` tool) install them after a confirmation. Every day at
+`update_check_time` (local time, default `09:00`, empty turns it off) the device runs that check
+and tells the allowed Telegram users about new versions, at most once a week per version. It never
+installs anything by itself.
+
 ## Web UI access
 
 The web UI, `/api` and WebDAV are served over HTTPS (port 443) with a self-signed ECDSA certificate

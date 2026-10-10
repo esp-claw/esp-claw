@@ -78,6 +78,7 @@ typedef struct {
 #define APP_DEFAULT_API_PROFILES             ""
 #define APP_DEFAULT_APP_TRUSTED_KEYS         ""
 #define APP_DEFAULT_APP_ALLOW_UNSIGNED       "false"
+#define APP_DEFAULT_UPDATE_CHECK_TIME        "09:00"
 #define APP_DEFAULT_STT_BASE_URL             "https://api.openai.com/v1"
 #define APP_DEFAULT_STT_API_KEY              ""
 #define APP_DEFAULT_STT_MODEL                "gpt-4o-mini-transcribe"
@@ -126,6 +127,7 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_BLOB_FIELD(api_profiles, "api_profiles", "api_profiles_b", APP_DEFAULT_API_PROFILES),
     APP_CONFIG_BLOB_FIELD(app_trusted_keys, "app_trust_keys", "app_trust_k_b", APP_DEFAULT_APP_TRUSTED_KEYS),
     APP_CONFIG_FIELD(app_allow_unsigned, "app_allow_uns", APP_DEFAULT_APP_ALLOW_UNSIGNED),
+    APP_CONFIG_FIELD(update_check_time, "upd_chk_time", APP_DEFAULT_UPDATE_CHECK_TIME),
     APP_CONFIG_FIELD(stt_base_url, "stt_base_url", APP_DEFAULT_STT_BASE_URL),
     APP_CONFIG_FIELD(stt_api_key, "stt_api_key", APP_DEFAULT_STT_API_KEY),
     APP_CONFIG_FIELD(stt_model, "stt_model", APP_DEFAULT_STT_MODEL),
@@ -787,6 +789,7 @@ void app_config_to_claw(const app_config_t *config, app_claw_config_t *out)
     strlcpy(out->api_profiles, config->api_profiles, sizeof(out->api_profiles));
     strlcpy(out->app_trusted_keys, config->app_trusted_keys, sizeof(out->app_trusted_keys));
     strlcpy(out->app_allow_unsigned, config->app_allow_unsigned, sizeof(out->app_allow_unsigned));
+    strlcpy(out->update_check_time, config->update_check_time, sizeof(out->update_check_time));
     strlcpy(out->stt_base_url, config->stt_base_url, sizeof(out->stt_base_url));
     strlcpy(out->stt_api_key, config->stt_api_key, sizeof(out->stt_api_key));
     strlcpy(out->stt_model, config->stt_model, sizeof(out->stt_model));

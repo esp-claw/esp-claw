@@ -625,7 +625,8 @@ static cJSON *cap_im_tg_select_best_photo(cJSON *message_json)
     return selected;
 }
 
-static char *cap_im_tg_get_file_path(const char *file_id)
+/* Resolves file_id via getFile. *out_size gets Telegram's file_size, or 0 when not reported. */
+static char *cap_im_tg_get_file_path(const char *file_id, size_t *out_size)
 {
     char method[256];
     char *resp = NULL;
@@ -633,8 +634,10 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     cJSON *ok_json;
     cJSON *result_json;
     cJSON *file_path_json;
+    cJSON *file_size_json;
     char *copy = NULL;
 
+    *out_size = 0;
     if (!file_id || !file_id[0]) {
         return NULL;
     }
@@ -653,8 +656,12 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     ok_json = cJSON_GetObjectItem(root, "ok");
     result_json = cJSON_GetObjectItem(root, "result");
     file_path_json = cJSON_IsObject(result_json) ? cJSON_GetObjectItem(result_json, "file_path") : NULL;
+    file_size_json = cJSON_IsObject(result_json) ? cJSON_GetObjectItem(result_json, "file_size") : NULL;
     if (cJSON_IsTrue(ok_json) && cJSON_IsString(file_path_json) && file_path_json->valuestring) {
         copy = strdup(file_path_json->valuestring);
+        if (cJSON_IsNumber(file_size_json) && file_size_json->valuedouble > 0) {
+            *out_size = (size_t)file_size_json->valuedouble;
+        }
     }
 
     cJSON_Delete(root);
@@ -690,12 +697,17 @@ static void cap_im_tg_publish_voice_text(const char *chat_id,
     }
 }
 
+/* Transcribes audio and publishes the text (or the failure reason) to the agent. The audio is the
+ * file at path, or len bytes of data named filename when data is set. */
 static void cap_im_tg_transcribe_and_publish(const char *chat_id,
                                              const char *sender_id,
                                              const char *message_id,
                                              const char *caption,
                                              const char *mime,
-                                             const char *path)
+                                             const char *path,
+                                             const uint8_t *data,
+                                             size_t len,
+                                             const char *filename)
 {
     char reason[192];
     char body[256];
@@ -703,15 +715,13 @@ static void cap_im_tg_transcribe_and_publish(const char *chat_id,
     esp_err_t err;
 
     cap_im_tg_busy_show(chat_id, true, 0, "🎙 Transkribiere Sprachnachricht…");
-    err = cap_im_attachment_transcribe_file(TAG,
-                                            s_tg.stt_base_url,
-                                            s_tg.stt_api_key,
-                                            s_tg.stt_model,
-                                            path,
-                                            mime,
-                                            &text,
-                                            reason,
-                                            sizeof(reason));
+    if (data) {
+        err = cap_im_attachment_transcribe_buffer(TAG, s_tg.stt_base_url, s_tg.stt_api_key, s_tg.stt_model,
+                                                  data, len, filename, mime, &text, reason, sizeof(reason));
+    } else {
+        err = cap_im_attachment_transcribe_file(TAG, s_tg.stt_base_url, s_tg.stt_api_key, s_tg.stt_model,
+                                                path, mime, &text, reason, sizeof(reason));
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Telegram voice transcription failed: message=%s err=%s reason=%s",
                  message_id, esp_err_to_name(err), reason);
@@ -724,6 +734,55 @@ static void cap_im_tg_transcribe_and_publish(const char *chat_id,
     cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
                                  text[0] ? text : "(leere Transkription)");
     free(text);
+}
+
+/* Downloads a voice/audio file into PSRAM and transcribes it from there, so voice notes never touch
+ * the flash DATA volume. Returns ESP_ERR_NO_MEM only when the PSRAM buffer could not be allocated,
+ * which lets the caller fall back to the flash path; transcription results and failures are
+ * published to the agent here. */
+static esp_err_t cap_im_tg_transcribe_from_psram(const char *chat_id,
+                                                 const char *sender_id,
+                                                 const char *message_id,
+                                                 const char *original_filename,
+                                                 const char *mime,
+                                                 const char *caption,
+                                                 const char *remote_path,
+                                                 size_t expected_bytes)
+{
+    char *download_url = NULL;
+    char filename[CAP_IM_TG_NAME_BUF_SIZE];
+    uint8_t *data = NULL;
+    size_t len = 0;
+    esp_err_t err;
+
+    download_url = malloc(CAP_IM_TG_PATH_BUF_SIZE);
+    if (!download_url) {
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(download_url, CAP_IM_TG_PATH_BUF_SIZE, "%s/file/bot%s/%s",
+             CAP_IM_TG_API_BASE, s_tg.bot_token, remote_path);
+    err = cap_im_attachment_download_url_to_psram(TAG,
+                                                  download_url,
+                                                  MIN(s_tg.max_inbound_file_bytes, CAP_IM_TG_STT_MAX_BYTES),
+                                                  expected_bytes,
+                                                  &data,
+                                                  &len);
+    free(download_url);
+    if (err != ESP_OK) {
+        return err;
+    }
+    ESP_LOGI(TAG, "Telegram audio buffered in PSRAM: message=%s bytes=%u", message_id, (unsigned int)len);
+
+    if (original_filename && original_filename[0]) {
+        strlcpy(filename, original_filename, sizeof(filename));
+    } else {
+        snprintf(filename, sizeof(filename), "audio%s",
+                 cap_im_attachment_guess_extension(remote_path, NULL, mime));
+    }
+
+    cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, NULL, data, len, filename);
+    free(data);
+    return ESP_OK;
 }
 
 static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
@@ -744,6 +803,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     char download_url[CAP_IM_TG_PATH_BUF_SIZE];
     const char *extension = NULL;
     size_t bytes = 0;
+    size_t expected_bytes = 0;
     char *payload_json = NULL;
     bool grouped = false;
     esp_err_t err;
@@ -753,9 +813,19 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
         return ESP_ERR_INVALID_STATE;
     }
 
-    remote_path = cap_im_tg_get_file_path(file_id);
+    remote_path = cap_im_tg_get_file_path(file_id, &expected_bytes);
     if (!remote_path) {
         return ESP_FAIL;
+    }
+
+    if (strcmp(content_type, "audio") == 0) {
+        err = cap_im_tg_transcribe_from_psram(chat_id, sender_id, message_id, original_filename,
+                                              mime, caption, remote_path, expected_bytes);
+        if (err != ESP_ERR_NO_MEM) {
+            free(remote_path);
+            return err;
+        }
+        ESP_LOGW(TAG, "Telegram audio does not fit in PSRAM, falling back to flash: message=%s", message_id);
     }
 
     extension = cap_im_attachment_guess_extension(remote_path, original_filename, mime);
@@ -785,6 +855,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                                  strcmp(content_type, "audio") == 0 ?
                                                  MIN(s_tg.max_inbound_file_bytes, CAP_IM_TG_STT_MAX_BYTES) :
                                                  s_tg.max_inbound_file_bytes,
+                                                 expected_bytes,
                                                  &bytes);
     if (err != ESP_OK) {
         free(remote_path);
@@ -801,7 +872,8 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                         saved_path,
                                         caption);
     if (strcmp(content_type, "audio") == 0) {
-        cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, saved_path);
+        cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, saved_path,
+                                         NULL, 0, NULL);
     } else if (!grouped && caption && caption[0]) {
         size_t content_len = strlen(caption) + strlen(saved_path) + 64;
         char *content = malloc(content_len);
@@ -860,6 +932,20 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     return ESP_OK;
 }
 
+/* Human-readable download failure. ESP_ERR_NO_MEM from the download path means the DATA flash
+ * volume is full, not RAM; spelling that out keeps the agent from blaming RAM. */
+static const char *cap_im_tg_download_error_reason(esp_err_t err)
+{
+    switch (err) {
+    case ESP_ERR_NO_MEM:
+        return "Flash-Datenspeicher (DATA-Partition) voll, auch nach Aufräumen des Anhang-Eingangs";
+    case ESP_ERR_INVALID_SIZE:
+        return "Datei zu groß";
+    default:
+        return esp_err_to_name(err);
+    }
+}
+
 static void cap_im_tg_attachment_task(void *arg)
 {
     cap_im_tg_attachment_job_t *job = NULL;
@@ -893,10 +979,10 @@ static void cap_im_tg_attachment_task(void *arg)
                              job->message_id,
                              esp_err_to_name(err));
                     if (strcmp(job->content_type, "audio") == 0) {
-                        char body[96];
+                        char body[160];
 
                         snprintf(body, sizeof(body), "(konnte nicht heruntergeladen werden: %s)",
-                                 esp_err_to_name(err));
+                                 cap_im_tg_download_error_reason(err));
                         cap_im_tg_publish_voice_text(job->chat_id, job->sender_id, job->message_id,
                                                      job->caption, body);
                     }
@@ -1187,7 +1273,8 @@ static const struct {
     {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},
     {"ssh", "SSH client (pubkey, allowed, allow, revoke)", "ssh_command", NULL},
     {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
-    {"app", "Install, update or remove a WASM app", "apps_command", NULL},
+    {"app", "Install, update (update all, updates) or remove a WASM app", "apps_command", NULL},
+    {"updates", "Check for app and firmware updates", "apps_check_updates", NULL},
     {"fw", "Firmware status, check and update", "firmware_command", NULL},
     {"web", "Web UI login link (status, cert renew)", "web_command", NULL},
 };
@@ -3110,6 +3197,23 @@ esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
     }
 
     return last_err;
+}
+
+esp_err_t cap_im_tg_send_text_to_allowed(const char *text)
+{
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    char chat_id[24];
+
+    /* A private chat has the user's id. */
+    for (size_t i = 0; i < s_tg.allowed_user_count; i++) {
+        snprintf(chat_id, sizeof(chat_id), "%" PRId64, s_tg.allowed_user_ids[i]);
+        if (cap_im_tg_send_text(chat_id, text) == ESP_OK) {
+            ret = ESP_OK;
+        } else if (ret != ESP_OK) {
+            ret = ESP_FAIL;
+        }
+    }
+    return ret;
 }
 
 esp_err_t cap_im_tg_send_image(const char *chat_id, const char *path, const char *caption)

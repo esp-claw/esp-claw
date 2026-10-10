@@ -49,12 +49,25 @@ esp_err_t cap_im_attachment_build_saved_paths(const char *root_dir,
                                               size_t saved_name_size,
                                               char *saved_path,
                                               size_t saved_path_size);
+/* Streams url to dest_path in small chunks. expected_bytes (0 if unknown) sizes the free-space
+ * check: known sizes need expected_bytes plus a fixed reserve, unknown sizes a larger fixed floor.
+ * Returns ESP_ERR_NO_MEM when the storage volume, not RAM, is too full. */
 esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
                                                  const char *root_dir,
                                                  const char *url,
                                                  const char *dest_path,
                                                  size_t max_bytes,
+                                                 size_t expected_bytes,
                                                  size_t *out_bytes);
+/* Downloads url into a PSRAM buffer, never touching flash. expected_bytes (0 if unknown) sizes the
+ * first allocation. On success *out_data is a heap buffer the caller frees with free().
+ * Returns ESP_ERR_NO_MEM when PSRAM cannot hold the file, ESP_ERR_INVALID_SIZE above max_bytes. */
+esp_err_t cap_im_attachment_download_url_to_psram(const char *log_tag,
+                                                  const char *url,
+                                                  size_t max_bytes,
+                                                  size_t expected_bytes,
+                                                  uint8_t **out_data,
+                                                  size_t *out_len);
 esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
                                                 const char *dest_path,
                                                 const unsigned char *buf,
@@ -74,6 +87,19 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
                                             char **out_text,
                                             char *err_buf,
                                             size_t err_buf_size);
+/* Same as cap_im_attachment_transcribe_file, but uploads len bytes from data; filename is the
+ * multipart filename the STT API uses to detect the format (e.g. "voice.ogg"). */
+esp_err_t cap_im_attachment_transcribe_buffer(const char *log_tag,
+                                              const char *base_url,
+                                              const char *api_key,
+                                              const char *model,
+                                              const uint8_t *data,
+                                              size_t len,
+                                              const char *filename,
+                                              const char *mime,
+                                              char **out_text,
+                                              char *err_buf,
+                                              size_t err_buf_size);
 char *cap_im_attachment_build_payload_json(
     const cap_im_attachment_payload_config_t *config);
 

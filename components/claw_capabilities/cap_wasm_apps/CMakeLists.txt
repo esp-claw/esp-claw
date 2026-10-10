@@ -6,6 +6,8 @@ idf_component_register(
         "src/cap_wasm_install.c"
         "src/cap_wasm_manifest.c"
         "src/cap_wasm_pkg.c"
+        "src/cap_wasm_release.c"
+        "src/cap_wasm_updates.c"
         "third_party/monocypher/monocypher.c"
         "third_party/monocypher/monocypher-ed25519.c"
     INCLUDE_DIRS

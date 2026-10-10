@@ -15,10 +15,12 @@
 #include "cap_wasm_manifest.h"
 #include "cap_im_tg.h"
 #include "cap_wasm_pkg.h"
+#include "cap_wasm_release.h"
 #include "claw_cap.h"
 #include "wasm_export.h"
 
 #define CAP_WASM_PSRAM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define CAP_WASM_MAX_APPS   8
 
 /* Host API error codes (returned negated). Must match include/claw.h of github.com/esp-claw/app-sdk. */
 enum {
@@ -142,6 +144,15 @@ typedef bool (*cap_wasm_sink_t)(void *ctx, const uint8_t *data, size_t len);
 uint8_t *cap_wasm_download(const char *url, size_t max, size_t *out_len, char *err, size_t err_size);
 esp_err_t cap_wasm_stream(const char *url, cap_wasm_sink_t sink, void *ctx, char *err, size_t err_size);
 
+/*
+ * Streams https://api.github.com/repos/<repo>/releases/latest through `scan` (set up by the
+ * caller); false with `err` set when the request fails (403: rate limit, 404: no release).
+ */
+bool cap_wasm_release_latest(const char *repo, cap_wasm_rel_scan_t *scan, char *err, size_t err_size);
+
+/* Parsed manifest of installed app `name`; false when it is missing or invalid. */
+bool cap_wasm_installed_manifest(const char *name, cap_wasm_manifest_t *mf);
+
 /* Shows `html` with a confirm and a cancel button in `chat`; ESP_OK when confirmed. */
 esp_err_t cap_wasm_ask(const char *chat, char *html, size_t html_size, const char *yes_label);
 
@@ -159,16 +170,38 @@ esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char 
 /*
  * Downloads an .ecapp from an https URL, verifies it, asks for confirmation in the Telegram chat
  * of `ctx` and installs it. `expect_name` (update) must match the package; an older version than
- * the installed one needs `force`. Must not run on the WASM thread or the Telegram poll task.
+ * the installed one needs `force`. `confirmed` (the update was confirmed in a list) skips the
+ * question unless the new version adds permissions. Must not run on the WASM thread or the
+ * Telegram poll task.
  */
-esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
+esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force, bool confirmed,
                            const claw_cap_call_context_t *ctx, char *output, size_t output_size);
 
 /* Asks for confirmation, then deletes the app, its files and its key-value data. */
 esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
 
+/* ---------- Update checks (cap_wasm_updates.c); they block on HTTP, not on the poll task ---------- */
+
+/* "/app updates": every app and the firmware with installed and available versions. */
+esp_err_t cap_wasm_check_updates(char *output, size_t output_size);
+
+/* "/app update <name>": installs the latest GitHub release of the app's source (or the source URL itself). */
+esp_err_t cap_wasm_update(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+
+/* "/app update all": one confirmation for every app update, then installs them in turn until one fails. */
+esp_err_t cap_wasm_update_all(const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+
+/* Starts the daily and boot update checks when update_check_time is set. */
+void cap_wasm_updates_start(void);
+
+/* Tool handlers in the cap_wasm_apps_mgr group. */
+esp_err_t cap_wasm_check_updates_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                         char *output, size_t output_size);
+esp_err_t cap_wasm_update_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                  char *output, size_t output_size);
+
 /*
- * Runs "/app install|update|remove ..." (or "fw <args>" for cap_wasm_fw_command) on its own task
+ * Runs "/app install|update|updates|remove ..." (or "fw <args>" for cap_wasm_fw_command) on its own task
  * and sends the result to `chat_id`.
  */
 esp_err_t cap_wasm_start_job(const char *command, const char *chat_id);
@@ -177,6 +210,9 @@ esp_err_t cap_wasm_start_job(const char *command, const char *chat_id);
 
 /* "/fw" arguments: "" (status), "check [url]" or "update [--force] [url]". Blocks; not on the poll task. */
 esp_err_t cap_wasm_fw_command(const char *args, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+
+/* Signed version of the latest firmware release and how it compares to the running one. */
+bool cap_wasm_fw_latest(char version[CAP_WASM_FW_TEXT_MAX + 1], int *cmp, char *err, size_t err_size);
 
 /* Starts the post-update health check / rollback report when there is something to do. */
 void cap_wasm_fw_boot(void);

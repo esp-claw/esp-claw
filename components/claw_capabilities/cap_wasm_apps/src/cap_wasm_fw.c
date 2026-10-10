@@ -38,10 +38,9 @@
 
 static const char *TAG = "cap_wasm_fw";
 
-#define FW_RELEASE_URL     "https://api.github.com/repos/esp-claw/esp-claw/releases/latest"
+#define FW_REPO            "esp-claw/esp-claw"
 #define FW_ASSET           "edge_agent.bin"
 #define FW_SIG_SUFFIX      ".sig.json"
-#define FW_RELEASE_MAX     (128 * 1024)
 #define FW_URL_MAX         256
 #define FW_NVS_NS          "fw"
 #define FW_HEALTH_MIN_S    60   /* must run this long before it counts as good */
@@ -225,19 +224,36 @@ static esp_err_t fw_status(char *output, size_t output_size)
         }
     }
     if (len > 0 && (size_t)len < output_size) {
-        snprintf(output + len, output_size - len, "Last update: %s\nSource: latest release of github.com/esp-claw/"
-                 "esp-claw (%s + %s%s)", last[0] ? last : "none", FW_ASSET, FW_ASSET, FW_SIG_SUFFIX);
+        snprintf(output + len, output_size - len, "Last update: %s\nSource: latest release of github.com/" FW_REPO
+                 " (%s + %s%s)", last[0] ? last : "none", FW_ASSET, FW_ASSET, FW_SIG_SUFFIX);
     }
     return ESP_OK;
+}
+
+typedef struct {
+    char *bin;
+    char *sig;
+} fw_assets_t;
+
+static void fw_asset(void *ctx, const char *url)
+{
+    fw_assets_t *a = ctx;
+    const char *file = strrchr(url, '/');
+
+    if (file && strncmp(url, "https://", 8) == 0 && strlen(url) < FW_URL_MAX) {
+        if (strcmp(file + 1, FW_ASSET) == 0) {
+            strcpy(a->bin, url);
+        } else if (strcmp(file + 1, FW_ASSET FW_SIG_SUFFIX) == 0) {
+            strcpy(a->sig, url);
+        }
+    }
 }
 
 /* Image and signature URLs from `url` (an https .bin) or the latest GitHub release. */
 static bool fw_resolve(const char *url, char bin[FW_URL_MAX], char sig[FW_URL_MAX], char *err, size_t err_size)
 {
-    size_t len = 0;
-    char *json;
-    cJSON *root;
-    const cJSON *asset = NULL;
+    fw_assets_t assets = { .bin = bin, .sig = sig };
+    cap_wasm_rel_scan_t scan = { .on_asset = fw_asset, .ctx = &assets };
 
     if (url && url[0]) {
         if (strncmp(url, "https://", 8) != 0 || strpbrk(url, "?#") ||
@@ -250,27 +266,15 @@ static bool fw_resolve(const char *url, char bin[FW_URL_MAX], char sig[FW_URL_MA
         snprintf(sig, FW_URL_MAX, "%s%s", url, FW_SIG_SUFFIX);
         return true;
     }
-    json = (char *)cap_wasm_download(FW_RELEASE_URL, FW_RELEASE_MAX, &len, err, err_size);
-    root = json ? cJSON_Parse(json) : NULL;
-    heap_caps_free(json);
     bin[0] = sig[0] = '\0';
-    cJSON_ArrayForEach(asset, cJSON_GetObjectItem(root, "assets")) {
-        const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(asset, "name"));
-        const char *dl = cJSON_GetStringValue(cJSON_GetObjectItem(asset, "browser_download_url"));
-
-        if (name && dl && strncmp(dl, "https://", 8) == 0 && strlen(dl) < FW_URL_MAX) {
-            if (strcmp(name, FW_ASSET) == 0) {
-                strcpy(bin, dl);
-            } else if (strcmp(name, FW_ASSET FW_SIG_SUFFIX) == 0) {
-                strcpy(sig, dl);
-            }
-        }
+    if (!cap_wasm_release_latest(FW_REPO, &scan, err, err_size)) {
+        return false;
     }
-    if (json && (!bin[0] || !sig[0])) {
+    if (!bin[0] || !sig[0]) {
         snprintf(err, err_size, "the latest release has no %s and %s%s assets", FW_ASSET, FW_ASSET, FW_SIG_SUFFIX);
+        return false;
     }
-    cJSON_Delete(root);
-    return bin[0] && sig[0];
+    return true;
 }
 
 /*
@@ -312,6 +316,18 @@ static bool fw_prepare(const char *url, char bin[FW_URL_MAX], cap_wasm_fw_sig_t 
     if (!cap_wasm_version_cmp(sig->version, desc->version, cmp)) {
         *cmp = 0; /* not comparable: treated like a reinstall, needs --force */
     }
+    return true;
+}
+
+bool cap_wasm_fw_latest(char version[CAP_WASM_FW_TEXT_MAX + 1], int *cmp, char *err, size_t err_size)
+{
+    char bin[FW_URL_MAX];
+    cap_wasm_fw_sig_t sig;
+
+    if (!fw_prepare(NULL, bin, &sig, cmp, err, err_size)) {
+        return false;
+    }
+    strcpy(version, sig.version);
     return true;
 }
 

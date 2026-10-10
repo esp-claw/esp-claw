@@ -58,7 +58,6 @@ static const char *TAG = "cap_wasm_apps";
 
 #define CAP_WASM_GROUP            "cap_wasm_apps"
 #define CAP_WASM_MGR_GROUP        "cap_wasm_apps_mgr"
-#define CAP_WASM_MAX_APPS         8
 #define CAP_WASM_MAX_TOOLS        32   /* dispatch slots, see CAP_WASM_SLOTS */
 #define CAP_WASM_TOOLS_JSON_MAX   (CAP_WASM_MAX_TOOLS * 3 * 1024)
 #define CAP_WASM_TOOL_DESC_MAX    256  /* claw_cap truncates longer tool descriptions */
@@ -1578,7 +1577,7 @@ static esp_err_t cap_wasm_install_execute(const char *input_json, const claw_cap
         snprintf(output, output_size, "Error: url (https, at most 255 chars) is required");
         return ESP_ERR_INVALID_ARG;
     }
-    return cap_wasm_install(url, NULL, false, ctx, output, output_size);
+    return cap_wasm_install(url, NULL, false, false, ctx, output, output_size);
 }
 
 static esp_err_t cap_wasm_remove_execute(const char *input_json, const claw_cap_call_context_t *ctx,
@@ -1616,7 +1615,8 @@ static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap
     if (!verb[0] || strcmp(verb, "list") == 0) {
         return cap_wasm_status(false, output, output_size);
     }
-    if (strcmp(verb, "install") == 0 || strcmp(verb, "update") == 0 || strcmp(verb, "remove") == 0) {
+    if (strcmp(verb, "install") == 0 || strcmp(verb, "update") == 0 || strcmp(verb, "updates") == 0 ||
+            strcmp(verb, "remove") == 0) {
         /* Confirmation is answered through the Telegram poll task this handler runs on. */
         const char *chat = cap_im_tg_confirm_chat(ctx);
 
@@ -1633,7 +1633,8 @@ static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap
     snprintf(output, output_size,
              "Usage:\n/apps  List WASM apps\n"
              "/app install [--force] <https-url>  Install a signed .ecapp (--force allows a downgrade)\n"
-             "/app update <name> [url]  Update from url or where it was installed from\n"
+             "/app updates  List available app and firmware updates\n"
+             "/app update <name>|all [url]  Update to the latest GitHub release (or from url)\n"
              "/app remove <name>  Delete an app and its data\n"
              "/apps enable|disable <name>  Turn an app on/off (persists)\n"
              "/apps load|unload <name>  Load into / free from memory now\n"
@@ -1716,6 +1717,28 @@ static const claw_cap_descriptor_t s_mgr_descriptors[] = {
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json = CAP_WASM_NAME_SCHEMA,
         .execute = cap_wasm_remove_execute,
+    },
+    {
+        .id = "apps_check_updates",
+        .name = "apps_check_updates",
+        .family = "wasm_app",
+        .description = "List the installed and the latest available versions of the firmware and of every WASM "
+                       "app installed from a GitHub release.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+        .execute = cap_wasm_check_updates_execute,
+    },
+    {
+        .id = "apps_update",
+        .name = "apps_update",
+        .family = "wasm_app",
+        .description = "Update an installed WASM app (name) or every app with an update (\"all\") to its latest "
+                       "GitHub release. The user confirms in Telegram; only works in a Telegram chat.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = CAP_WASM_NAME_SCHEMA,
+        .execute = cap_wasm_update_execute,
     },
     {
         .id = "firmware_command",
@@ -1843,6 +1866,7 @@ esp_err_t cap_wasm_apps_register_group(const char *base_path)
         ESP_LOGE(TAG, "failed to register the %s group", CAP_WASM_MGR_GROUP);
     }
     cap_wasm_fw_boot();
+    cap_wasm_updates_start();
     s_req_queue = xQueueCreate(1, sizeof(cap_wasm_req_t *));
     s_done = xSemaphoreCreateBinary();
     s_call_lock = xSemaphoreCreateMutex();

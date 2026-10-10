@@ -763,6 +763,7 @@ static esp_err_t cap_im_qq_save_attachment(const char *chat_id,
                                                  normalized_url,
                                                  saved_path,
                                                  s_qq.max_inbound_file_bytes,
+                                                 0,
                                                  &bytes);
     if (err != ESP_OK) {
         return err;
