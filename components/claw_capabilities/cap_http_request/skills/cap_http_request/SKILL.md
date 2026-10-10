@@ -22,6 +22,13 @@ Use this skill when the task needs a direct HTTP or HTTPS request to a known end
 
 ## Available capability
 - `http_request`: send standard HTTP requests to allowlisted domains or IPs and return status plus body text, or save the response body directly to a file.
+- `http_profiles`: list the configured API credential profiles (name, base_url, hosts). Secrets are never shown.
+
+## API profiles (credentials)
+- Never put API tokens into `headers`. For APIs with a configured profile, pass `profile` and either `path` (appended to the profile's `base_url`) or a full https `url` on one of the profile's `hosts`. The device injects the credentials.
+- With `profile`, the profile's `hosts` replace the global allowlist, `Authorization` (and the profile's own auth header) supplied in `headers` is dropped, and redirects must stay on https and the profile's hosts.
+- `GET`/`HEAD` run directly. `POST`/`PUT`/`PATCH`/`DELETE` with a profile ask the user to confirm in Telegram and are refused outside an allowed Telegram chat.
+- Service-specific guidance lives in the `cloudflare` and `gcloud` skills.
 
 ## Calling rules
 - Only call `http_request` when the target host is expected to be in the configured allowlist.
@@ -32,7 +39,7 @@ Use this skill when the task needs a direct HTTP or HTTPS request to a known end
   "url": "https://api.example.com/v1/data",
   "method": "GET",
   "headers": {
-    "Authorization": "Bearer <token>"
+    "Accept": "application/json"
   },
   "body": "",
   "timeout_ms": 15000,
@@ -42,7 +49,8 @@ Use this skill when the task needs a direct HTTP or HTTPS request to a known end
 }
 ```
 
-- `url` is required and must start with `http://` or `https://`.
+- `url` is required without `profile` and must start with `http://` or `https://`.
+- JSON bodies (object or array) get `Content-Type: application/json` unless `headers` sets a content type.
 - `method` defaults to `GET`.
 - `body` is only valid for methods that accept a request body.
 - `save_path` is optional. When present, the response body is streamed directly to this file and is not returned in memory.
@@ -65,6 +73,9 @@ Use this skill when the task needs a direct HTTP or HTTPS request to a known end
   - `Error: save_path must be a non-empty string`
   - `Error: failed to open save_path`
   - `Error: http request failed (...)`
+  - `Error: unknown API profile '...' (see http_profiles)`
+  - `Error: host '...' is not allowed for profile '...'`
+  - `Error: abgelehnt vom Benutzer` (mutation rejected in Telegram; do not retry)
 
 ## Examples
 
@@ -82,6 +93,13 @@ Use this skill when the task needs a direct HTTP or HTTPS request to a known end
     "Content-Type": "application/json"
   },
   "body": "{\"name\":\"demo\"}"
+}
+```
+
+```json
+{
+  "profile": "cloudflare",
+  "path": "/zones?per_page=50"
 }
 ```
 
