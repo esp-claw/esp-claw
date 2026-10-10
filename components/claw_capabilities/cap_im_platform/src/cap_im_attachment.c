@@ -362,17 +362,20 @@ static esp_err_t cap_im_attachment_download_event_handler(esp_http_client_event_
 
 static esp_err_t cap_im_attachment_check_free_space(const char *log_tag, const char *path)
 {
+    char root[32];
     uint64_t total = 0;
     uint64_t free_bytes = 0;
-    esp_err_t err = esp_vfs_fat_info(path, &total, &free_bytes);
+    const char *slash = (path[0] == '/') ? strchr(path + 1, '/') : NULL;
+    snprintf(root, sizeof(root), "%.*s", (int)(slash ? (size_t)(slash - path) : strlen(path)), path);
+    esp_err_t err = esp_vfs_fat_info(root, &total, &free_bytes);
 
     if (err != ESP_OK) {
-        ESP_LOGW(log_tag, "attachment free space query failed: path=%s err=%s", path, esp_err_to_name(err));
+        ESP_LOGW(log_tag, "attachment free space query failed: root=%s err=%s", root, esp_err_to_name(err));
         return ESP_OK;
     }
     if (free_bytes < CAP_IM_ATTACHMENT_MIN_FREE_BYTES) {
-        ESP_LOGW(log_tag, "attachment skipped, storage low: free=%u min=%u path=%s",
-                 (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES, path);
+        ESP_LOGW(log_tag, "attachment skipped, storage low: free=%u min=%u root=%s",
+                 (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES, root);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
