@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 void safe_copy(char *dst, size_t dst_size, const char *src)
 {
@@ -710,6 +711,47 @@ esp_err_t write_file_text(const char *path, const char *text)
         return ESP_FAIL;
     }
     fclose(file);
+    return ESP_OK;
+}
+
+/* Write via a temp file. FAT cannot rename over an existing file, so the old
+ * file is moved to a backup first and restored if the final rename fails. */
+esp_err_t write_file_atomic(const char *path, const char *text)
+{
+    char tmp[CLAW_MEMORY_MAX_PATH + 8];
+    char bak[CLAW_MEMORY_MAX_PATH + 8];
+    struct stat st = {0};
+    bool had_old;
+    esp_err_t err;
+
+    if (!path || !text ||
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+        snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    err = write_file_text(tmp, text);
+    if (err != ESP_OK) {
+        unlink(tmp);
+        return err;
+    }
+    had_old = stat(path, &st) == 0;
+    if (had_old) {
+        unlink(bak);
+        if (rename(path, bak) != 0) {
+            unlink(tmp);
+            return ESP_FAIL;
+        }
+    }
+    if (rename(tmp, path) != 0) {
+        if (had_old) {
+            rename(bak, path);
+        }
+        unlink(tmp);
+        return ESP_FAIL;
+    }
+    if (had_old) {
+        unlink(bak);
+    }
     return ESP_OK;
 }
 

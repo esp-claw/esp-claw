@@ -60,9 +60,13 @@ typedef struct {
 #define APP_DEFAULT_SEARCH_TAVILY_KEY        ""
 #define APP_DEFAULT_SSH_HOSTS                ""
 #define APP_DEFAULT_WOL_TARGETS              ""
+#define APP_DEFAULT_API_PROFILES             ""
 #define APP_DEFAULT_STT_BASE_URL             "https://api.openai.com/v1"
 #define APP_DEFAULT_STT_API_KEY              ""
 #define APP_DEFAULT_STT_MODEL                "gpt-4o-mini-transcribe"
+#define APP_DEFAULT_EMBED_BASE_URL           "https://api.openai.com/v1"
+#define APP_DEFAULT_EMBED_API_KEY            ""
+#define APP_DEFAULT_EMBED_MODEL              "text-embedding-3-small"
 #define APP_DEFAULT_ENABLED_CAP_GROUPS       ""
 #define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS   ""
 #define APP_DEFAULT_ENABLED_LUA_MODULES      ""
@@ -102,9 +106,13 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(search_http_allowlist, "http_allow_ls", APP_SEARCH_HTTP_ALLOWLIST),
     APP_CONFIG_FIELD(ssh_hosts, "ssh_hosts", APP_DEFAULT_SSH_HOSTS),
     APP_CONFIG_FIELD(wol_targets, "wol_targets", APP_DEFAULT_WOL_TARGETS),
+    APP_CONFIG_FIELD(api_profiles, "api_profiles", APP_DEFAULT_API_PROFILES),
     APP_CONFIG_FIELD(stt_base_url, "stt_base_url", APP_DEFAULT_STT_BASE_URL),
     APP_CONFIG_FIELD(stt_api_key, "stt_api_key", APP_DEFAULT_STT_API_KEY),
     APP_CONFIG_FIELD(stt_model, "stt_model", APP_DEFAULT_STT_MODEL),
+    APP_CONFIG_FIELD(embed_base_url, "embed_base_url", APP_DEFAULT_EMBED_BASE_URL),
+    APP_CONFIG_FIELD(embed_api_key, "embed_api_key", APP_DEFAULT_EMBED_API_KEY),
+    APP_CONFIG_FIELD(embed_model, "embed_model", APP_DEFAULT_EMBED_MODEL),
     APP_CONFIG_FIELD(enabled_cap_groups, "en_cap_groups", APP_DEFAULT_ENABLED_CAP_GROUPS),
     APP_CONFIG_FIELD(llm_visible_cap_groups, "vis_cap_groups", APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS),
     APP_CONFIG_FIELD(enabled_lua_modules, "en_lua_mods", APP_DEFAULT_ENABLED_LUA_MODULES),
@@ -601,9 +609,13 @@ void app_config_to_claw(const app_config_t *config, app_claw_config_t *out)
             sizeof(out->search_http_allowlist));
     strlcpy(out->ssh_hosts, config->ssh_hosts, sizeof(out->ssh_hosts));
     strlcpy(out->wol_targets, config->wol_targets, sizeof(out->wol_targets));
+    strlcpy(out->api_profiles, config->api_profiles, sizeof(out->api_profiles));
     strlcpy(out->stt_base_url, config->stt_base_url, sizeof(out->stt_base_url));
     strlcpy(out->stt_api_key, config->stt_api_key, sizeof(out->stt_api_key));
     strlcpy(out->stt_model, config->stt_model, sizeof(out->stt_model));
+    strlcpy(out->embed_base_url, config->embed_base_url, sizeof(out->embed_base_url));
+    strlcpy(out->embed_api_key, config->embed_api_key, sizeof(out->embed_api_key));
+    strlcpy(out->embed_model, config->embed_model, sizeof(out->embed_model));
     strlcpy(out->enabled_cap_groups, config->enabled_cap_groups, sizeof(out->enabled_cap_groups));
     strlcpy(out->llm_visible_cap_groups, config->llm_visible_cap_groups, sizeof(out->llm_visible_cap_groups));
     strlcpy(out->enabled_lua_modules, config->enabled_lua_modules, sizeof(out->enabled_lua_modules));

@@ -22,6 +22,7 @@ extern "C" {
 #define APP_CLAW_FILE_PATH_LEN        96
 #define APP_CLAW_SSH_HOSTS_LEN        1536
 #define APP_CLAW_WOL_TARGETS_LEN      1024
+#define APP_CLAW_API_PROFILES_LEN     3584
 
 typedef struct claw_core_state *claw_core_handle_t;
 
@@ -54,9 +55,13 @@ typedef struct {
     char search_http_allowlist[APP_CLAW_STR_LEN];
     char ssh_hosts[APP_CLAW_SSH_HOSTS_LEN];
     char wol_targets[APP_CLAW_WOL_TARGETS_LEN];
+    char api_profiles[APP_CLAW_API_PROFILES_LEN];
     char stt_base_url[APP_CLAW_STR_LEN];
     char stt_api_key[APP_CLAW_STR_LEN];
     char stt_model[APP_CLAW_MODEL_LEN];
+    char embed_base_url[APP_CLAW_STR_LEN];
+    char embed_api_key[APP_CLAW_STR_LEN];
+    char embed_model[APP_CLAW_MODEL_LEN];
     char asr_provider[APP_CLAW_SHORT_STR_LEN];
     char asr_api_key[APP_CLAW_STR_LEN];
     char asr_workspace_id[APP_CLAW_STR_LEN];

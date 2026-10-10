@@ -688,6 +688,8 @@ static esp_err_t app_cap_prepare_http_request(const app_claw_config_t *config,
 
     ESP_RETURN_ON_ERROR(cap_http_request_set_allowlist(config->search_http_allowlist),
                         TAG, "Failed to set HTTP allowlist");
+    ESP_RETURN_ON_ERROR(cap_http_request_set_profiles(config->api_profiles),
+                        TAG, "Failed to set HTTP API profiles");
     return ESP_OK;
 }
 

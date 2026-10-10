@@ -53,9 +53,13 @@ typedef struct {
     char search_http_allowlist[APP_CONFIG_STR_LEN];
     char ssh_hosts[APP_CLAW_SSH_HOSTS_LEN];
     char wol_targets[APP_CLAW_WOL_TARGETS_LEN];
+    char api_profiles[APP_CLAW_API_PROFILES_LEN];
     char stt_base_url[APP_CONFIG_STR_LEN];
     char stt_api_key[APP_CONFIG_STR_LEN];
     char stt_model[64];
+    char embed_base_url[APP_CONFIG_STR_LEN];
+    char embed_api_key[APP_CONFIG_STR_LEN];
+    char embed_model[64];
     char enabled_cap_groups[APP_CONFIG_STR_LEN];
     char llm_visible_cap_groups[APP_CONFIG_STR_LEN];
     char enabled_lua_modules[APP_CONFIG_STR_LEN];

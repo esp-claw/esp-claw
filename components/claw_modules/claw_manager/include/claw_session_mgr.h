@@ -47,6 +47,12 @@ typedef struct {
     char sessions[CLAW_SESSION_MGR_MAX_SESSIONS][CLAW_SESSION_MGR_ALIAS_MAX + 1];
 } claw_session_mgr_alias_map_t;
 
+/* parent_session_id is set for subagent sessions; current marks the active alias of a chat. */
+typedef void (*claw_session_mgr_visit_fn_t)(const char *session_id,
+                                            const char *parent_session_id,
+                                            bool current,
+                                            void *user_ctx);
+
 typedef esp_err_t (*claw_session_mgr_delete_session_fn_t)(const char *session_id,
                                                           bool *out_deleted_any,
                                                           void *user_ctx);
@@ -97,6 +103,12 @@ esp_err_t claw_session_mgr_delete_chat_session(uint32_t agent_id,
                                                const char *alias,
                                                char *out_alias,
                                                size_t out_alias_size);
+/* Visits every chat alias and subagent session known to the maps. The callback
+ * runs with the session manager lock held and must not call back into it. */
+esp_err_t claw_session_mgr_visit_sessions(claw_session_mgr_visit_fn_t fn, void *user_ctx);
+/* Deletes an inactive chat alias (parent_session_id NULL) or a subagent session
+ * and updates the corresponding map; the current alias of a chat is refused. */
+esp_err_t claw_session_mgr_delete_session(const char *session_id, const char *parent_session_id);
 
 #ifdef __cplusplus
 }

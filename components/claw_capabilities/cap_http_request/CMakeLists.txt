@@ -7,4 +7,9 @@ idf_component_register(
         claw_cap
         esp_http_client
         http_reuse
+    PRIV_REQUIRES
+        cap_im_platform
+        esp_hw_support
+        freertos
+        mbedtls
 )

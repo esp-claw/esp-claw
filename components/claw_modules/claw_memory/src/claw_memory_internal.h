@@ -12,6 +12,7 @@
 
 #include "cJSON.h"
 #include "claw_memory.h"
+#include "claw_memory_algo.h"
 #include "llm/claw_llm_runtime.h"
 
 #define CLAW_MEMORY_DEFAULT_MAX_MESSAGE_CHARS    4096
@@ -32,7 +33,10 @@
 #define CLAW_MEMORY_SOUL_FILE                    "soul.md"
 #define CLAW_MEMORY_IDENTITY_FILE                "identity.md"
 #define CLAW_MEMORY_USER_FILE                    "user.md"
-#define CLAW_MEMORY_AUTO_EXTRACT_MAX_ITEMS       3
+#define CLAW_MEMORY_VECTORS_FILE                 "memory_vectors.bin"
+#define CLAW_MEMORY_USER_MD_MAX                  2048
+#define CLAW_MEMORY_MARKDOWN_MAX                 4096
+#define CLAW_MEMORY_PIPELINE_KEY                 "pipeline"
 typedef enum {
     CLAW_MEMORY_BACKEND_FORMAT_UNKNOWN = 0,
     CLAW_MEMORY_BACKEND_FORMAT_OPENAI = 1,
@@ -50,6 +54,8 @@ typedef struct {
     char soul_path[CLAW_MEMORY_MAX_PATH];
     char identity_path[CLAW_MEMORY_MAX_PATH];
     char user_path[CLAW_MEMORY_MAX_PATH];
+    char vectors_path[CLAW_MEMORY_MAX_PATH];
+    char storage_root_dir[CLAW_MEMORY_MAX_PATH];
     size_t max_message_chars;
     uint32_t max_tool_iterations;
     claw_memory_backend_format_t backend_format;
@@ -62,12 +68,6 @@ typedef struct {
     size_t count;
     size_t capacity;
 } claw_memory_item_list_t;
-
-typedef enum {
-    CLAW_MEMORY_MESSAGE_INTENT_NONE = 0,
-    CLAW_MEMORY_MESSAGE_INTENT_FORGET,
-    CLAW_MEMORY_MESSAGE_INTENT_REPLACE,
-} claw_memory_message_intent_t;
 
 extern claw_memory_state_t s_memory;
 
@@ -107,15 +107,44 @@ size_t file_size_bytes(const char *path);
 esp_err_t ensure_file_with_default(const char *path, const char *default_text);
 esp_err_t claw_memory_join_path(char *dst, size_t dst_size, const char *dir, const char *name);
 
-esp_err_t claw_memory_auto_extract_prepare_with_runtime(claw_llm_runtime_t *runtime,
-                                                        const char *user_text,
-                                                        claw_memory_message_intent_t *out_message_intent,
-                                                        char **out_llm_text);
-esp_err_t claw_memory_auto_extract_apply_result(const char *llm_text,
-                                                claw_memory_message_intent_t message_intent,
-                                                char **out_memory_summary);
-esp_err_t claw_memory_async_extract_init(const claw_memory_config_t *config);
-esp_err_t claw_memory_async_extract_ensure_started(const claw_core_request_t *request);
+esp_err_t write_file_atomic(const char *path, const char *text);
+
+/* Recursive lock around all memory files (records, index, profile files,
+ * session logs, vectors). Never held across network calls. */
+void claw_memory_lock(void);
+void claw_memory_unlock(void);
+
+/* Background pipeline (claw_memory_pipeline.c). The note_* hooks expect the lock held. */
+esp_err_t claw_memory_pipeline_init(const claw_memory_config_t *config);
+void claw_memory_pipeline_note_persist(const char *session_id, const char *data_path);
+void claw_memory_pipeline_note_request(const char *session_id);
+void claw_memory_pipeline_note_access(const char *memory_id);
+
+/* Session logs (claw_memory_session.c); callers hold the lock. */
+esp_err_t claw_memory_session_read_transcript(const char *data_path,
+                                              uint32_t from_turn,
+                                              size_t max_bytes,
+                                              char **out_text,
+                                              uint32_t *out_turn_count);
+esp_err_t claw_memory_session_turn_count(const char *data_path, uint32_t *out_turn_count);
+esp_err_t claw_memory_session_compact_with_summary(const char *data_path,
+                                                   size_t keep_bytes,
+                                                   const char *summary,
+                                                   uint32_t max_drop_turns,
+                                                   uint32_t *out_dropped_turns);
+esp_err_t claw_memory_session_delete_files(const char *data_path,
+                                          bool *out_deleted_any,
+                                          size_t *out_freed);
+
+/* Embeddings + int8 vector store (claw_memory_embed.c). */
+esp_err_t claw_memory_embed_init(const claw_memory_embed_config_t *config);
+bool claw_memory_embed_enabled(void);
+esp_err_t claw_memory_embed_texts(const char *const *texts, size_t count, float *out_vectors);
+esp_err_t claw_memory_embed_query(const char *text, float *out_vector);
+esp_err_t claw_memory_vectors_put(const char *memory_id, const float *vector);
+void claw_memory_vectors_remove(const char *memory_id);
+const int8_t *claw_memory_vectors_get(const char *memory_id);
+size_t claw_memory_vectors_prune(const claw_memory_item_list_t *active);
 
 void claw_memory_make_id(char *dst, size_t dst_size);
 void claw_memory_build_item_key(const claw_memory_item_t *item,
@@ -131,10 +160,7 @@ bool claw_memory_items_semantically_match(const claw_memory_item_t *existing,
                                           const claw_memory_item_t *incoming);
 bool claw_memory_items_equivalent_for_update(const claw_memory_item_t *existing,
                                              const claw_memory_item_t *replacement);
-esp_err_t claw_memory_replace_conflicting_items(const claw_memory_item_t *incoming,
-                                                claw_memory_message_intent_t message_intent);
 cJSON *claw_memory_parse_llm_json_document(const char *text);
-char *claw_memory_summary_catalog_dup(void);
 
 esp_err_t claw_memory_load_index(cJSON **out_root);
 esp_err_t claw_memory_save_index(cJSON *root);
@@ -161,10 +187,10 @@ void claw_memory_append_digest_line(const char *action,
                                     const char *extra);
 void claw_memory_rebuild_keyword_index(cJSON *index_root,
                                        const claw_memory_item_list_t *items);
-esp_err_t claw_memory_export_markdown_internal(char **out_markdown,
-                                               const claw_memory_item_list_t *items,
-                                               cJSON *index_root);
-esp_err_t claw_memory_sync_markdown(const claw_memory_item_list_t *items, cJSON *index_root);
+esp_err_t claw_memory_append_recall_deltas(const char *const *memory_ids,
+                                           const uint16_t *counts,
+                                           size_t count);
+cJSON *claw_memory_pipeline_state(cJSON *index_root);
 esp_err_t claw_memory_compact_internal(bool append_digest);
 esp_err_t claw_memory_maybe_compact(void);
 esp_err_t claw_memory_profile_init_defaults(void);
