@@ -10,6 +10,7 @@ apps/
   sdk/claw_util.h   optional output buffer / minimal JSON reader used by the examples
   hello/            echo, benchmark, persistent counter, runaway loop (runtime test app)
   cf_dns/           read-only Cloudflare DNS via the device's "cloudflare" API profile
+  ping/             ICMP echo (ping) to a host from the device
   build.sh          builds apps/<name>/build/{app.wasm,manifest.json}
 ```
 
@@ -60,7 +61,7 @@ tool `apps_status` returns the same as JSON.
   "name": "cf_dns",
   "version": "1.0.0",
   "description": "shown in /apps and apps_status",
-  "permissions": { "log": true, "kv": true, "http_profiles": ["cloudflare"], "confirm": true },
+  "permissions": { "log": true, "kv": true, "http_profiles": ["cloudflare"], "confirm": true, "ping": true },
   "limits": { "memory_kb": 64, "call_timeout_ms": 5000 }
 }
 ```
@@ -70,7 +71,7 @@ tool `apps_status` returns the same as JSON.
 | `name` | required, 1-24 chars `[a-z0-9_]`, starts with a letter, equals the directory name |
 | `version` | required, 1-16 chars `[A-Za-z0-9.+-]` |
 | `description` | optional, <= 200 bytes |
-| `permissions.log` / `kv` / `confirm` | optional booleans, default false |
+| `permissions.log` / `kv` / `confirm` / `ping` | optional booleans, default false |
 | `permissions.http_profiles` | optional, 1-4 names of `api_profiles` entries the app may use |
 | `limits.memory_kb` | linear memory cap, multiple of 64, 64-512, default 64 |
 | `limits.call_timeout_ms` | budget per tool call, 100-30000, default 5000 (`app_init`: fixed 2000) |

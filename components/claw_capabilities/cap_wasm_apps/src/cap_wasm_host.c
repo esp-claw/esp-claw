@@ -19,7 +19,12 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "lwip/inet.h"
+#include "lwip/netdb.h"
 #include "nvs.h"
+#include "ping/ping_sock.h"
 #include "sdkconfig.h"
 #if CONFIG_APP_CLAW_CAP_IM_TG
 #include "cap_im_tg.h"
@@ -40,6 +45,10 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_BODY_MAX           (16 * 1024)
 #define CAP_WASM_CONFIRM_TEXT_MAX   1024
 #define CAP_WASM_CONFIRM_TIMEOUT_MS 60000
+#define CAP_WASM_PING_MAX_COUNT     10
+#define CAP_WASM_PING_TIMEOUT_MS    1000
+#define CAP_WASM_PING_INTERVAL_MS   200
+#define CAP_WASM_HOST_NAME_MAX      253
 
 cap_wasm_call_t g_cap_wasm_call;
 
@@ -389,6 +398,133 @@ static int32_t cap_wasm_confirm(wasm_exec_env_t env, const char *text, uint32_t 
 #endif
 }
 
+/* ---------- ICMP echo ---------- */
+
+typedef struct {
+    SemaphoreHandle_t done;
+    uint32_t rtt_min;
+    uint32_t rtt_max;
+    uint32_t rtt_sum;
+} cap_wasm_ping_t;
+
+static void cap_wasm_ping_success(esp_ping_handle_t hdl, void *args)
+{
+    cap_wasm_ping_t *ping = args;
+    uint32_t rtt = 0;
+
+    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &rtt, sizeof(rtt));
+    ping->rtt_min = rtt < ping->rtt_min ? rtt : ping->rtt_min;
+    ping->rtt_max = rtt > ping->rtt_max ? rtt : ping->rtt_max;
+    ping->rtt_sum += rtt;
+}
+
+static void cap_wasm_ping_end(esp_ping_handle_t hdl, void *args)
+{
+    (void)hdl;
+    xSemaphoreGive(((cap_wasm_ping_t *)args)->done);
+}
+
+static bool cap_wasm_resolve(const char *host, ip_addr_t *out)
+{
+    struct addrinfo *res = NULL;
+    bool ok = false;
+
+    memset(out, 0, sizeof(*out));
+    if (ipaddr_aton(host, out)) {
+        return true;
+    }
+    if (getaddrinfo(host, NULL, NULL, &res) != 0 || !res) {
+        return false;
+    }
+    if (res->ai_family == AF_INET) {
+        struct in_addr addr4 = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+
+        inet_addr_to_ip4addr(ip_2_ip4(out), &addr4);
+        IP_SET_TYPE(out, IPADDR_TYPE_V4);
+        ok = true;
+    } else if (res->ai_family == AF_INET6) {
+        struct in6_addr addr6 = ((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
+
+        inet6_addr_to_ip6addr(ip_2_ip6(out), &addr6);
+        IP_SET_TYPE(out, IPADDR_TYPE_V6);
+        ok = true;
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+/* Pings `host` `count` times and writes a JSON summary to out; returns its length or -errno. */
+static int32_t cap_wasm_ping(wasm_exec_env_t env, const char *host, uint32_t host_len, int32_t count,
+                             char *out, uint32_t out_cap)
+{
+    cap_wasm_app_t *app = cap_wasm_env_app(env);
+    cap_wasm_ping_t ping = { .rtt_min = UINT32_MAX };
+    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+    esp_ping_callbacks_t cbs = {
+        .cb_args = &ping,
+        .on_ping_success = cap_wasm_ping_success,
+        .on_ping_end = cap_wasm_ping_end,
+    };
+    esp_ping_handle_t session = NULL;
+    char name[CAP_WASM_HOST_NAME_MAX + 1];
+    uint32_t sent = 0;
+    uint32_t received = 0;
+    int len;
+
+    if (g_cap_wasm_call.app != app) {
+        return -CAP_WASM_EPERM;
+    }
+    if (count < 1 || count > CAP_WASM_PING_MAX_COUNT || host_len == 0 || host_len > CAP_WASM_HOST_NAME_MAX) {
+        return -CAP_WASM_EINVAL;
+    }
+    memcpy(name, host, host_len);
+    name[host_len] = '\0';
+    /* Host names and IPv4/IPv6 literals only; the name is echoed into JSON unescaped. */
+    if (strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:") != host_len) {
+        return -CAP_WASM_EINVAL;
+    }
+
+    cap_wasm_budget_pause(true);
+    if (!cap_wasm_resolve(name, &config.target_addr)) {
+        cap_wasm_budget_pause(false);
+        return -CAP_WASM_ENOENT;
+    }
+    config.count = (uint32_t)count;
+    config.timeout_ms = CAP_WASM_PING_TIMEOUT_MS;
+    config.interval_ms = CAP_WASM_PING_INTERVAL_MS;
+    ping.done = xSemaphoreCreateBinary();
+    if (!ping.done || esp_ping_new_session(&config, &cbs, &session) != ESP_OK || esp_ping_start(session) != ESP_OK) {
+        if (session) {
+            esp_ping_delete_session(session);
+        }
+        if (ping.done) {
+            vSemaphoreDelete(ping.done);
+        }
+        cap_wasm_budget_pause(false);
+        return -CAP_WASM_EIO;
+    }
+    /* The session ends by itself after `count` probes of at most timeout_ms each; the callbacks use
+     * `ping` on this stack, so wait for the end callback before returning. */
+    xSemaphoreTake(ping.done, portMAX_DELAY);
+    esp_ping_get_profile(session, ESP_PING_PROF_REQUEST, &sent, sizeof(sent));
+    esp_ping_get_profile(session, ESP_PING_PROF_REPLY, &received, sizeof(received));
+    esp_ping_delete_session(session);
+    vSemaphoreDelete(ping.done);
+    cap_wasm_budget_pause(false);
+
+    len = snprintf(out, out_cap, "{\"host\":\"%s\",\"ip\":\"%s\",\"sent\":%" PRIu32 ",\"received\":%" PRIu32,
+                   name, ipaddr_ntoa(&config.target_addr), sent, received);
+    if (received > 0 && len > 0 && (uint32_t)len < out_cap) {
+        len += snprintf(out + len, out_cap - len, ",\"rtt_ms\":{\"min\":%" PRIu32 ",\"avg\":%" PRIu32 ",\"max\":%" PRIu32 "}",
+                        ping.rtt_min, ping.rtt_sum / received, ping.rtt_max);
+    }
+    if (len > 0 && (uint32_t)len < out_cap) {
+        len += snprintf(out + len, out_cap - len, "}");
+    }
+    ESP_LOGI(TAG, "[%s] ping %s: %" PRIu32 "/%" PRIu32 " replies", app->name, name, received, sent);
+    return len > 0 && (uint32_t)len < out_cap ? len : -CAP_WASM_ENOBUFS;
+}
+
 /* ---------- Misc ---------- */
 
 static int64_t cap_wasm_now_ms(wasm_exec_env_t env)
@@ -417,6 +553,7 @@ NativeSymbol g_cap_wasm_natives[] = {
     { "http_profile_request", cap_wasm_http_profile_request, "(*~*~*~*~*~)i", NULL },
     { "http_response_read", cap_wasm_http_response_read, "(*~)i", NULL },
     { "confirm", cap_wasm_confirm, "(*~)i", NULL },
+    { "ping", cap_wasm_ping, "(*~i*~)i", NULL },
     { "now_ms", cap_wasm_now_ms, "()I", NULL },
     { "random", cap_wasm_random, "(*~)i", NULL },
 };
@@ -435,6 +572,7 @@ bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm)
         { "http_profile_request", CAP_WASM_PERM_HTTP },
         { "http_response_read", CAP_WASM_PERM_HTTP },
         { "confirm", CAP_WASM_PERM_CONFIRM },
+        { "ping", CAP_WASM_PERM_PING },
     };
 
     for (size_t i = 0; i < g_cap_wasm_native_count; i++) {

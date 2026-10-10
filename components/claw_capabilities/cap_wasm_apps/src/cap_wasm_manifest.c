@@ -79,7 +79,7 @@ static bool cap_wasm_parse_int(const cJSON *item, const char *field, uint32_t mi
 
 static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *out, char *err, size_t err_size)
 {
-    static const char *const keys[] = {"log", "kv", "http_profiles", "confirm"};
+    static const char *const keys[] = {"log", "kv", "http_profiles", "confirm", "ping"};
     static const struct {
         const char *key;
         uint32_t perm;
@@ -87,6 +87,7 @@ static bool cap_wasm_parse_permissions(const cJSON *perms, cap_wasm_manifest_t *
         {"log", CAP_WASM_PERM_LOG},
         {"kv", CAP_WASM_PERM_KV},
         {"confirm", CAP_WASM_PERM_CONFIRM},
+        {"ping", CAP_WASM_PERM_PING},
     };
     const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(perms, "http_profiles");
     const cJSON *item = NULL;

@@ -13,6 +13,7 @@ idf_component_register(
         esp_hw_support
         esp_timer
         json
+        lwip
         nvs_flash
         pthread
 )

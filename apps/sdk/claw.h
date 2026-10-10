@@ -84,6 +84,12 @@ CLAW_IMPORT("http_response_read") int32_t claw_http_response_read(void *out, uin
  * waits up to 60 s. 0 = confirmed, -CLAW_ECANCELED, -CLAW_ETIMEDOUT, -CLAW_ENOTSUP outside Telegram. */
 CLAW_IMPORT("confirm") int32_t claw_confirm(const char *text, uint32_t len);
 
+/* permission "ping": sends `count` (1-10) ICMP echo requests to a host name or IPv4/IPv6 literal
+ * ([A-Za-z0-9.:-]) and writes a JSON summary to out:
+ * {"host","ip","sent","received","rtt_ms":{"min","avg","max"}} (rtt_ms only with replies).
+ * Returns its length, -CLAW_ENOENT (unknown host), -CLAW_EINVAL or -CLAW_ENOBUFS. Only in tool_call. */
+CLAW_IMPORT("ping") int32_t claw_ping(const char *host, uint32_t host_len, int32_t count, char *out, uint32_t out_cap);
+
 /* Unix time in ms (before SNTP sync this is close to 0). */
 CLAW_IMPORT("now_ms") int64_t claw_now_ms(void);
 

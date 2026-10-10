@@ -30,6 +30,7 @@ typedef enum {
     CAP_WASM_PERM_KV = 1 << 1,
     CAP_WASM_PERM_HTTP = 1 << 2,
     CAP_WASM_PERM_CONFIRM = 1 << 3,
+    CAP_WASM_PERM_PING = 1 << 4,
 } cap_wasm_perm_t;
 
 typedef struct {
