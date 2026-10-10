@@ -90,25 +90,6 @@
     ]
   },
   {
-    "id": "im_attachment_saved_reply",
-    "description": "Reply when an IM attachment is saved.",
-    "enabled": true,
-    "ack": "{{event.channel}} attachment saved",
-    "match": {
-      "event_type": "attachment_saved"
-    },
-    "actions": [
-      {
-        "type": "send_message",
-        "input": {
-          "channel": "{{event.source_channel}}",
-          "chat_id": "{{event.chat_id}}",
-          "message": "File received from {{event.source_channel}}"
-        }
-      }
-    ]
-  },
-  {
     "id": "im_any_message_agent",
     "description": "Route IM text messages to the agent.",
     "enabled": true,
