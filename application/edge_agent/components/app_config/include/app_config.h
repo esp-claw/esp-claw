@@ -51,6 +51,7 @@ typedef struct {
     char search_brave_key[APP_CONFIG_STR_LEN];
     char search_tavily_key[APP_CONFIG_STR_LEN];
     char search_http_allowlist[APP_CONFIG_STR_LEN];
+    char ssh_hosts[APP_CLAW_SSH_HOSTS_LEN];
     char stt_base_url[APP_CONFIG_STR_LEN];
     char stt_api_key[APP_CONFIG_STR_LEN];
     char stt_model[64];

@@ -20,6 +20,7 @@ extern "C" {
 #define APP_CLAW_TIMEOUT_LEN          16
 #define APP_CLAW_PATH_LEN             64
 #define APP_CLAW_FILE_PATH_LEN        96
+#define APP_CLAW_SSH_HOSTS_LEN        1536
 
 typedef struct claw_core_state *claw_core_handle_t;
 
@@ -50,6 +51,7 @@ typedef struct {
     char search_brave_key[APP_CLAW_STR_LEN];
     char search_tavily_key[APP_CLAW_STR_LEN];
     char search_http_allowlist[APP_CLAW_STR_LEN];
+    char ssh_hosts[APP_CLAW_SSH_HOSTS_LEN];
     char stt_base_url[APP_CLAW_STR_LEN];
     char stt_api_key[APP_CLAW_STR_LEN];
     char stt_model[APP_CLAW_MODEL_LEN];

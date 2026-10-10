@@ -36,6 +36,7 @@ export type AppConfig = {
   search_brave_key: string;
   search_tavily_key: string;
   search_http_allowlist: string;
+  ssh_hosts: string;
   stt_base_url: string;
   stt_api_key: string;
   stt_model: string;
@@ -80,7 +81,7 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   ],
   search: ['search_brave_key', 'search_tavily_key', 'search_http_allowlist'],
   stt: ['stt_base_url', 'stt_api_key', 'stt_model'],
-  capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups'],
+  capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups', 'ssh_hosts'],
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],
 };

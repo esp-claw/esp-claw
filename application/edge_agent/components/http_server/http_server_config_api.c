@@ -88,6 +88,7 @@ static const config_field_def_t CONFIG_FIELDS[] = {
 
     CONFIG_FIELD("capabilities", enabled_cap_groups),
     CONFIG_FIELD("capabilities", llm_visible_cap_groups),
+    CONFIG_FIELD("capabilities", ssh_hosts),
 
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
@@ -369,6 +370,19 @@ static esp_err_t config_post_handler(httpd_req_t *req)
             return httpd_resp_send_err(req,
                                        HTTPD_400_BAD_REQUEST,
                                        "LLM boolean fields must be true/false");
+        }
+        if (strcmp(field->name, "ssh_hosts") == 0 && item->valuestring[0]) {
+            /* Truncated JSON would silently drop hosts, so reject instead of clipping. */
+            cJSON *hosts = cJSON_Parse(item->valuestring);
+            bool valid = cJSON_IsArray(hosts) && strlen(item->valuestring) < field->size;
+
+            cJSON_Delete(hosts);
+            if (!valid) {
+                cJSON_Delete(root);
+                free(config);
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                           "ssh_hosts must be a JSON array of at most 1535 bytes");
+            }
         }
         strlcpy(field_mutable(config, field), item->valuestring, field->size);
         applied_count++;

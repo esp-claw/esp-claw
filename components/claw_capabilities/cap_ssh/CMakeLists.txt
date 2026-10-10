@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "src/cap_ssh.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        claw_cap
+    PRIV_REQUIRES
+        cap_im_platform
+        freertos
+        mbedtls
+        nvs_flash
+)
