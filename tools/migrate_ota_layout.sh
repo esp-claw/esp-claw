@@ -12,9 +12,11 @@
 #    ./ota-migration-<timestamp>/
 # 2. writes the bootloader (with rollback support), the new partition table, the initial otadata
 #    and the app into ota_0
-# 3. writes the storage dump back at the storage offset of the new table
-# NVS is never written. Offsets come from the two CSVs; every esptool command is printed and each
-# write asks for confirmation. Do not use `idf.py flash` for this: it would also write a fresh
+# 3. if nvs moved or grew: writes the old NVS bytes (from the full backup, padded with 0xFF to the
+#    new size) at the nvs offset of the new table; otherwise NVS is not written
+# 4. writes the storage dump back at the storage offset of the new table
+# Offsets come from the two CSVs; every esptool command is printed and each write asks for
+# confirmation. Do not use `idf.py flash` for this: it would also write a fresh
 # storage.bin over /fatfs.
 set -euo pipefail
 
@@ -86,8 +88,9 @@ read -r NEW_NVS_OFF NEW_NVS_SIZE < <(part "$NEW_CSV" nvs)
 read -r OTA0_OFF OTA0_SIZE < <(part "$NEW_CSV" ota_0)
 read -r OTADATA_OFF _ < <(part "$NEW_CSV" otadata)
 
-[ "$OLD_NVS_OFF $OLD_NVS_SIZE" = "$NEW_NVS_OFF $NEW_NVS_SIZE" ] ||
-    { echo "nvs moved between the tables; settings would be lost" >&2; exit 1; }
+[ "$NEW_NVS_SIZE" -ge "$OLD_NVS_SIZE" ] ||
+    { echo "nvs is smaller in the new table; settings would not fit" >&2; exit 1; }
+NVS_MOVED=$([ "$OLD_NVS_OFF $OLD_NVS_SIZE" = "$NEW_NVS_OFF $NEW_NVS_SIZE" ] && echo 0 || echo 1)
 [ "$OLD_STORAGE_SIZE" = "$NEW_STORAGE_SIZE" ] ||
     { echo "storage size differs between the tables; a raw copy is not possible" >&2; exit 1; }
 
@@ -111,9 +114,10 @@ mkdir -p "$BACKUP"
 cp "$OLD_CSV" "$NEW_CSV" "$BACKUP/"
 echo "Backups go to $BACKUP"
 echo "storage: old $(hex "$OLD_STORAGE_OFF") -> new $(hex "$NEW_STORAGE_OFF"), $(hex "$NEW_STORAGE_SIZE") bytes;" \
-     "nvs $(hex "$NEW_NVS_OFF") +$(hex "$NEW_NVS_SIZE") is not written"
+     "nvs: old $(hex "$OLD_NVS_OFF") +$(hex "$OLD_NVS_SIZE") -> new $(hex "$NEW_NVS_OFF") +$(hex "$NEW_NVS_SIZE")" \
+     "($([ "$NVS_MOVED" = 1 ] && echo "copied" || echo "not written"))"
 
-echo "== 1/3 Backup (read only)"
+echo "== 1/4 Backup (read only)"
 run read_flash 0 "$(hex "$FLASH_SIZE")" "$BACKUP/full_flash_8MB.bin"
 run read_flash "$(hex "$OLD_STORAGE_OFF")" "$(hex "$OLD_STORAGE_SIZE")" "$BACKUP/storage.bin"
 [ "$(stat -c %s "$BACKUP/full_flash_8MB.bin")" = "$FLASH_SIZE" ] &&
@@ -122,16 +126,30 @@ run read_flash "$(hex "$OLD_STORAGE_OFF")" "$(hex "$OLD_STORAGE_SIZE")" "$BACKUP
 # The storage dump must be the same bytes as that range of the full dump.
 cmp <(tail -c +"$((OLD_STORAGE_OFF + 1))" "$BACKUP/full_flash_8MB.bin" | head -c "$OLD_STORAGE_SIZE") "$BACKUP/storage.bin" ||
     { echo "the two reads differ; check the USB connection and retry" >&2; exit 1; }
-(cd "$BACKUP" && sha256sum full_flash_8MB.bin storage.bin > SHA256SUMS)
+# Old NVS bytes from the full dump, padded with 0xFF (erased flash) to the new size.
+{ dd if="$BACKUP/full_flash_8MB.bin" iflag=skip_bytes,count_bytes skip="$OLD_NVS_OFF" count="$OLD_NVS_SIZE" status=none
+  head -c "$((NEW_NVS_SIZE - OLD_NVS_SIZE))" /dev/zero | tr '\0' '\377'; } > "$BACKUP/nvs.bin"
+[ "$(stat -c %s "$BACKUP/nvs.bin")" = "$NEW_NVS_SIZE" ] || { echo "nvs.bin has the wrong size" >&2; exit 1; }
+(cd "$BACKUP" && sha256sum full_flash_8MB.bin storage.bin nvs.bin > SHA256SUMS)
 
-echo "== 2/3 Bootloader, partition table, otadata, app"
+echo "== 2/4 Bootloader, partition table, otadata, app"
 WRITE_ARGS=(write_flash "$(hex "$BOOT_OFF")" "$BOOTLOADER" "$(hex "$PT_OFF")" "$PART_TABLE"
             "$(hex "$OTADATA_OFF")" "$OTADATA" "$(hex "$OTA0_OFF")" "$APP")
 echo "  ${ESPTOOL[*]} ${WRITE_ARGS[*]}"
 confirm "This replaces the bootloader, partition table and app."
 run "${WRITE_ARGS[@]}"
 
-echo "== 3/3 Storage back at its new offset"
+echo "== 3/4 NVS at its new offset"
+if [ "$NVS_MOVED" = 1 ]; then
+    NVS_ARGS=(write_flash "$(hex "$NEW_NVS_OFF")" "$BACKUP/nvs.bin")
+    echo "  ${ESPTOOL[*]} ${NVS_ARGS[*]}"
+    confirm "This writes the old NVS (settings) at the new nvs offset."
+    run "${NVS_ARGS[@]}"
+else
+    echo "nvs is unchanged, not written"
+fi
+
+echo "== 4/4 Storage back at its new offset"
 STORAGE_ARGS=(write_flash "$(hex "$NEW_STORAGE_OFF")" "$BACKUP/storage.bin")
 echo "  ${ESPTOOL[*]} ${STORAGE_ARGS[*]}"
 confirm "This writes the storage dump back."
