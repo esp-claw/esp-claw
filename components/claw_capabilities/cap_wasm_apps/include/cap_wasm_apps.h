@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 
@@ -48,6 +49,35 @@ void cap_wasm_updates_kick(void);
  *         health check that confirms a freshly booted image or lets the bootloader roll back.
  */
 esp_err_t cap_wasm_apps_register_group(const char *base_path);
+
+/*
+ * Management for a trusted local user channel (the authenticated web UI). Each call writes a
+ * result to `out`: JSON on success for the *_json calls, otherwise a human-readable message
+ * (also the error text on failure). They block until the WASM thread has handled the request.
+ */
+
+/**
+ * @brief  JSON array of the installed apps (name, version, state, enabled, tools, last_error, timer, ...).
+ *         ESP_ERR_INVALID_STATE when the WASM app runtime is not running.
+ */
+esp_err_t cap_wasm_apps_status_json(char *out, size_t size);
+
+/**
+ * @brief  JSON {app, settings:[{key, type, description, secret, set, value?, default?}]} of app
+ *         `name`; secret values are never included.
+ */
+esp_err_t cap_wasm_apps_settings_json(const char *name, char *out, size_t size);
+
+/**
+ * @brief  Enables (loads and registers its tools) or disables app `name`; persists across reboots.
+ */
+esp_err_t cap_wasm_apps_set_enabled(const char *name, bool enabled, char *out, size_t size);
+
+/**
+ * @brief  Sets setting `key` of app `name` to `value`, or resets it to its default when `value`
+ *         is NULL. The value is validated against the setting type declared in the manifest.
+ */
+esp_err_t cap_wasm_apps_set_setting(const char *name, const char *key, const char *value, char *out, size_t size);
 
 #ifdef __cplusplus
 }

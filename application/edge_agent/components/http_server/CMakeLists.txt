@@ -51,6 +51,11 @@ if(CONFIG_APP_CLAW_LUA_MODULE_HTTP_SERVER)
     list(APPEND http_server_requires lua_module_http_server)
 endif()
 
+if(CONFIG_APP_CLAW_CAP_WASM_APPS)
+    list(APPEND http_server_srcs "http_server_wasm_apps_api.c")
+    list(APPEND http_server_requires cap_wasm_apps)
+endif()
+
 idf_component_register(
     SRCS
         ${http_server_srcs}

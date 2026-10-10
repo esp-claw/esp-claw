@@ -35,6 +35,12 @@ const SkillsPage = lazy(() =>
 const FilesPage = lazy(() =>
   import('./pages/FilesPage').then((mod) => ({ default: mod.FilesPage })),
 );
+const WebDavPage = lazy(() =>
+  import('./pages/WebDavPage').then((mod) => ({ default: mod.WebDavPage })),
+);
+const WasmAppsPage = lazy(() =>
+  import('./pages/WasmAppsPage').then((mod) => ({ default: mod.WasmAppsPage })),
+);
 const WebImPage = lazy(() =>
   import('./pages/WebImPage').then((mod) => ({ default: mod.WebImPage })),
 );
@@ -251,6 +257,14 @@ const App: Component = () => {
               </Show>
               <Show when={currentTab() === 'webreq'}>
                 <WebReqPage
+                  onRestartRequest={() => void handleRestartRequest({ reloadOnSuccess: true })}
+                />
+              </Show>
+              <Show when={currentTab() === 'webdav'}>
+                <WebDavPage />
+              </Show>
+              <Show when={currentTab() === 'wasm'}>
+                <WasmAppsPage
                   onRestartRequest={() => void handleRestartRequest({ reloadOnSuccess: true })}
                 />
               </Show>
