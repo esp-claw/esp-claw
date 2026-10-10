@@ -49,11 +49,15 @@ esp_err_t cap_im_attachment_build_saved_paths(const char *root_dir,
                                               size_t saved_name_size,
                                               char *saved_path,
                                               size_t saved_path_size);
+/* Streams url to dest_path in small chunks. expected_bytes (0 if unknown) sizes the free-space
+ * check: known sizes need expected_bytes plus a fixed reserve, unknown sizes a larger fixed floor.
+ * Returns ESP_ERR_NO_MEM when the storage volume, not RAM, is too full. */
 esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
                                                  const char *root_dir,
                                                  const char *url,
                                                  const char *dest_path,
                                                  size_t max_bytes,
+                                                 size_t expected_bytes,
                                                  size_t *out_bytes);
 esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
                                                 const char *dest_path,

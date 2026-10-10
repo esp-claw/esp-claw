@@ -27,7 +27,10 @@
 #define CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES (512 * 1024)
 #define CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS 64
 #define CAP_IM_ATTACHMENT_PRUNE_MAX_SKIPPED 8
+/* Free-space floor when the download size is unknown. */
 #define CAP_IM_ATTACHMENT_MIN_FREE_BYTES (256 * 1024)
+/* Headroom kept free on top of a known download size, for sessions, memory and FAT metadata. */
+#define CAP_IM_ATTACHMENT_FREE_RESERVE_BYTES (64 * 1024)
 /* 2020-01-01 UTC. Earlier wall-clock time means the clock was never set, so mtimes are not ordered. */
 #define CAP_IM_ATTACHMENT_MIN_VALID_EPOCH 1577836800
 /* Inbox layout is <root>/<platform>/<chat>/<file>: two directory levels above the files. */
@@ -389,21 +392,26 @@ static uint64_t cap_im_attachment_free_bytes(const char *log_tag, const char *pa
 static uint64_t cap_im_attachment_gc(const char *log_tag,
                                      const char *root_dir,
                                      const char *keep_path,
-                                     bool need_free);
+                                     uint64_t need_free_bytes);
 
-static esp_err_t cap_im_attachment_ensure_free_space(const char *log_tag, const char *root_dir)
+static esp_err_t cap_im_attachment_ensure_free_space(const char *log_tag,
+                                                     const char *root_dir,
+                                                     size_t expected_bytes)
 {
+    uint64_t min_free = expected_bytes ?
+                        (uint64_t)expected_bytes + CAP_IM_ATTACHMENT_FREE_RESERVE_BYTES :
+                        CAP_IM_ATTACHMENT_MIN_FREE_BYTES;
     uint64_t free_bytes = cap_im_attachment_free_bytes(log_tag, root_dir);
 
-    if (free_bytes >= CAP_IM_ATTACHMENT_MIN_FREE_BYTES) {
+    if (free_bytes >= min_free) {
         return ESP_OK;
     }
-    ESP_LOGW(log_tag, "attachment storage low, running GC: free=%u min=%u",
-             (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES);
-    free_bytes = cap_im_attachment_gc(log_tag, root_dir, NULL, true);
-    if (free_bytes < CAP_IM_ATTACHMENT_MIN_FREE_BYTES) {
+    ESP_LOGW(log_tag, "attachment storage low, running GC: free=%u min=%u expected=%u",
+             (unsigned int)free_bytes, (unsigned int)min_free, (unsigned int)expected_bytes);
+    free_bytes = cap_im_attachment_gc(log_tag, root_dir, NULL, min_free);
+    if (free_bytes < min_free) {
         ESP_LOGW(log_tag, "attachment skipped, storage low after GC: free=%u min=%u",
-                 (unsigned int)free_bytes, (unsigned int)CAP_IM_ATTACHMENT_MIN_FREE_BYTES);
+                 (unsigned int)free_bytes, (unsigned int)min_free);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -414,6 +422,7 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
                                                  const char *url,
                                                  const char *dest_path,
                                                  size_t max_bytes,
+                                                 size_t expected_bytes,
                                                  size_t *out_bytes)
 {
     esp_http_client_config_t config = {0};
@@ -427,7 +436,7 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
         return ESP_ERR_INVALID_ARG;
     }
 
-    err = cap_im_attachment_ensure_free_space(log_tag, root_dir);
+    err = cap_im_attachment_ensure_free_space(log_tag, root_dir, expected_bytes);
     if (err != ESP_OK) {
         return err;
     }
@@ -614,19 +623,18 @@ static void cap_im_attachment_gc_scan(cap_im_attachment_gc_t *gc, size_t len, in
     closedir(dir);
 }
 
-static bool cap_im_attachment_gc_goal_met(uint64_t total_bytes, uint64_t free_bytes, bool need_free)
+static bool cap_im_attachment_gc_goal_met(uint64_t total_bytes, uint64_t free_bytes, uint64_t need_free_bytes)
 {
-    return total_bytes <= CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES &&
-           (!need_free || free_bytes >= CAP_IM_ATTACHMENT_MIN_FREE_BYTES);
+    return total_bytes <= CAP_IM_ATTACHMENT_INBOX_BUDGET_BYTES && free_bytes >= need_free_bytes;
 }
 
-/* Deletes the oldest inbox files across all platforms until the inbox fits the budget and, if
- * need_free, the volume has CAP_IM_ATTACHMENT_MIN_FREE_BYTES free, or nothing deletable is left.
+/* Deletes the oldest inbox files across all platforms until the inbox fits the budget and the
+ * volume has need_free_bytes free (0: no free-space goal), or nothing deletable is left.
  * keep_path (may be NULL) is never deleted. Returns free bytes after the run (UINT64_MAX if unknown). */
 static uint64_t cap_im_attachment_gc(const char *log_tag,
                                      const char *root_dir,
                                      const char *keep_path,
-                                     bool need_free)
+                                     uint64_t need_free_bytes)
 {
     cap_im_attachment_gc_t gc = {.keep_path = keep_path};
     uint64_t free_bytes = UINT64_MAX;
@@ -647,7 +655,7 @@ static uint64_t cap_im_attachment_gc(const char *log_tag,
         gc.oldest_path[0] = '\0';
         cap_im_attachment_gc_scan(&gc, strlen(gc.path), CAP_IM_ATTACHMENT_INBOX_DIR_DEPTH);
         free_bytes = cap_im_attachment_free_bytes(log_tag, root_dir);
-        if (cap_im_attachment_gc_goal_met(gc.total_bytes, free_bytes, need_free) ||
+        if (cap_im_attachment_gc_goal_met(gc.total_bytes, free_bytes, need_free_bytes) ||
                 gc.oldest_path[0] == '\0' || attempts >= CAP_IM_ATTACHMENT_PRUNE_MAX_REMOVALS) {
             break;
         }
@@ -676,7 +684,7 @@ void cap_im_attachment_prune_inbox(const char *log_tag, const char *root_dir, co
     if (!log_tag || !root_dir || !root_dir[0]) {
         return;
     }
-    cap_im_attachment_gc(log_tag, root_dir, keep_path, false);
+    cap_im_attachment_gc(log_tag, root_dir, keep_path, 0);
 }
 
 static esp_err_t cap_im_attachment_http_write_all(esp_http_client_handle_t client,

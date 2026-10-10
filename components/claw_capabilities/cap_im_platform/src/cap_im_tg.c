@@ -625,7 +625,8 @@ static cJSON *cap_im_tg_select_best_photo(cJSON *message_json)
     return selected;
 }
 
-static char *cap_im_tg_get_file_path(const char *file_id)
+/* Resolves file_id via getFile. *out_size gets Telegram's file_size, or 0 when not reported. */
+static char *cap_im_tg_get_file_path(const char *file_id, size_t *out_size)
 {
     char method[256];
     char *resp = NULL;
@@ -633,8 +634,10 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     cJSON *ok_json;
     cJSON *result_json;
     cJSON *file_path_json;
+    cJSON *file_size_json;
     char *copy = NULL;
 
+    *out_size = 0;
     if (!file_id || !file_id[0]) {
         return NULL;
     }
@@ -653,8 +656,12 @@ static char *cap_im_tg_get_file_path(const char *file_id)
     ok_json = cJSON_GetObjectItem(root, "ok");
     result_json = cJSON_GetObjectItem(root, "result");
     file_path_json = cJSON_IsObject(result_json) ? cJSON_GetObjectItem(result_json, "file_path") : NULL;
+    file_size_json = cJSON_IsObject(result_json) ? cJSON_GetObjectItem(result_json, "file_size") : NULL;
     if (cJSON_IsTrue(ok_json) && cJSON_IsString(file_path_json) && file_path_json->valuestring) {
         copy = strdup(file_path_json->valuestring);
+        if (cJSON_IsNumber(file_size_json) && file_size_json->valuedouble > 0) {
+            *out_size = (size_t)file_size_json->valuedouble;
+        }
     }
 
     cJSON_Delete(root);
@@ -744,6 +751,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     char download_url[CAP_IM_TG_PATH_BUF_SIZE];
     const char *extension = NULL;
     size_t bytes = 0;
+    size_t expected_bytes = 0;
     char *payload_json = NULL;
     bool grouped = false;
     esp_err_t err;
@@ -753,7 +761,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
         return ESP_ERR_INVALID_STATE;
     }
 
-    remote_path = cap_im_tg_get_file_path(file_id);
+    remote_path = cap_im_tg_get_file_path(file_id, &expected_bytes);
     if (!remote_path) {
         return ESP_FAIL;
     }
@@ -785,6 +793,7 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                                  strcmp(content_type, "audio") == 0 ?
                                                  MIN(s_tg.max_inbound_file_bytes, CAP_IM_TG_STT_MAX_BYTES) :
                                                  s_tg.max_inbound_file_bytes,
+                                                 expected_bytes,
                                                  &bytes);
     if (err != ESP_OK) {
         free(remote_path);
@@ -860,6 +869,20 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     return ESP_OK;
 }
 
+/* Human-readable download failure. ESP_ERR_NO_MEM from the download path means the DATA flash
+ * volume is full, not RAM; spelling that out keeps the agent from blaming RAM. */
+static const char *cap_im_tg_download_error_reason(esp_err_t err)
+{
+    switch (err) {
+    case ESP_ERR_NO_MEM:
+        return "Flash-Datenspeicher (DATA-Partition) voll, auch nach Aufräumen des Anhang-Eingangs";
+    case ESP_ERR_INVALID_SIZE:
+        return "Datei zu groß";
+    default:
+        return esp_err_to_name(err);
+    }
+}
+
 static void cap_im_tg_attachment_task(void *arg)
 {
     cap_im_tg_attachment_job_t *job = NULL;
@@ -893,10 +916,10 @@ static void cap_im_tg_attachment_task(void *arg)
                              job->message_id,
                              esp_err_to_name(err));
                     if (strcmp(job->content_type, "audio") == 0) {
-                        char body[96];
+                        char body[160];
 
                         snprintf(body, sizeof(body), "(konnte nicht heruntergeladen werden: %s)",
-                                 esp_err_to_name(err));
+                                 cap_im_tg_download_error_reason(err));
                         cap_im_tg_publish_voice_text(job->chat_id, job->sender_id, job->message_id,
                                                      job->caption, body);
                     }
