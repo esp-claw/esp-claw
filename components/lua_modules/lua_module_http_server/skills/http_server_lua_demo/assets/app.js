@@ -7,7 +7,7 @@ async function sendState(enabled) {
   statusEl.textContent = "Sending...";
   const response = await fetch(`/api/lua/${appId}/toggle`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Requested-With": "esp-claw" },
     body: JSON.stringify({ enabled }),
   });
   const data = await response.json();

@@ -11,6 +11,9 @@ This module lets a long-running Lua script publish static DATA files and HTTP ca
 - `app:url()` returns the static URL prefix, such as `/lua/panel/`.
 - `app:serve_forever()` dispatches callback requests until the Lua job is stopped.
 
+Pages and callbacks are served behind the web UI login (HTTPS, Telegram `/web`). Browser code must send an
+`X-Requested-With` header (any value) on POST requests; the device rejects state-changing requests without it.
+
 Callback `req` fields:
 - `method`: `"GET"` or `"POST"`
 - `path`: route path without the `/api/lua/<app_id>` prefix

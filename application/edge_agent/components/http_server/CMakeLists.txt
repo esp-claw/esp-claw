@@ -14,6 +14,9 @@ endif()
 
 set(http_server_srcs
     "http_server_core.c"
+    "http_server_auth.c"
+    "http_server_auth_core.c"
+    "http_server_tls.c"
     "http_server_assets.c"
     "http_server_capabilities_api.c"
     "http_server_config_api.c"
@@ -32,10 +35,15 @@ set(http_server_requires
     app_claw
     cap_im_local
     claw_cap
+    esp_app_format
     esp_http_server
+    esp_https_server
+    esp_netif
+    esp_timer
     fatfs
     heap
     mbedtls
+    nvs_flash
 )
 
 if(CONFIG_APP_CLAW_LUA_MODULE_HTTP_SERVER)

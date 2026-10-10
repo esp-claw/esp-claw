@@ -11,6 +11,7 @@
 
 #include "cJSON.h"
 #include "esp_http_server.h"
+#include "esp_netif.h"
 #include "http_server.h"
 
 #define HTTP_SERVER_CTRL_PORT         32769
@@ -20,9 +21,15 @@
 #define HTTP_SERVER_TMP_SUFFIX        ".davtmp"
 
 typedef struct {
-    httpd_handle_t server;
+    httpd_handle_t https; /* 443: UI, API, WebDAV */
+    httpd_handle_t http;  /* 80: redirect to HTTPS, or the UI over the soft-AP while access is open */
     char storage_base_path[HTTP_SERVER_PATH_MAX];
     http_server_services_t services;
+    bool login_enabled; /* Telegram can deliver /web login links (bot token and allowlist at boot) */
+    bool ap_protected;  /* the soft-AP has a password */
+    char cert_sha256[96];
+    char cert_names[96];
+    char cert_until[12];
 } http_server_ctx_t;
 
 http_server_ctx_t *http_server_ctx(void);
@@ -62,4 +69,15 @@ esp_err_t http_server_register_webim_routes(httpd_handle_t server);
 esp_err_t http_server_register_webdav_routes(httpd_handle_t server);
 void http_server_webdav_apply_config(const app_config_t *config);
 void http_server_webim_ws_fd_remove(int fd);
-esp_err_t http_server_captive_404_handler(httpd_req_t *req, httpd_err_code_t error);
+
+void http_server_httpd_config(httpd_config_t *config);
+esp_err_t http_server_register_routes(httpd_handle_t server);
+/* Registers `uri` behind the access check of http_server_auth.c. */
+esp_err_t http_server_register_uri(httpd_handle_t server, const httpd_uri_t *uri);
+esp_err_t http_server_register_login_routes(httpd_handle_t server);
+esp_err_t http_server_auth_open(httpd_handle_t hd, int sockfd);
+esp_err_t http_server_http_404_handler(httpd_req_t *req, httpd_err_code_t error);
+/* Address of a Wi-Fi interface ("WIFI_STA_DEF", "WIFI_AP_DEF") while it is up with an IP. */
+bool http_server_netif_ip(const char *ifkey, esp_netif_ip_info_t *info);
+/* (Re)starts the HTTPS server; `renew` replaces the certificate first. */
+esp_err_t http_server_https_start(bool renew);

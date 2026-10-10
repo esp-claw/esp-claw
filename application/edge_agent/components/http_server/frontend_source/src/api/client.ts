@@ -186,7 +186,13 @@ async function request<T>(
   const response = await fetch(url, {
     cache: 'no-store',
     ...init,
+    // The device refuses state-changing requests without it (CSRF check).
+    headers: { 'X-Requested-With': 'esp-claw', ...(init?.headers as Record<string, string> | undefined) },
   });
+  if (response.status === 401) {
+    // Session expired: the reloaded page explains how to log in again.
+    window.location.reload();
+  }
   if (!response.ok) {
     throw await parseError(response, fallbackError);
   }

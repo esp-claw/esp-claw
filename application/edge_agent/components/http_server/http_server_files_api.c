@@ -322,7 +322,7 @@ esp_err_t http_server_register_files_routes(httpd_handle_t server)
     };
 
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
-        esp_err_t err = httpd_register_uri_handler(server, &handlers[i]);
+        esp_err_t err = http_server_register_uri(server, &handlers[i]);
         if (err != ESP_OK) {
             return err;
         }

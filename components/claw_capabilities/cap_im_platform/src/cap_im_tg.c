@@ -1189,6 +1189,7 @@ static const struct {
     {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
     {"app", "Install, update or remove a WASM app", "apps_command", NULL},
     {"fw", "Firmware status, check and update", "firmware_command", NULL},
+    {"web", "Web UI login link (status, cert renew)", "web_command", NULL},
 };
 #define CAP_IM_TG_COMMAND_COUNT (sizeof(s_tg_commands) / sizeof(s_tg_commands[0]))
 

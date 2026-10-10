@@ -48,6 +48,18 @@ next to it. A new image must have WiFi and Telegram working within 5 minutes and
 otherwise the device rolls back to the previous one. Moving an existing board to this layout
 keeps NVS and `/fatfs`: `tools/migrate_ota_layout.sh -p <port>`.
 
+## Web UI access
+
+The web UI, `/api` and WebDAV are served over HTTPS (port 443) with a self-signed ECDSA certificate
+that the device creates on first start (stored in NVS). Only clients in the STA or setup-AP subnet
+can connect. Once a Telegram bot token and `tg_allowed_user_ids` are configured (read at boot),
+the UI needs a login: send `/web` to the bot and open the one-time link (5 minutes, single use);
+the session lasts 12 hours (at most 4, kept in RAM). `/web` also prints the certificate's SHA-256
+fingerprint to compare with the browser warning; `/web status` lists URLs and sessions, and
+`/web cert renew` issues a certificate for the current IP addresses. Port 80 redirects to HTTPS,
+except for the setup portal on the soft-AP while no login is possible: before Telegram is set up,
+or while the STA is down and the AP has a password. WebDAV is only available as `davs://<ip>/dav/`.
+
 
 ## Quick Start
 

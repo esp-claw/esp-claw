@@ -55,5 +55,5 @@ esp_err_t http_server_register_capabilities_routes(httpd_handle_t server)
         .handler = capabilities_get_handler,
     };
 
-    return httpd_register_uri_handler(server, &handler);
+    return http_server_register_uri(server, &handler);
 }

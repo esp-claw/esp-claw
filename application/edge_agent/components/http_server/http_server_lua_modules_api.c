@@ -54,5 +54,5 @@ esp_err_t http_server_register_lua_modules_routes(httpd_handle_t server)
         .handler = lua_modules_get_handler,
     };
 
-    return httpd_register_uri_handler(server, &handler);
+    return http_server_register_uri(server, &handler);
 }

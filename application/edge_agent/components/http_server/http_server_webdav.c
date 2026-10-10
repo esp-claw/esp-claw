@@ -51,6 +51,7 @@ void http_server_webdav_apply_config(const app_config_t *config)
 {
     strlcpy(s_user, config->webdav_user, sizeof(s_user));
     strlcpy(s_pass, config->webdav_password, sizeof(s_pass));
+    ESP_LOGI(TAG, "WebDAV %s at " DAV_PREFIX "/ (HTTPS only)", s_pass[0] ? "enabled" : "disabled (no webdav_password)");
 }
 
 /* ── Responses ──────────────────────────────────────────────────────── */
@@ -894,14 +895,6 @@ static esp_err_t webdav_handler(httpd_req_t *req)
 
 esp_err_t http_server_register_webdav_routes(httpd_handle_t server)
 {
-    http_server_ctx_t *ctx = http_server_ctx();
-    app_config_t *config = calloc(1, sizeof(*config));
-    if (config && ctx->services.load_config(config) == ESP_OK) {
-        http_server_webdav_apply_config(config);
-    }
-    free(config);
-    ESP_LOGI(TAG, "WebDAV %s at " DAV_PREFIX "/", s_pass[0] ? "enabled" : "disabled (no webdav_password)");
-
     const httpd_uri_t handler = { .uri = DAV_PREFIX "/?*", .method = HTTP_ANY, .handler = webdav_handler };
-    return httpd_register_uri_handler(server, &handler);
+    return http_server_register_uri(server, &handler);
 }
