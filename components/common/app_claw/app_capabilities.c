@@ -524,6 +524,11 @@ static esp_err_t app_cap_register_im_tg(const app_claw_config_t *config,
     ESP_RETURN_ON_ERROR(cap_im_tg_set_allowed_user_ids(config->tg_allowed_user_ids),
                         TAG, "Failed to set Telegram allowed user ids");
 
+    ESP_RETURN_ON_ERROR(cap_im_tg_set_stt_config(config->stt_base_url,
+                                                 config->stt_api_key,
+                                                 config->stt_model),
+                        TAG, "Failed to set Telegram STT config");
+
     return ESP_OK;
 }
 #endif

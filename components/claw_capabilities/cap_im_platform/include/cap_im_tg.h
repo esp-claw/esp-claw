@@ -25,6 +25,8 @@ esp_err_t cap_im_tg_register_group(void);
 esp_err_t cap_im_tg_set_token(const char *bot_token);
 /* Comma-separated numeric Telegram user ids; an empty list drops every update. */
 esp_err_t cap_im_tg_set_allowed_user_ids(const char *user_ids_csv);
+/* Speech-to-text for inbound voice/audio; an empty api_key disables transcription. */
+esp_err_t cap_im_tg_set_stt_config(const char *base_url, const char *api_key, const char *model);
 esp_err_t cap_im_tg_set_attachment_config(
     const cap_im_tg_attachment_config_t *config);
 esp_err_t cap_im_tg_start(void);

@@ -58,6 +58,9 @@ typedef struct {
 #define APP_DEFAULT_WECHAT_ACCOUNT_ID        "default"
 #define APP_DEFAULT_SEARCH_BRAVE_KEY         ""
 #define APP_DEFAULT_SEARCH_TAVILY_KEY        ""
+#define APP_DEFAULT_STT_BASE_URL             "https://api.openai.com/v1"
+#define APP_DEFAULT_STT_API_KEY              ""
+#define APP_DEFAULT_STT_MODEL                "gpt-4o-mini-transcribe"
 #define APP_DEFAULT_ENABLED_CAP_GROUPS       ""
 #define APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS   ""
 #define APP_DEFAULT_ENABLED_LUA_MODULES      ""
@@ -95,6 +98,9 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(search_brave_key, "brave_key", APP_DEFAULT_SEARCH_BRAVE_KEY),
     APP_CONFIG_FIELD(search_tavily_key, "tavily_key", APP_DEFAULT_SEARCH_TAVILY_KEY),
     APP_CONFIG_FIELD(search_http_allowlist, "http_allow_ls", APP_SEARCH_HTTP_ALLOWLIST),
+    APP_CONFIG_FIELD(stt_base_url, "stt_base_url", APP_DEFAULT_STT_BASE_URL),
+    APP_CONFIG_FIELD(stt_api_key, "stt_api_key", APP_DEFAULT_STT_API_KEY),
+    APP_CONFIG_FIELD(stt_model, "stt_model", APP_DEFAULT_STT_MODEL),
     APP_CONFIG_FIELD(enabled_cap_groups, "en_cap_groups", APP_DEFAULT_ENABLED_CAP_GROUPS),
     APP_CONFIG_FIELD(llm_visible_cap_groups, "vis_cap_groups", APP_DEFAULT_LLM_VISIBLE_CAP_GROUPS),
     APP_CONFIG_FIELD(enabled_lua_modules, "en_lua_mods", APP_DEFAULT_ENABLED_LUA_MODULES),
@@ -587,6 +593,9 @@ void app_config_to_claw(const app_config_t *config, app_claw_config_t *out)
     strlcpy(out->search_http_allowlist,
             config->search_http_allowlist,
             sizeof(out->search_http_allowlist));
+    strlcpy(out->stt_base_url, config->stt_base_url, sizeof(out->stt_base_url));
+    strlcpy(out->stt_api_key, config->stt_api_key, sizeof(out->stt_api_key));
+    strlcpy(out->stt_model, config->stt_model, sizeof(out->stt_model));
     strlcpy(out->enabled_cap_groups, config->enabled_cap_groups, sizeof(out->enabled_cap_groups));
     strlcpy(out->llm_visible_cap_groups, config->llm_visible_cap_groups, sizeof(out->llm_visible_cap_groups));
     strlcpy(out->enabled_lua_modules, config->enabled_lua_modules, sizeof(out->enabled_lua_modules));

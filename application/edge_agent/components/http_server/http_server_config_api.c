@@ -82,6 +82,10 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_SECRET_FIELD("search", search_tavily_key),
     CONFIG_FIELD("search",       search_http_allowlist),
 
+    CONFIG_FIELD("stt",          stt_base_url),
+    CONFIG_SECRET_FIELD("stt",   stt_api_key),
+    CONFIG_FIELD("stt",          stt_model),
+
     CONFIG_FIELD("capabilities", enabled_cap_groups),
     CONFIG_FIELD("capabilities", llm_visible_cap_groups),
 
