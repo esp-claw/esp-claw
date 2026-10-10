@@ -1,5 +1,5 @@
 > [!NOTE]
-> **This is an unofficial community fork** of [espressif/esp-claw](https://github.com/espressif/esp-claw), maintained at [esp-claw/esp-claw](https://github.com/esp-claw/esp-claw). It is not affiliated with or endorsed by Espressif.
+> **This is an unofficial community fork** of [espressif/esp-claw](https://github.com/espressif/esp-claw), maintained at [esp-claw/esp-claw](https://github.com/esp-claw/esp-claw). It is not affiliated with or endorsed by Espressif. See [FORK.md](FORK.md) for what the fork changes, releases and syncing with upstream, and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 > The fork adds WASM apps, SSH, WebDAV, credential profiles, Telegram rich messages, voice transcription and long-term memory; see the [organization profile](https://github.com/esp-claw).
 > Apps: see https://github.com/esp-claw/app-sdk and https://github.com/esp-claw/app-template.
 > The SSH tool statically links [libssh](https://www.libssh.org/), which is LGPL-2.1. Check its terms before you distribute firmware binaries.
