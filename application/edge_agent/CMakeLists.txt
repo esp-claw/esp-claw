@@ -4,6 +4,39 @@ include("${CMAKE_SOURCE_DIR}/tools/cmake/esp_idf_patch.cmake")
 include("${CMAKE_SOURCE_DIR}/tools/cmake/flash_partition_defaults.cmake")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# Local builds: derive the app version from the git tag so the firmware update check
+# (which compares esp_app_desc_t.version) does not see 0.1.0. Release CI writes
+# version.txt, which must win, so PROJECT_VER is only set when that file is absent.
+# v0.2.6-3-gabc1234-dirty -> 0.2.6+3.gabc1234.dirty (semver build metadata, equal to 0.2.6).
+if(NOT EXISTS "${CMAKE_CURRENT_LIST_DIR}/version.txt" AND NOT DEFINED PROJECT_VER)
+    execute_process(
+        COMMAND git -C "${CMAKE_CURRENT_LIST_DIR}/../.." describe --tags --dirty
+        OUTPUT_VARIABLE EDGE_AGENT_GIT_DESCRIBE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    # Strip -dirty first so it cannot be mistaken for a pre-release identifier.
+    string(REGEX REPLACE "-dirty$" "" EDGE_AGENT_GIT_CLEAN "${EDGE_AGENT_GIT_DESCRIBE}")
+    if(EDGE_AGENT_GIT_CLEAN MATCHES "^v?([0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?)(-([0-9]+)-(g[0-9a-f]+))?$")
+        set(EDGE_AGENT_GIT_VERSION "${CMAKE_MATCH_1}")
+        set(EDGE_AGENT_GIT_BUILD "")
+        if(CMAKE_MATCH_3)
+            set(EDGE_AGENT_GIT_BUILD "${CMAKE_MATCH_4}.${CMAKE_MATCH_5}")
+        endif()
+        if(NOT EDGE_AGENT_GIT_CLEAN STREQUAL EDGE_AGENT_GIT_DESCRIBE)
+            string(JOIN "." EDGE_AGENT_GIT_BUILD ${EDGE_AGENT_GIT_BUILD} "dirty")
+        endif()
+        if(EDGE_AGENT_GIT_BUILD)
+            string(APPEND EDGE_AGENT_GIT_VERSION "+${EDGE_AGENT_GIT_BUILD}")
+        endif()
+        string(LENGTH "${EDGE_AGENT_GIT_VERSION}" EDGE_AGENT_GIT_VERSION_LEN)
+        if(EDGE_AGENT_GIT_VERSION_LEN LESS_EQUAL 31)
+            set(PROJECT_VER "${EDGE_AGENT_GIT_VERSION}")
+        endif()
+    endif()
+endif()
+
 project(edge_agent VERSION 0.1.0)
 
 set(EDGE_AGENT_FATFS_IMAGE_ROOT "${CMAKE_SOURCE_DIR}/fatfs_image")
