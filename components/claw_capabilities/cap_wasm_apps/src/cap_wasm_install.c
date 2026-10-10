@@ -14,10 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "cap_http_rules.h"
 #include "cap_wasm_internal.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -37,6 +39,7 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_CONFIRM_MS    120000
 #define CAP_WASM_JOB_STACK     (12 * 1024)
 #define CAP_WASM_OUTPUT_MAX    1024
+#define CAP_WASM_MAX_REDIRECTS 5
 
 static atomic_flag s_busy = ATOMIC_FLAG_INIT;
 
@@ -44,12 +47,37 @@ typedef struct {
     uint8_t *buf;
     size_t len;
     bool too_big;
+    bool redirect_refused;
+    char *location;
+    int location_headers; /* Location headers in the current response */
 } cap_wasm_dl_t;
 
 static esp_err_t cap_wasm_dl_event(esp_http_client_event_t *evt)
 {
     cap_wasm_dl_t *dl = evt->user_data;
 
+    if (evt->event_id == HTTP_EVENT_HEADERS_SENT) {
+        free(dl->location);
+        dl->location = NULL;
+        dl->location_headers = 0;
+        return ESP_OK;
+    }
+    if (evt->event_id == HTTP_EVENT_ON_HEADER && evt->header_key && evt->header_value &&
+            strcasecmp(evt->header_key, "Location") == 0) {
+        /* esp_http_client concatenates repeated Location headers: refuse those. */
+        free(dl->location);
+        dl->location = ++dl->location_headers == 1 ? strdup(evt->header_value) : NULL;
+        return ESP_OK;
+    }
+    /* Release downloads redirect to signed CDN URLs: follow https targets only (no auth is sent). */
+    if (evt->event_id == HTTP_EVENT_REDIRECT) {
+        if (!dl->location || strlen(dl->location) >= CAP_HTTP_REQUEST_REDIRECT_URL_MAX ||
+                !cap_http_rules_https_location_ok(dl->location)) {
+            dl->redirect_refused = true;
+            return ESP_FAIL;
+        }
+        return esp_http_client_set_redirection(evt->client);
+    }
     /* Bodies of redirect responses also arrive here. */
     if (evt->event_id != HTTP_EVENT_ON_DATA || esp_http_client_get_status_code(evt->client) != 200 || dl->too_big) {
         return ESP_OK;
@@ -71,8 +99,11 @@ static uint8_t *cap_wasm_download(const char *url, size_t *out_len, char *err, s
         .event_handler = cap_wasm_dl_event,
         .user_data = &dl,
         .timeout_ms = CAP_WASM_HTTP_MS,
-        .buffer_size = 2048,
+        .buffer_size = 4096, /* response headers, incl. a long Location */
+        .buffer_size_tx = CAP_HTTP_REQUEST_REDIRECT_URL_MAX + 512, /* request line of the redirect target */
         .crt_bundle_attach = esp_crt_bundle_attach,
+        .disable_auto_redirect = true,
+        .max_redirection_count = CAP_WASM_MAX_REDIRECTS,
     };
     esp_http_client_handle_t client = dl.buf ? esp_http_client_init(&cfg) : NULL;
     esp_err_t ret = client ? esp_http_client_perform(client) : ESP_ERR_NO_MEM;
@@ -81,6 +112,7 @@ static uint8_t *cap_wasm_download(const char *url, size_t *out_len, char *err, s
     if (client) {
         esp_http_client_cleanup(client);
     }
+    free(dl.location);
     /* The query string may carry a token, so it is not logged. */
     ESP_LOGI(TAG, "download %.*s: %s, HTTP %d, %u bytes", (int)strcspn(url, "?#"), url, esp_err_to_name(ret), status,
              (unsigned)dl.len);
@@ -90,6 +122,8 @@ static uint8_t *cap_wasm_download(const char *url, size_t *out_len, char *err, s
     }
     if (dl.too_big) {
         snprintf(err, err_size, "the package is larger than %d KB", CAP_WASM_PKG_MAX / 1024);
+    } else if (dl.redirect_refused) {
+        snprintf(err, err_size, "redirect refused (HTTP %d to a non-https or overlong URL)", status);
     } else {
         snprintf(err, err_size, "download failed (%s, HTTP %d)", esp_err_to_name(ret), status);
     }
