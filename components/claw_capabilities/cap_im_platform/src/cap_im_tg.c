@@ -141,6 +141,7 @@ typedef struct {
 } cap_im_tg_confirm_t;
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
+static volatile bool s_tg_online; /* a getUpdates poll succeeded since boot */
 static bool s_tg_initialized;
 static bool s_tg_rich_unsupported;
 static cap_im_tg_confirm_t s_confirm;
@@ -2307,7 +2308,9 @@ static void cap_im_tg_poll_task(void *arg)
 
     cap_im_tg_set_commands();
     while (!s_tg.stop_requested) {
-        if (cap_im_tg_poll_once() != ESP_OK) {
+        if (cap_im_tg_poll_once() == ESP_OK) {
+            s_tg_online = true;
+        } else {
             if (s_tg.stop_requested) {
                 break;
             }
@@ -2319,6 +2322,11 @@ static void cap_im_tg_poll_task(void *arg)
 
     s_tg.poll_task = NULL;
     claw_task_delete(NULL);
+}
+
+bool cap_im_tg_is_online(void)
+{
+    return s_tg_online;
 }
 
 static esp_err_t cap_im_tg_gateway_init(void)

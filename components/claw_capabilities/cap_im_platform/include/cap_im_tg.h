@@ -46,6 +46,8 @@ esp_err_t cap_im_tg_send_html(const char *chat_id, const char *html, int64_t *ou
  */
 esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *const *labels, size_t label_count,
                             uint32_t timeout_ms, int *out_choice, int64_t *out_message_id);
+/* True once a getUpdates poll succeeded since boot (the bot token works and Telegram is reachable). */
+bool cap_im_tg_is_online(void);
 /* Replaces a sent message with `html` and removes its inline buttons. */
 esp_err_t cap_im_tg_edit_message(const char *chat_id, int64_t message_id, const char *html);
 

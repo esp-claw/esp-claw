@@ -76,6 +76,35 @@ bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
                          char key_id[CAP_WASM_KEY_ID_LEN + 1], char *err, size_t err_size);
 
 /*
+ * Firmware signature (<image>.sig.json, written by tools/fwsign.py):
+ *   {"alg":"ed25519","key_id":"<8 hex>","version":"<v>","project":"<p>","size":N,"sha256":"<hex>","sig":"<b64>"}
+ * "sig" is the Ed25519 signature over the canonical bytes
+ *   {"project":"<p>","version":"<v>","size":N,"sha256":"<hex>"}
+ * in exactly this key order, no whitespace, lowercase hex. project and version are the image's
+ * esp_app_desc_t fields: 1-31 printable ASCII chars without '"' or '\\'.
+ */
+#define CAP_WASM_FW_TEXT_MAX 31
+
+typedef struct {
+    char project[CAP_WASM_FW_TEXT_MAX + 1];
+    char version[CAP_WASM_FW_TEXT_MAX + 1];
+    uint32_t size;
+    char sha256[CAP_WASM_SHA_HEX_LEN + 1];
+    char key_id[CAP_WASM_KEY_ID_LEN + 1];
+} cap_wasm_fw_sig_t;
+
+/* Writes the canonical signed bytes of a firmware signature; returns their length, or 0 when too small. */
+size_t cap_wasm_fw_sig_canonical(const char *project, const char *version, uint32_t size, const char *sha256,
+                                 char *out, size_t out_size);
+
+/*
+ * Parses a firmware signature, checks its format, that key_id is in `keys` and the Ed25519
+ * signature. The image itself is checked later against out->size and out->sha256.
+ */
+bool cap_wasm_fw_sig_verify(const char *sig_json, const cap_wasm_key_t *keys, size_t key_count,
+                            cap_wasm_fw_sig_t *out, char *err, size_t err_size);
+
+/*
  * Orders MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD] versions like semver: numeric fields, a
  * pre-release sorts before its release, pre-release identifiers compare numerically when both are
  * digits and as ASCII otherwise (digits first), build metadata is ignored. Returns false when

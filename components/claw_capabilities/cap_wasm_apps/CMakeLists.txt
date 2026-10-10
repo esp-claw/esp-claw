@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "src/cap_wasm_apps.c"
+        "src/cap_wasm_fw.c"
         "src/cap_wasm_host.c"
         "src/cap_wasm_install.c"
         "src/cap_wasm_manifest.c"
@@ -14,11 +15,13 @@ idf_component_register(
     REQUIRES
         claw_cap
     PRIV_REQUIRES
+        app_update
         cap_http_request
         cap_im_platform
         esp_http_client
         esp_hw_support
         esp_timer
+        esp_wifi
         json
         lwip
         mbedtls

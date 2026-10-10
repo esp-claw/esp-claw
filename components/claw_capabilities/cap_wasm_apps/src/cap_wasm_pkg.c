@@ -5,6 +5,7 @@
  */
 #include "cap_wasm_pkg.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,88 @@ bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
         goto done;
     }
     strcpy(key_id, keys[k].key_id);
+    ok = true;
+
+done:
+    cJSON_Delete(root);
+    return ok;
+}
+
+size_t cap_wasm_fw_sig_canonical(const char *project, const char *version, uint32_t size, const char *sha256,
+                                 char *out, size_t out_size)
+{
+    int n = snprintf(out, out_size, "{\"project\":\"%s\",\"version\":\"%s\",\"size\":%" PRIu32 ",\"sha256\":\"%s\"}",
+                     project, version, size, sha256);
+
+    return n > 0 && (size_t)n < out_size ? (size_t)n : 0;
+}
+
+/* 1..max printable ASCII chars that JSON would not escape. */
+static bool cap_wasm_fw_text_ok(const char *s, size_t max)
+{
+    size_t len = s ? strlen(s) : 0;
+
+    if (len == 0 || len > max) {
+        return false;
+    }
+    for (; *s; s++) {
+        if (*s < 0x20 || *s > 0x7e || *s == '"' || *s == '\\') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cap_wasm_fw_sig_verify(const char *sig_json, const cap_wasm_key_t *keys, size_t key_count,
+                            cap_wasm_fw_sig_t *out, char *err, size_t err_size)
+{
+    static const char *const keys_top[] = {"alg", "key_id", "version", "project", "size", "sha256", "sig"};
+    cJSON *root = cJSON_Parse(sig_json);
+    const cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "size");
+    const char *alg = cap_wasm_json_str(root, "alg");
+    const char *kid = cap_wasm_json_str(root, "key_id");
+    const char *version = cap_wasm_json_str(root, "version");
+    const char *project = cap_wasm_json_str(root, "project");
+    const char *sha256 = cap_wasm_json_str(root, "sha256");
+    const char *sig_b64 = cap_wasm_json_str(root, "sig");
+    char canonical[192];
+    uint8_t sig[64];
+    size_t canonical_len;
+    size_t k;
+    bool ok = false;
+
+    memset(out, 0, sizeof(*out));
+    if (!cJSON_IsObject(root)) {
+        snprintf(err, err_size, "the .sig.json is not a signature object");
+        goto done;
+    }
+    if (!cap_wasm_keys_known(root, keys_top, 7, "signature key", err, err_size)) {
+        goto done;
+    }
+    if (!alg || strcmp(alg, "ed25519") != 0 || !kid || !sig_b64 || !cap_wasm_fw_text_ok(version, CAP_WASM_FW_TEXT_MAX) ||
+            !cap_wasm_fw_text_ok(project, CAP_WASM_FW_TEXT_MAX) || !sha256 || strlen(sha256) != CAP_WASM_SHA_HEX_LEN ||
+            strspn(sha256, "0123456789abcdef") != CAP_WASM_SHA_HEX_LEN || !cJSON_IsNumber(size) ||
+            size->valuedouble < 1 || size->valuedouble > UINT32_MAX || size->valuedouble != (double)(uint32_t)size->valuedouble) {
+        snprintf(err, err_size, "the .sig.json needs alg \"ed25519\", key_id, version, project, size, sha256 and sig");
+        goto done;
+    }
+    for (k = 0; k < key_count && strcmp(keys[k].key_id, kid) != 0; k++) {
+    }
+    if (k == key_count) {
+        snprintf(err, err_size, "signed by untrusted key %.8s", kid);
+        goto done;
+    }
+    out->size = (uint32_t)size->valuedouble;
+    canonical_len = cap_wasm_fw_sig_canonical(project, version, out->size, sha256, canonical, sizeof(canonical));
+    if (!cap_wasm_b64_decode(sig_b64, sig, sizeof(sig)) || canonical_len == 0 ||
+            crypto_ed25519_check(sig, keys[k].pub, (const uint8_t *)canonical, canonical_len) != 0) {
+        snprintf(err, err_size, "invalid signature (key %s)", keys[k].key_id);
+        goto done;
+    }
+    strcpy(out->project, project);
+    strcpy(out->version, version);
+    strcpy(out->sha256, sha256);
+    strcpy(out->key_id, keys[k].key_id);
     ok = true;
 
 done:
