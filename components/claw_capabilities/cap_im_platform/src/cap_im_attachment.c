@@ -13,12 +13,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -38,6 +40,9 @@
 #define CAP_IM_ATTACHMENT_STT_BOUNDARY "----cap_im_stt_boundary"
 #define CAP_IM_ATTACHMENT_STT_TIMEOUT_MS 60000
 #define CAP_IM_ATTACHMENT_STT_CHUNK_BYTES 4096
+/* First PSRAM buffer size when the download size is unknown; it doubles as data arrives. */
+#define CAP_IM_ATTACHMENT_MEM_INITIAL_BYTES (64 * 1024)
+#define CAP_IM_ATTACHMENT_MEM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 /* Upload chunks and the JSON response share one buffer; it bounds the accepted response size. */
 #define CAP_IM_ATTACHMENT_STT_BUF_BYTES (32 * 1024)
 
@@ -48,6 +53,15 @@ typedef struct {
     bool limit_hit;
     bool write_failed;
 } cap_im_attachment_download_t;
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+    size_t max_bytes;
+    bool limit_hit;
+    bool alloc_failed;
+} cap_im_attachment_mem_download_t;
 
 static uint64_t cap_im_attachment_fnv1a64(const char *text)
 {
@@ -506,6 +520,119 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
     return ESP_OK;
 }
 
+/* Grows dl->data in PSRAM so `extra` more bytes fit: exact size on first use if larger than the
+ * initial size, then doubling, never beyond max_bytes (callers check max_bytes first). */
+static bool cap_im_attachment_mem_reserve(cap_im_attachment_mem_download_t *dl, size_t extra)
+{
+    size_t need = dl->len + extra;
+    size_t new_cap;
+    uint8_t *grown;
+
+    if (need <= dl->cap) {
+        return true;
+    }
+    new_cap = dl->cap ? dl->cap * 2 : CAP_IM_ATTACHMENT_MEM_INITIAL_BYTES;
+    if (new_cap < need) {
+        new_cap = need;
+    }
+    if (new_cap > dl->max_bytes) {
+        new_cap = dl->max_bytes;
+    }
+    grown = heap_caps_realloc(dl->data, new_cap, CAP_IM_ATTACHMENT_MEM_CAPS);
+    if (!grown) {
+        return false;
+    }
+    dl->data = grown;
+    dl->cap = new_cap;
+    return true;
+}
+
+static esp_err_t cap_im_attachment_mem_download_event_handler(esp_http_client_event_t *event)
+{
+    cap_im_attachment_mem_download_t *dl = (cap_im_attachment_mem_download_t *)event->user_data;
+
+    if (!dl || event->event_id != HTTP_EVENT_ON_DATA || event->data_len <= 0) {
+        return ESP_OK;
+    }
+    if (dl->len + (size_t)event->data_len > dl->max_bytes) {
+        dl->limit_hit = true;
+        return ESP_FAIL;
+    }
+    if (!cap_im_attachment_mem_reserve(dl, (size_t)event->data_len)) {
+        dl->alloc_failed = true;
+        return ESP_FAIL;
+    }
+    memcpy(dl->data + dl->len, event->data, (size_t)event->data_len);
+    dl->len += (size_t)event->data_len;
+    return ESP_OK;
+}
+
+esp_err_t cap_im_attachment_download_url_to_psram(const char *log_tag,
+                                                  const char *url,
+                                                  size_t max_bytes,
+                                                  size_t expected_bytes,
+                                                  uint8_t **out_data,
+                                                  size_t *out_len)
+{
+    esp_http_client_config_t config = {0};
+    esp_http_client_handle_t client = NULL;
+    cap_im_attachment_mem_download_t dl = {0};
+    esp_err_t err;
+    int status;
+
+    if (!log_tag || !url || !url[0] || !out_data || !out_len || max_bytes == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_data = NULL;
+    *out_len = 0;
+    if (expected_bytes > max_bytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    dl.max_bytes = max_bytes;
+    /* A known size is allocated up front, so the buffer never has to move. */
+    if (!cap_im_attachment_mem_reserve(&dl, expected_bytes ? expected_bytes : 1)) {
+        ESP_LOGW(log_tag, "attachment PSRAM alloc failed: bytes=%u", (unsigned int)expected_bytes);
+        return ESP_ERR_NO_MEM;
+    }
+
+    config.url = url;
+    config.event_handler = cap_im_attachment_mem_download_event_handler;
+    config.user_data = &dl;
+    config.timeout_ms = 30000;
+    config.buffer_size = 2048;
+    config.buffer_size_tx = 1024;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    client = esp_http_client_init(&config);
+    if (!client) {
+        free(dl.data);
+        return ESP_FAIL;
+    }
+    err = esp_http_client_perform(client);
+    status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (dl.alloc_failed) {
+        ESP_LOGW(log_tag, "attachment PSRAM grow failed: bytes=%u", (unsigned int)dl.len);
+        free(dl.data);
+        return ESP_ERR_NO_MEM;
+    }
+    if (err != ESP_OK || status < 200 || status >= 300 || dl.limit_hit || dl.len == 0) {
+        ESP_LOGW(log_tag, "attachment PSRAM download failed: err=%s http=%d bytes=%u limit_hit=%d",
+                 esp_err_to_name(err), status, (unsigned int)dl.len, dl.limit_hit ? 1 : 0);
+        free(dl.data);
+        if (dl.limit_hit) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        return err != ESP_OK ? err : ESP_FAIL;
+    }
+
+    *out_data = dl.data;
+    *out_len = dl.len;
+    return ESP_OK;
+}
+
 esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
                                                 const char *dest_path,
                                                 const unsigned char *buf,
@@ -704,24 +831,36 @@ static esp_err_t cap_im_attachment_http_write_all(esp_http_client_handle_t clien
     return ESP_OK;
 }
 
-/* Streams the multipart body: head (model part + file part header), file in chunks, tail. */
+/* Audio body for an STT upload: an open file read in chunks, or a memory buffer when data is set. */
+typedef struct {
+    FILE *file;
+    const uint8_t *data;
+    size_t size;
+} cap_im_attachment_stt_source_t;
+
+/* Streams the multipart body: head (model part + file part header), audio in chunks, tail. */
 static esp_err_t cap_im_attachment_stt_upload(esp_http_client_handle_t client,
                                               const char *head,
                                               size_t head_len,
                                               const char *tail,
                                               size_t tail_len,
-                                              FILE *file,
-                                              size_t file_size,
+                                              const cap_im_attachment_stt_source_t *src,
                                               char *chunk)
 {
+    FILE *file = src->file;
     esp_err_t err;
 
-    err = esp_http_client_open(client, (int)(head_len + file_size + tail_len));
+    err = esp_http_client_open(client, (int)(head_len + src->size + tail_len));
     if (err != ESP_OK) {
         return err;
     }
     err = cap_im_attachment_http_write_all(client, head, head_len);
-    while (err == ESP_OK) {
+    for (size_t off = 0; err == ESP_OK && src->data && off < src->size; off += CAP_IM_ATTACHMENT_STT_CHUNK_BYTES) {
+        size_t n = MIN(src->size - off, (size_t)CAP_IM_ATTACHMENT_STT_CHUNK_BYTES);
+
+        err = cap_im_attachment_http_write_all(client, (const char *)src->data + off, n);
+    }
+    while (err == ESP_OK && !src->data) {
         size_t nread = fread(chunk, 1, CAP_IM_ATTACHMENT_STT_CHUNK_BYTES, file);
 
         if (nread == 0) {
@@ -739,21 +878,21 @@ static esp_err_t cap_im_attachment_stt_upload(esp_http_client_handle_t client,
     return err;
 }
 
-esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
-                                            const char *base_url,
-                                            const char *api_key,
-                                            const char *model,
-                                            const char *path,
-                                            const char *mime,
-                                            char **out_text,
-                                            char *err_buf,
-                                            size_t err_buf_size)
+/* Sends one multipart STT request for src; the caller owns src->file. */
+static esp_err_t cap_im_attachment_stt_request(const char *log_tag,
+                                               const char *base_url,
+                                               const char *api_key,
+                                               const char *model,
+                                               const char *filename,
+                                               const char *mime,
+                                               const cap_im_attachment_stt_source_t *src,
+                                               char **out_text,
+                                               char *err_buf,
+                                               size_t err_buf_size)
 {
     static const char tail[] = "\r\n--" CAP_IM_ATTACHMENT_STT_BOUNDARY "--\r\n";
-    struct stat st = {0};
     esp_http_client_config_t config = {0};
     esp_http_client_handle_t client = NULL;
-    FILE *file = NULL;
     char *buf = NULL;
     char *auth = NULL;
     char url[384];
@@ -766,18 +905,6 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
     int status = 0;
     int resp_len = 0;
     esp_err_t err;
-
-    if (!log_tag || !base_url || !base_url[0] || !api_key || !api_key[0] || !model || !model[0] ||
-            !path || !out_text || !err_buf || err_buf_size == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    *out_text = NULL;
-    err_buf[0] = '\0';
-
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
-        snprintf(err_buf, err_buf_size, "Audiodatei nicht lesbar");
-        return ESP_ERR_NOT_FOUND;
-    }
 
     base_len = strlen(base_url);
     while (base_len > 0 && base_url[base_len - 1] == '/') {
@@ -797,7 +924,7 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
                         "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
                         "Content-Type: %s\r\n\r\n",
                         model,
-                        cap_im_attachment_basename(path),
+                        filename,
                         mime && mime[0] ? mime : "application/octet-stream");
     if (head_len < 0 || (size_t)head_len >= sizeof(head)) {
         snprintf(err_buf, err_buf_size, "Multipart-Header zu lang");
@@ -811,14 +938,6 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
         return ESP_ERR_NO_MEM;
     }
 
-    file = fopen(path, "rb");
-    if (!file) {
-        free(auth);
-        free(buf);
-        snprintf(err_buf, err_buf_size, "Audiodatei nicht lesbar");
-        return ESP_FAIL;
-    }
-
     config.url = url;
     config.method = HTTP_METHOD_POST;
     config.timeout_ms = CAP_IM_ATTACHMENT_STT_TIMEOUT_MS;
@@ -828,7 +947,6 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
 
     client = esp_http_client_init(&config);
     if (!client) {
-        fclose(file);
         free(auth);
         free(buf);
         snprintf(err_buf, err_buf_size, "HTTP-Client-Init fehlgeschlagen");
@@ -839,14 +957,13 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
     esp_http_client_set_header(client, "Authorization", auth);
 
     err = cap_im_attachment_stt_upload(client, head, (size_t)head_len, tail, sizeof(tail) - 1,
-                                       file, (size_t)st.st_size, buf);
+                                       src, buf);
     if (err == ESP_OK) {
         status = esp_http_client_get_status_code(client);
         resp_len = esp_http_client_read_response(client, buf, CAP_IM_ATTACHMENT_STT_BUF_BYTES - 1);
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    fclose(file);
     free(auth);
 
     if (err != ESP_OK) {
@@ -880,6 +997,79 @@ esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
     cJSON_Delete(root);
     free(buf);
     return err;
+}
+
+static bool cap_im_attachment_stt_args_ok(const char *log_tag,
+                                          const char *base_url,
+                                          const char *api_key,
+                                          const char *model,
+                                          char **out_text,
+                                          char *err_buf,
+                                          size_t err_buf_size)
+{
+    if (!log_tag || !base_url || !base_url[0] || !api_key || !api_key[0] || !model || !model[0] ||
+            !out_text || !err_buf || err_buf_size == 0) {
+        return false;
+    }
+    *out_text = NULL;
+    err_buf[0] = '\0';
+    return true;
+}
+
+esp_err_t cap_im_attachment_transcribe_file(const char *log_tag,
+                                            const char *base_url,
+                                            const char *api_key,
+                                            const char *model,
+                                            const char *path,
+                                            const char *mime,
+                                            char **out_text,
+                                            char *err_buf,
+                                            size_t err_buf_size)
+{
+    struct stat st = {0};
+    cap_im_attachment_stt_source_t src = {0};
+    esp_err_t err;
+
+    if (!path || !cap_im_attachment_stt_args_ok(log_tag, base_url, api_key, model,
+                                                out_text, err_buf, err_buf_size)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        snprintf(err_buf, err_buf_size, "Audiodatei nicht lesbar");
+        return ESP_ERR_NOT_FOUND;
+    }
+    src.file = fopen(path, "rb");
+    if (!src.file) {
+        snprintf(err_buf, err_buf_size, "Audiodatei nicht lesbar");
+        return ESP_FAIL;
+    }
+    src.size = (size_t)st.st_size;
+    err = cap_im_attachment_stt_request(log_tag, base_url, api_key, model, cap_im_attachment_basename(path),
+                                        mime, &src, out_text, err_buf, err_buf_size);
+    fclose(src.file);
+    return err;
+}
+
+esp_err_t cap_im_attachment_transcribe_buffer(const char *log_tag,
+                                              const char *base_url,
+                                              const char *api_key,
+                                              const char *model,
+                                              const uint8_t *data,
+                                              size_t len,
+                                              const char *filename,
+                                              const char *mime,
+                                              char **out_text,
+                                              char *err_buf,
+                                              size_t err_buf_size)
+{
+    cap_im_attachment_stt_source_t src = {.data = data, .size = len};
+
+    if (!data || len == 0 || !filename || !filename[0] ||
+            !cap_im_attachment_stt_args_ok(log_tag, base_url, api_key, model, out_text, err_buf, err_buf_size)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cap_im_attachment_stt_request(log_tag, base_url, api_key, model, filename,
+                                         mime, &src, out_text, err_buf, err_buf_size);
 }
 
 char *cap_im_attachment_build_payload_json(

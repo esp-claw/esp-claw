@@ -697,12 +697,17 @@ static void cap_im_tg_publish_voice_text(const char *chat_id,
     }
 }
 
+/* Transcribes audio and publishes the text (or the failure reason) to the agent. The audio is the
+ * file at path, or len bytes of data named filename when data is set. */
 static void cap_im_tg_transcribe_and_publish(const char *chat_id,
                                              const char *sender_id,
                                              const char *message_id,
                                              const char *caption,
                                              const char *mime,
-                                             const char *path)
+                                             const char *path,
+                                             const uint8_t *data,
+                                             size_t len,
+                                             const char *filename)
 {
     char reason[192];
     char body[256];
@@ -710,15 +715,13 @@ static void cap_im_tg_transcribe_and_publish(const char *chat_id,
     esp_err_t err;
 
     cap_im_tg_busy_show(chat_id, true, 0, "🎙 Transkribiere Sprachnachricht…");
-    err = cap_im_attachment_transcribe_file(TAG,
-                                            s_tg.stt_base_url,
-                                            s_tg.stt_api_key,
-                                            s_tg.stt_model,
-                                            path,
-                                            mime,
-                                            &text,
-                                            reason,
-                                            sizeof(reason));
+    if (data) {
+        err = cap_im_attachment_transcribe_buffer(TAG, s_tg.stt_base_url, s_tg.stt_api_key, s_tg.stt_model,
+                                                  data, len, filename, mime, &text, reason, sizeof(reason));
+    } else {
+        err = cap_im_attachment_transcribe_file(TAG, s_tg.stt_base_url, s_tg.stt_api_key, s_tg.stt_model,
+                                                path, mime, &text, reason, sizeof(reason));
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Telegram voice transcription failed: message=%s err=%s reason=%s",
                  message_id, esp_err_to_name(err), reason);
@@ -731,6 +734,55 @@ static void cap_im_tg_transcribe_and_publish(const char *chat_id,
     cap_im_tg_publish_voice_text(chat_id, sender_id, message_id, caption,
                                  text[0] ? text : "(leere Transkription)");
     free(text);
+}
+
+/* Downloads a voice/audio file into PSRAM and transcribes it from there, so voice notes never touch
+ * the flash DATA volume. Returns ESP_ERR_NO_MEM only when the PSRAM buffer could not be allocated,
+ * which lets the caller fall back to the flash path; transcription results and failures are
+ * published to the agent here. */
+static esp_err_t cap_im_tg_transcribe_from_psram(const char *chat_id,
+                                                 const char *sender_id,
+                                                 const char *message_id,
+                                                 const char *original_filename,
+                                                 const char *mime,
+                                                 const char *caption,
+                                                 const char *remote_path,
+                                                 size_t expected_bytes)
+{
+    char *download_url = NULL;
+    char filename[CAP_IM_TG_NAME_BUF_SIZE];
+    uint8_t *data = NULL;
+    size_t len = 0;
+    esp_err_t err;
+
+    download_url = malloc(CAP_IM_TG_PATH_BUF_SIZE);
+    if (!download_url) {
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(download_url, CAP_IM_TG_PATH_BUF_SIZE, "%s/file/bot%s/%s",
+             CAP_IM_TG_API_BASE, s_tg.bot_token, remote_path);
+    err = cap_im_attachment_download_url_to_psram(TAG,
+                                                  download_url,
+                                                  MIN(s_tg.max_inbound_file_bytes, CAP_IM_TG_STT_MAX_BYTES),
+                                                  expected_bytes,
+                                                  &data,
+                                                  &len);
+    free(download_url);
+    if (err != ESP_OK) {
+        return err;
+    }
+    ESP_LOGI(TAG, "Telegram audio buffered in PSRAM: message=%s bytes=%u", message_id, (unsigned int)len);
+
+    if (original_filename && original_filename[0]) {
+        strlcpy(filename, original_filename, sizeof(filename));
+    } else {
+        snprintf(filename, sizeof(filename), "audio%s",
+                 cap_im_attachment_guess_extension(remote_path, NULL, mime));
+    }
+
+    cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, NULL, data, len, filename);
+    free(data);
+    return ESP_OK;
 }
 
 static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
@@ -764,6 +816,16 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
     remote_path = cap_im_tg_get_file_path(file_id, &expected_bytes);
     if (!remote_path) {
         return ESP_FAIL;
+    }
+
+    if (strcmp(content_type, "audio") == 0) {
+        err = cap_im_tg_transcribe_from_psram(chat_id, sender_id, message_id, original_filename,
+                                              mime, caption, remote_path, expected_bytes);
+        if (err != ESP_ERR_NO_MEM) {
+            free(remote_path);
+            return err;
+        }
+        ESP_LOGW(TAG, "Telegram audio does not fit in PSRAM, falling back to flash: message=%s", message_id);
     }
 
     extension = cap_im_attachment_guess_extension(remote_path, original_filename, mime);
@@ -810,7 +872,8 @@ static esp_err_t cap_im_tg_save_attachment(const char *chat_id,
                                         saved_path,
                                         caption);
     if (strcmp(content_type, "audio") == 0) {
-        cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, saved_path);
+        cap_im_tg_transcribe_and_publish(chat_id, sender_id, message_id, caption, mime, saved_path,
+                                         NULL, 0, NULL);
     } else if (!grouped && caption && caption[0]) {
         size_t content_len = strlen(caption) + strlen(saved_path) + 64;
         char *content = malloc(content_len);
