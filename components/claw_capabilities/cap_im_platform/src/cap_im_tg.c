@@ -1187,7 +1187,8 @@ static const struct {
     {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},
     {"ssh", "SSH client (pubkey, allowed, allow, revoke)", "ssh_command", NULL},
     {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
-    {"app", "Install, update or remove a WASM app", "apps_command", NULL},
+    {"app", "Install, update (update all, updates) or remove a WASM app", "apps_command", NULL},
+    {"updates", "Check for app and firmware updates", "apps_check_updates", NULL},
     {"fw", "Firmware status, check and update", "firmware_command", NULL},
 };
 #define CAP_IM_TG_COMMAND_COUNT (sizeof(s_tg_commands) / sizeof(s_tg_commands[0]))
@@ -3109,6 +3110,23 @@ esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
     }
 
     return last_err;
+}
+
+esp_err_t cap_im_tg_send_text_to_allowed(const char *text)
+{
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    char chat_id[24];
+
+    /* A private chat has the user's id. */
+    for (size_t i = 0; i < s_tg.allowed_user_count; i++) {
+        snprintf(chat_id, sizeof(chat_id), "%" PRId64, s_tg.allowed_user_ids[i]);
+        if (cap_im_tg_send_text(chat_id, text) == ESP_OK) {
+            ret = ESP_OK;
+        } else if (ret != ESP_OK) {
+            ret = ESP_FAIL;
+        }
+    }
+    return ret;
 }
 
 esp_err_t cap_im_tg_send_image(const char *chat_id, const char *path, const char *caption)

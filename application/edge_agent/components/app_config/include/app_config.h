@@ -56,6 +56,7 @@ typedef struct {
     char api_profiles[APP_CLAW_API_PROFILES_LEN];
     char app_trusted_keys[APP_CONFIG_STR_LEN];
     char app_allow_unsigned[8];
+    char update_check_time[8];
     char stt_base_url[APP_CONFIG_STR_LEN];
     char stt_api_key[APP_CONFIG_STR_LEN];
     char stt_model[64];

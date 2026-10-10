@@ -41,6 +41,7 @@ export type AppConfig = {
   api_profiles: string;
   app_trusted_keys: string;
   app_allow_unsigned: string;
+  update_check_time: string;
   stt_base_url: string;
   stt_api_key: string;
   stt_model: string;
@@ -102,7 +103,7 @@ export const GROUP_FIELDS: Record<ConfigGroup, (keyof AppConfig)[]> = {
   stt: ['stt_base_url', 'stt_api_key', 'stt_model'],
   embed: ['embed_base_url', 'embed_api_key', 'embed_model'],
   capabilities: ['enabled_cap_groups', 'llm_visible_cap_groups', 'ssh_hosts', 'wol_targets', 'api_profiles',
-    'app_trusted_keys', 'app_allow_unsigned'],
+    'app_trusted_keys', 'app_allow_unsigned', 'update_check_time'],
   skills: ['enabled_lua_modules'],
   time: ['time_timezone'],
   webdav: ['webdav_user', 'webdav_password'],
