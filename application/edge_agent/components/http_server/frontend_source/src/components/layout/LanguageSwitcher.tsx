@@ -67,7 +67,7 @@ export function LanguageSwitcher() {
         <Book class="w-4 h-4" />
       </a>
       <a
-        href="https://github.com/espressif/esp-claw"
+        href="https://github.com/esp-claw/esp-claw"
         target="_blank"
         rel="noreferrer"
         class={iconButtonClass}

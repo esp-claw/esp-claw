@@ -23,7 +23,7 @@
       <img src="https://img.shields.io/badge/runs_on-ESP32_Series-red?style=flat-square" alt="Runs on ESP32 Series" />
     </a>
     <a href="./LICENSE">
-      <img src="https://img.shields.io/github/license/espressif/esp-claw?style=flat-square" alt="License" />
+      <img src="https://img.shields.io/github/license/esp-claw/esp-claw?style=flat-square" alt="License" />
     </a>
   </p>
 
@@ -191,11 +191,11 @@ If this project helps you, please consider giving it a star. ⭐⭐⭐⭐⭐
 ### Star History
 
 <div align="center">
-  <a href="https://www.star-history.com/?repos=espressif%2Fesp-claw&type=date&legend=top-left">
+  <a href="https://www.star-history.com/?repos=esp-claw%2Fesp-claw&type=date&legend=top-left">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=espressif/esp-claw&type=date&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=espressif/esp-claw&type=date&legend=top-left" />
-    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=espressif/esp-claw&type=date&legend=top-left" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=esp-claw/esp-claw&type=date&theme=dark&legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=esp-claw/esp-claw&type=date&legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=esp-claw/esp-claw&type=date&legend=top-left" />
   </picture>
   </a>
 </div>

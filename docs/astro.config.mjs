@@ -23,7 +23,7 @@ export default defineConfig({
         {
           icon: "github",
           label: "GitHub",
-          href: "https://github.com/espressif/esp-claw",
+          href: "https://github.com/esp-claw/esp-claw",
         },
         {
           icon: "rocket",

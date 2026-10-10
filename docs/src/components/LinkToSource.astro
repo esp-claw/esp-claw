@@ -21,7 +21,7 @@ const normalizedPath = rawPath.replace(/^\/+/, "").replace(/^\.\/+/, "");
 const isDirectory = normalizedPath.endsWith("/");
 
 const repoBase =
-  import.meta.env.PUBLIC_DOC_SOURCECODE_REPO ?? "https://github.com/espressif/esp-claw";
+  import.meta.env.PUBLIC_DOC_SOURCECODE_REPO ?? "https://github.com/esp-claw/esp-claw";
 const defaultRefs = import.meta.env.PUBLIC_DOC_SOURCECODE_REFS ?? "master";
 const refs = props.refs ?? defaultRefs;
 
