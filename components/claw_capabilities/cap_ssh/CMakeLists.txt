@@ -15,4 +15,4 @@ idf_component_register(
 )
 
 # libssh needs a getnameinfo() that also handles AF_INET6, see cap_ssh_netdb.c.
-target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=getnameinfo")
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=getnameinfo" "-u __wrap_getnameinfo")
