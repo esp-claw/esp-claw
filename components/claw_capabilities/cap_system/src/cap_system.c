@@ -823,7 +823,11 @@ static cJSON *cap_system_build_storage_json(void)
             }, &image) == ESP_OK) {
             cJSON_AddNumberToObject(app, "image_size", image.image_len);
         }
-        cJSON_AddBoolToObject(app, "ota_slot_available", next != NULL);
+        /* Without an ota_1 slot IDF hands back the running partition itself. */
+        cJSON_AddBoolToObject(app, "ota_slot_available", next != NULL && next != running);
+        if (next && next != running) {
+            cJSON_AddStringToObject(app, "next_partition", next->label);
+        }
     }
 
     return root;

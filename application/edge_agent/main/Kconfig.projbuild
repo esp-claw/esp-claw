@@ -59,4 +59,13 @@ menu "Default Search Settings"
 
 endmenu
 
+config EDGE_AGENT_SYSTEM_FS_EMBEDDED
+    bool "Embed system files in the app image"
+    default n
+    help
+        Embed the skills, built-in Lua scripts and recovery seeds in the app image and serve
+        them read-only at /system instead of mounting a "system" FAT partition, so OTA updates
+        also update them. Needs a partition table without a "system" partition (e.g.
+        partitions_8MB_ota.csv). Fonts are not embedded: keep this off on display boards.
+
 endmenu

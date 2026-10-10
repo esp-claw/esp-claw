@@ -1,0 +1,8 @@
+# Name,    Type, SubType, Offset,   Size
+# Two 3200K app slots for OTA updates; skills/scripts are embedded in the app image (no system partition).
+nvs,       data, nvs,     0xA000,   0x6000
+otadata,   data, ota,     0x10000,  0x2000
+phy_init,  data, phy,     0x12000,  0x1000
+ota_0,     app,  ota_0,   0x20000,  3200K
+ota_1,     app,  ota_1,   0x340000, 3200K
+storage,   data, fat,     0x660000, 1664K
