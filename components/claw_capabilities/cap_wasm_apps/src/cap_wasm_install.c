@@ -285,8 +285,8 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     char *html = NULL;
     uint8_t *buf = NULL;
     size_t len = 0;
-    cap_wasm_manifest_t mf;
-    cap_wasm_manifest_t old;
+    cap_wasm_manifest_t *mf = NULL; /* new and installed manifest, PSRAM: ~2 KB each */
+    cap_wasm_manifest_t *old = NULL;
     cap_wasm_pkg_t pkg;
     esp_err_t ret = ESP_FAIL;
     bool installed;
@@ -316,45 +316,47 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     manifest = heap_caps_calloc(1, pkg.manifest.len + 1, CAP_WASM_PSRAM_CAPS);
     sig = heap_caps_calloc(1, pkg.signature.len + 1, CAP_WASM_PSRAM_CAPS);
     html = heap_caps_malloc(html_size, CAP_WASM_PSRAM_CAPS);
-    if (!manifest || !sig || !html) {
+    mf = heap_caps_malloc(2 * sizeof(*mf), CAP_WASM_PSRAM_CAPS);
+    old = mf ? mf + 1 : NULL;
+    if (!manifest || !sig || !html || !mf) {
         snprintf(output, output_size, "Error: out of memory");
         goto done;
     }
     memcpy(manifest, pkg.manifest.data, pkg.manifest.len);
     memcpy(sig, pkg.signature.data, pkg.signature.len);
-    if (!cap_wasm_manifest_parse(manifest, NULL, &mf, err, sizeof(err)) ||
-            !cap_wasm_sig_verify(sig, &mf, pkg.manifest.data, pkg.manifest.len, pkg.wasm.data, pkg.wasm.len,
+    if (!cap_wasm_manifest_parse(manifest, NULL, mf, err, sizeof(err)) ||
+            !cap_wasm_sig_verify(sig, mf, pkg.manifest.data, pkg.manifest.len, pkg.wasm.data, pkg.wasm.len,
                                  g_cap_wasm_trusted, g_cap_wasm_trusted_count, key_id, err, sizeof(err))) {
         snprintf(output, output_size, "Error: package rejected: %s", err);
         goto done;
     }
-    if (!cap_wasm_version_cmp(mf.version, mf.version, &cmp)) {
-        snprintf(output, output_size, "Error: version '%s' is not MAJOR.MINOR.PATCH", mf.version);
+    if (!cap_wasm_version_cmp(mf->version, mf->version, &cmp)) {
+        snprintf(output, output_size, "Error: version '%s' is not MAJOR.MINOR.PATCH", mf->version);
         goto done;
     }
-    if (expect_name && strcmp(expect_name, mf.name) != 0) {
-        snprintf(output, output_size, "Error: the package contains app '%s', not '%s'", mf.name, expect_name);
+    if (expect_name && strcmp(expect_name, mf->name) != 0) {
+        snprintf(output, output_size, "Error: the package contains app '%s', not '%s'", mf->name, expect_name);
         goto done;
     }
-    installed = cap_wasm_installed_manifest(mf.name, &old);
-    if (installed && cap_wasm_version_cmp(mf.version, old.version, &cmp) && cmp < 0 && !force) {
+    installed = cap_wasm_installed_manifest(mf->name, old);
+    if (installed && cap_wasm_version_cmp(mf->version, old->version, &cmp) && cmp < 0 && !force) {
         snprintf(output, output_size, "Error: %s %s is older than the installed %s; /app install --force <url> "
-                 "downgrades", mf.name, mf.version, old.version);
+                 "downgrades", mf->name, mf->version, old->version);
         goto done;
     }
 
-    added = cap_wasm_perms_describe(&mf, installed ? &old : NULL, perms, sizeof(perms));
+    added = cap_wasm_perms_describe(mf, installed ? old : NULL, perms, sizeof(perms));
     if (installed) {
-        len = (size_t)snprintf(html, html_size, "<b>WASM-App aktualisieren?</b>\n<b>%s</b> %s → %s%s\n", mf.name,
-                               old.version, mf.version, cmp < 0 ? " ⚠️ Downgrade" : "");
+        len = (size_t)snprintf(html, html_size, "<b>WASM-App aktualisieren?</b>\n<b>%s</b> %s → %s%s\n", mf->name,
+                               old->version, mf->version, cmp < 0 ? " ⚠️ Downgrade" : "");
     } else {
-        len = (size_t)snprintf(html, html_size, "<b>WASM-App installieren?</b>\n<b>%s</b> %s (neu)\n", mf.name,
-                               mf.version);
+        len = (size_t)snprintf(html, html_size, "<b>WASM-App installieren?</b>\n<b>%s</b> %s (neu)\n", mf->name,
+                               mf->version);
     }
-    len += cap_wasm_html_escape(html + len, html_size - len, mf.description);
+    len += cap_wasm_html_escape(html + len, html_size - len, mf->description);
     snprintf(html + len, html_size - len, "\nRechte: %s\nLimits: %u KB Speicher, %u ms pro Aufruf\n"
-             "Signiert: Schlüssel <code>%s</code>, app.wasm %u Bytes", perms, (unsigned)mf.memory_kb,
-             (unsigned)mf.call_timeout_ms, key_id, (unsigned)pkg.wasm.len);
+             "Signiert: Schlüssel <code>%s</code>, app.wasm %u Bytes", perms, (unsigned)mf->memory_kb,
+             (unsigned)mf->call_timeout_ms, key_id, (unsigned)pkg.wasm.len);
     cap_im_tg_confirm_note(ctx, html, html_size);
     /* An update confirmed in a list (/app update all) is asked again only for new permissions. */
     ret = confirmed && installed && !added && cmp >= 0 ? ESP_OK : cap_wasm_ask(chat, html, html_size, "✅ Installieren");
@@ -363,19 +365,20 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
                  ret == ESP_ERR_INVALID_STATE ? "cancelled by the user" : esp_err_to_name(ret));
         goto done;
     }
-    if (!cap_wasm_stage(mf.name, &pkg)) {
-        snprintf(output, output_size, "Error: cannot write %s/%s.new/ (storage full?)", g_cap_wasm_apps_dir, mf.name);
+    if (!cap_wasm_stage(mf->name, &pkg)) {
+        snprintf(output, output_size, "Error: cannot write %s/%s.new/ (storage full?)", g_cap_wasm_apps_dir, mf->name);
         ret = ESP_FAIL;
         goto done;
     }
-    ESP_LOGI(TAG, "installing %s %s (key %s, was %s)", mf.name, mf.version, key_id, installed ? old.version : "-");
-    ret = cap_wasm_admin(CAP_WASM_REQ_INSTALL, mf.name, url, output, output_size);
+    ESP_LOGI(TAG, "installing %s %s (key %s, was %s)", mf->name, mf->version, key_id, installed ? old->version : "-");
+    ret = cap_wasm_admin(CAP_WASM_REQ_INSTALL, mf->name, url, output, output_size);
 
 done:
     heap_caps_free(buf);
     heap_caps_free(manifest);
     heap_caps_free(sig);
     heap_caps_free(html);
+    heap_caps_free(mf);
     atomic_flag_clear(&g_cap_wasm_busy);
     return ret;
 }
@@ -383,7 +386,7 @@ done:
 esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
     const char *chat = cap_im_tg_confirm_chat(ctx);
-    cap_wasm_manifest_t mf;
+    cap_wasm_manifest_t *mf = NULL;
     char html[320];
     esp_err_t ret;
 
@@ -395,8 +398,11 @@ esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, 
         snprintf(output, output_size, "Error: invalid app name");
         return ESP_ERR_INVALID_ARG;
     }
-    snprintf(html, sizeof(html), "<b>WASM-App entfernen?</b>\n<b>%s</b> %s\nLöscht die App und ihre gespeicherten Daten.",
-             name, cap_wasm_installed_manifest(name, &mf) ? mf.version : "(ohne gültiges Manifest)");
+    mf = heap_caps_malloc(sizeof(*mf), CAP_WASM_PSRAM_CAPS);
+    snprintf(html, sizeof(html), "<b>WASM-App entfernen?</b>\n<b>%s</b> %s\nLöscht die App, ihre gespeicherten Daten "
+             "und Einstellungen.", name, mf && cap_wasm_installed_manifest(name, mf) ? mf->version :
+             "(ohne gültiges Manifest)");
+    heap_caps_free(mf);
     cap_im_tg_confirm_note(ctx, html, sizeof(html));
     ret = cap_wasm_ask(chat, html, sizeof(html), "🗑 Entfernen");
     if (ret != ESP_OK) {

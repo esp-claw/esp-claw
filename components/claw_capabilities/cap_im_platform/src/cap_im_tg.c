@@ -1273,7 +1273,7 @@ static const struct {
     {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},
     {"ssh", "SSH client (pubkey, allowed, allow, revoke)", "ssh_command", NULL},
     {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
-    {"app", "Install, update (update all, updates) or remove a WASM app", "apps_command", NULL},
+    {"app", "Install, update (update all, updates), remove or configure (config) a WASM app", "apps_command", NULL},
     {"updates", "Check for app and firmware updates", "apps_check_updates", NULL},
     {"fw", "Firmware status, check and update", "firmware_command", NULL},
     {"web", "Web UI login link (status, cert renew)", "web_command", NULL},

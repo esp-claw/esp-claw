@@ -244,6 +244,30 @@ static int32_t cap_wasm_kv_del(wasm_exec_env_t env, const char *key, uint32_t ke
     return cap_wasm_kv_write(cap_wasm_env_app(env), key, key_len, NULL, 0, true);
 }
 
+/* ---------- Settings declared in the manifest, set by the user with /app config ---------- */
+
+static int32_t cap_wasm_config_get(wasm_exec_env_t env, const char *key, uint32_t key_len,
+                                   char *out, uint32_t out_cap)
+{
+    cap_wasm_app_t *app = cap_wasm_env_app(env);
+    const cap_wasm_setting_t *s = cap_wasm_manifest_setting(&app->mf, key, key_len);
+    char value[CAP_WASM_SETTING_VALUE_MAX + 1];
+    bool is_default;
+    int32_t len;
+
+    if (!s) {
+        return -CAP_WASM_EPERM; /* not declared in this app's manifest */
+    }
+    len = cap_wasm_cfg_get(app, s, value, sizeof(value), &is_default);
+    if (len >= 0 && (uint32_t)len > out_cap) {
+        return -CAP_WASM_ENOBUFS;
+    }
+    if (len >= 0) {
+        memcpy(out, value, len);
+    }
+    return len;
+}
+
 /* ---------- HTTP through cap_http_request credential profiles ---------- */
 
 static int32_t cap_wasm_http_errno(esp_err_t err)
@@ -549,6 +573,7 @@ NativeSymbol g_cap_wasm_natives[] = {
     { "kv_get", cap_wasm_kv_get, "(*~*~)i", NULL },
     { "kv_set", cap_wasm_kv_set, "(*~*~)i", NULL },
     { "kv_del", cap_wasm_kv_del, "(*~)i", NULL },
+    { "config_get", cap_wasm_config_get, "(*~*~)i", NULL },
     { "http_profile_request", cap_wasm_http_profile_request, "(*~*~*~*~*~)i", NULL },
     { "http_response_read", cap_wasm_http_response_read, "(*~)i", NULL },
     { "confirm", cap_wasm_confirm, "(*~)i", NULL },

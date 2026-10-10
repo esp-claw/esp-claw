@@ -110,6 +110,27 @@ int32_t cap_wasm_tool_add(cap_wasm_app_t *app, const char *name, uint32_t name_l
 /* Stops the call budget clock while a host function blocks (HTTP, confirmation). */
 void cap_wasm_budget_pause(bool pause);
 
+/* ---------- Settings (cap_wasm_config.c, WASM thread) ---------- */
+
+/*
+ * Value of setting `s` (stored, else the manifest default) as text in `out`; returns its length,
+ * -CAP_WASM_ENOENT when unset without a default, -CAP_WASM_ENOBUFS or -CAP_WASM_EIO.
+ */
+int32_t cap_wasm_cfg_get(const cap_wasm_app_t *app, const cap_wasm_setting_t *s, char *out, size_t size,
+                         bool *is_default);
+
+/*
+ * "/app config <name> [args]": "" lists the settings (secrets masked), "<key> <value>" sets one,
+ * "<key> --reset" returns it to the default. `json` lists them for the LLM (no secret values).
+ */
+esp_err_t cap_wasm_cfg_command(const cap_wasm_app_t *app, const char *args, bool json, char *out, size_t size);
+
+/* After an update: drops stored settings the manifest no longer declares or whose value no longer fits. */
+void cap_wasm_cfg_prune(const cap_wasm_app_t *app);
+
+/* Deletes every stored setting of the app (on remove). */
+void cap_wasm_cfg_erase(const char *app_name);
+
 /* ---------- Runtime <-> installer (cap_wasm_install.c) ---------- */
 
 typedef enum {
@@ -118,6 +139,8 @@ typedef enum {
     CAP_WASM_REQ_STATUS,
     CAP_WASM_REQ_LOAD,
     CAP_WASM_REQ_UNLOAD,
+    CAP_WASM_REQ_CONFIG,      /* `extra`: "/app config" arguments after the name */
+    CAP_WASM_REQ_CONFIG_JSON, /* settings listing for the LLM */
     /* The requests below can change the tool set. */
     CAP_WASM_REQ_RELOAD,
     CAP_WASM_REQ_ENABLE,

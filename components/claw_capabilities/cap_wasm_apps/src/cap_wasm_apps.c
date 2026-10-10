@@ -1203,11 +1203,13 @@ static bool cap_wasm_do_install(cap_wasm_app_t *app, const char *source, char *o
     app->enabled = true;
     if (cap_wasm_load(app, false, false)) {
         cap_wasm_rmdir(old_dir);
+        cap_wasm_cfg_prune(app);
         app->installed_at = (uint32_t)time(NULL);
         strlcpy(app->source_url, source && strlen(source) < sizeof(app->source_url) ? source : "",
                 sizeof(app->source_url));
-        snprintf(out, size, "Installed `%s` %s: %u tools.", app->name, app->mf.version,
-                 (unsigned)cap_wasm_app_tool_count(app));
+        snprintf(out, size, "Installed `%s` %s: %u tools.%s%s", app->name, app->mf.version,
+                 (unsigned)cap_wasm_app_tool_count(app), app->mf.setting_count ? "\nSettings: /app config " : "",
+                 app->mf.setting_count ? app->name : "");
         return true;
     }
     snprintf(out, size, "Install of `%s` failed: %s", app->name, app->last_error);
@@ -1262,6 +1264,11 @@ static void cap_wasm_do_admin(cap_wasm_req_t *req)
         snprintf(req->output, req->output_size, "`%s` %s.", app->name, app->module ? "unloaded" : "was not loaded");
         cap_wasm_unload(app);
         return;
+    case CAP_WASM_REQ_CONFIG:
+    case CAP_WASM_REQ_CONFIG_JSON:
+        req->err = cap_wasm_cfg_command(app, req->extra, req->type == CAP_WASM_REQ_CONFIG_JSON, req->output,
+                                        req->output_size);
+        return;
     case CAP_WASM_REQ_DISABLE:
         cap_wasm_unload(app);
         cap_wasm_remove_tools(app);
@@ -1287,6 +1294,7 @@ static void cap_wasm_do_admin(cap_wasm_req_t *req)
             nvs_commit(nvs);
             nvs_close(nvs);
         }
+        cap_wasm_cfg_erase(app->name);
         memset(app, 0, sizeof(*app));
         cap_wasm_index_save();
         return;
@@ -1552,6 +1560,13 @@ static esp_err_t cap_wasm_unload_execute(const char *input_json, const claw_cap_
     return cap_wasm_name_tool(CAP_WASM_REQ_UNLOAD, input_json, output, output_size);
 }
 
+static esp_err_t cap_wasm_config_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                         char *output, size_t output_size)
+{
+    (void)ctx;
+    return cap_wasm_name_tool(CAP_WASM_REQ_CONFIG_JSON, input_json, output, output_size);
+}
+
 static esp_err_t cap_wasm_set_enabled_execute(const char *input_json, const claw_cap_call_context_t *ctx,
                                               char *output, size_t output_size)
 {
@@ -1605,15 +1620,31 @@ static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap
         {"load", CAP_WASM_REQ_LOAD},
         {"unload", CAP_WASM_REQ_UNLOAD},
     };
-    char command[320] = "";
+    char command[512] = "";
     char verb[16] = "";
     char name[CAP_WASM_APP_NAME_MAX + 2] = "";
     esp_err_t err = ESP_OK;
+    int args_at = 0;
 
-    cap_wasm_input_str(input_json, "command", command, sizeof(command));
-    sscanf(command, "%15s %25s", verb, name);
+    if (!cap_wasm_input_str(input_json, "command", command, sizeof(command)) && strstr(input_json, "command")) {
+        snprintf(output, output_size, "Error: the command is longer than %u bytes", (unsigned)sizeof(command) - 1);
+        return ESP_ERR_INVALID_ARG;
+    }
+    sscanf(command, "%15s %25s%n", verb, name, &args_at);
     if (!verb[0] || strcmp(verb, "list") == 0) {
         return cap_wasm_status(false, output, output_size);
+    }
+    if (strcmp(verb, "config") == 0 && name[0]) {
+        const char *args = command + args_at;
+
+        /* Values are set by the user only: a Telegram slash command, never the agent or Lua (which
+         * cannot claim source_cap tg_gateway). */
+        if (args[strspn(args, " ")] &&
+                (!ctx || ctx->caller != CLAW_CAP_CALLER_SYSTEM || !cap_im_tg_confirm_chat(ctx))) {
+            snprintf(output, output_size, "Error: app settings can only be changed with /app config in Telegram");
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        return cap_wasm_admin(CAP_WASM_REQ_CONFIG, name, args, output, output_size);
     }
     if (strcmp(verb, "install") == 0 || strcmp(verb, "update") == 0 || strcmp(verb, "updates") == 0 ||
             strcmp(verb, "remove") == 0) {
@@ -1636,6 +1667,8 @@ static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap
              "/app updates  List available app and firmware updates\n"
              "/app update <name>|all [url]  Update to the latest GitHub release (or from url)\n"
              "/app remove <name>  Delete an app and its data\n"
+             "/app config <name>  List an app's settings\n"
+             "/app config <name> <key> <value>|--reset  Set a setting or reset it to its default\n"
              "/apps enable|disable <name>  Turn an app on/off (persists)\n"
              "/apps load|unload <name>  Load into / free from memory now\n"
              "/apps reload <name>  Reload an app from %s/<name>/", g_cap_wasm_apps_dir);
@@ -1684,6 +1717,17 @@ static const claw_cap_descriptor_t s_mgr_descriptors[] = {
         .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
         .input_schema_json = CAP_WASM_NAME_SCHEMA,
         .execute = cap_wasm_unload_execute,
+    },
+    {
+        .id = "apps_config",
+        .name = "apps_config",
+        .family = "wasm_app",
+        .description = "List an installed WASM app's settings: key, type, description, whether set, and the value "
+                       "(secret values are never shown). Read-only: the user sets values with /app config in Telegram.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = CAP_WASM_NAME_SCHEMA,
+        .execute = cap_wasm_config_execute,
     },
     {
         .id = "apps_set_enabled",
