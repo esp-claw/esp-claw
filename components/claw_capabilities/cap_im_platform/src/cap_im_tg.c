@@ -38,6 +38,9 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_API_BASE            "https://api.telegram.org"
 #define CAP_IM_TG_HTTP_RESP_INIT      2048
 #define CAP_IM_TG_MAX_MSG_LEN         4096
+/* Rich messages allow 32768 characters and 500 blocks; stay well below both. */
+#define CAP_IM_TG_RICH_MAX_BYTES      30000
+#define CAP_IM_TG_RICH_MAX_LINES      400
 #define CAP_IM_TG_POLL_TIMEOUT_S      20
 #define CAP_IM_TG_RETRY_DELAY_MS      3000
 #define CAP_IM_TG_ATTACHMENT_QUEUE_LEN 8
@@ -131,6 +134,7 @@ typedef struct {
 
 static EXT_RAM_BSS_ATTR cap_im_tg_state_t s_tg;
 static bool s_tg_initialized;
+static bool s_tg_rich_unsupported;
 static cap_im_tg_confirm_t s_confirm;
 static portMUX_TYPE s_confirm_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -221,9 +225,10 @@ static esp_err_t cap_im_tg_http_event_handler(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
-static esp_err_t cap_im_tg_api_call(const char *method,
-                                    const char *body_json,
-                                    char **out_response)
+static esp_err_t cap_im_tg_api_call_status(const char *method,
+                                           const char *body_json,
+                                           char **out_response,
+                                           int *out_status)
 {
     cap_im_tg_http_resp_t resp = {0};
     esp_http_client_config_t config = {0};
@@ -284,6 +289,9 @@ static esp_err_t cap_im_tg_api_call(const char *method,
     status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
     free(url);
+    if (out_status) {
+        *out_status = status;
+    }
 
     if (err != ESP_OK) {
         free(resp.buf);
@@ -298,6 +306,13 @@ static esp_err_t cap_im_tg_api_call(const char *method,
 
     *out_response = resp.buf;
     return ESP_OK;
+}
+
+static esp_err_t cap_im_tg_api_call(const char *method,
+                                    const char *body_json,
+                                    char **out_response)
+{
+    return cap_im_tg_api_call_status(method, body_json, out_response, NULL);
 }
 
 static esp_err_t cap_im_tg_publish_inbound_text(const char *chat_id,
@@ -1593,6 +1608,70 @@ static esp_err_t cap_im_tg_send_text_chunk(const char *chat_id, const char *mess
     return err;
 }
 
+static esp_err_t cap_im_tg_send_rich_chunk(const char *chat_id, const char *markdown, int *out_status)
+{
+    cJSON *body = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err;
+
+    body = cJSON_CreateObject();
+    if (!body) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(body, "chat_id", chat_id);
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(body, "rich_message"), "markdown", markdown);
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = cap_im_tg_api_call_status("sendRichMessage", body_json, &resp, out_status);
+    free(body_json);
+    free(resp);
+    return err;
+}
+
+/* Length of the next rich chunk: all of it if it fits, else the last paragraph break (or line
+ * break) outside a ``` fence before the limits, else any line break, else a UTF-8 safe cut. */
+static size_t cap_im_tg_rich_chunk_len(const char *text, size_t len)
+{
+    size_t i;
+    size_t lines = 0;
+    size_t para = 0;
+    size_t line = 0;
+    size_t any = 0;
+    bool fence = false;
+
+    for (i = 0; i < len && i < CAP_IM_TG_RICH_MAX_BYTES; i++) {
+        if ((i == 0 || text[i - 1] == '\n') && strncmp(text + i + strspn(text + i, " "), "```", 3) == 0) {
+            fence = !fence;
+        }
+        if (text[i] != '\n') {
+            continue;
+        }
+        if (++lines > CAP_IM_TG_RICH_MAX_LINES) {
+            break;
+        }
+        any = i + 1;
+        if (!fence) {
+            line = i + 1;
+            if (i > 0 && text[i - 1] == '\n') {
+                para = i + 1;
+            }
+        }
+    }
+    if (i == len) {
+        return len;
+    }
+    if (para > i / 2) {
+        return para;
+    }
+    return line ? line : any ? any : claw_utils_utf8_prefix_len(text, CAP_IM_TG_RICH_MAX_BYTES);
+}
+
 static const char *cap_im_tg_basename(const char *path)
 {
     const char *slash = NULL;
@@ -2391,22 +2470,11 @@ esp_err_t cap_im_tg_stop(void)
     return cap_im_tg_gateway_stop();
 }
 
-esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
+static esp_err_t cap_im_tg_send_text_legacy(const char *chat_id, const char *text)
 {
-    if (!s_tg_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
     size_t text_len;
     size_t offset = 0;
     esp_err_t last_err = ESP_OK;
-
-    if (!chat_id || !text || text[0] == '\0') {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (s_tg.bot_token[0] == '\0') {
-        return ESP_ERR_INVALID_STATE;
-    }
 
     text_len = strlen(text);
     while (offset < text_len) {
@@ -2428,6 +2496,64 @@ esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
 
         memcpy(chunk, text + offset, chunk_len);
         err = cap_im_tg_send_text_chunk(chat_id, chunk);
+        free(chunk);
+        if (err != ESP_OK) {
+            last_err = err;
+        }
+
+        offset += chunk_len;
+    }
+
+    return last_err;
+}
+
+esp_err_t cap_im_tg_send_text(const char *chat_id, const char *text)
+{
+    if (!s_tg_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t text_len;
+    size_t offset = 0;
+    esp_err_t last_err = ESP_OK;
+
+    if (!chat_id || !text || text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_tg.bot_token[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    text_len = strlen(text);
+    while (offset < text_len) {
+        size_t chunk_len = cap_im_tg_rich_chunk_len(text + offset, text_len - offset);
+        char *chunk = NULL;
+        esp_err_t err = ESP_FAIL;
+        int status = 0;
+
+        if (chunk_len == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        chunk = calloc(1, chunk_len + 1);
+        if (!chunk) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        memcpy(chunk, text + offset, chunk_len);
+        if (!s_tg_rich_unsupported) {
+            err = cap_im_tg_send_rich_chunk(chat_id, chunk, &status);
+        }
+        /* Fall back on Telegram rejecting the rich message (parse/feature error, unknown method).
+         * Transport errors are not retried: Telegram may already have accepted the message. */
+        if (s_tg_rich_unsupported || (err == ESP_FAIL && (status == 400 || status == 404))) {
+            if (status == 404 && !s_tg_rich_unsupported) {
+                s_tg_rich_unsupported = true;
+                ESP_LOGW(TAG, "sendRichMessage not available, using sendMessage until reboot");
+            } else if (status == 400) {
+                ESP_LOGW(TAG, "sendRichMessage rejected, falling back to sendMessage for this chunk");
+            }
+            err = cap_im_tg_send_text_legacy(chat_id, chunk);
+        }
         free(chunk);
         if (err != ESP_OK) {
             last_err = err;
