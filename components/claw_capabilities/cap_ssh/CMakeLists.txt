@@ -11,6 +11,7 @@ idf_component_register(
         freertos
         mbedtls
         nvs_flash
+        espressif__sock_utils
 )
 
 # libssh needs a getnameinfo() that also handles AF_INET6, see cap_ssh_netdb.c.
