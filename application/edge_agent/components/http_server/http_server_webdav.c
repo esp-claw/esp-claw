@@ -12,6 +12,7 @@
  * - LOCK/UNLOCK are fake: tokens are issued but never enforced. They only
  *   exist because Windows and macOS refuse to write without them.
  * - PROPPATCH accepts every property and stores nothing.
+ * - Collections report RFC 4331 quota properties so clients can show free space.
  * - COPY supports files only; PUT bodies must carry Content-Length
  *   (esp_http_server cannot read chunked request bodies).
  */
@@ -31,6 +32,7 @@
 
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_vfs_fat.h"
 #include "mbedtls/base64.h"
 
 #define DAV_PREFIX       "/dav"
@@ -323,6 +325,9 @@ static esp_err_t propfind_send_entry(httpd_req_t *req, char *buf, const char *re
     char created[24];
     char etag[40];
     struct tm tm;
+    uint64_t fs_total = 0;
+    uint64_t fs_free = 0;
+    bool quota = is_dir && esp_vfs_fat_info(http_server_ctx()->storage_base_path, &fs_total, &fs_free) == ESP_OK;
     format_http_date(st->st_mtime, date, sizeof(date));
     gmtime_r(&st->st_mtime, &tm);
     strftime(created, sizeof(created), "%Y-%m-%dT%H:%M:%SZ", &tm);
@@ -344,6 +349,11 @@ static esp_err_t propfind_send_entry(httpd_req_t *req, char *buf, const char *re
                                     "<D:getcontenttype>%s</D:getcontenttype>"
                                     "<D:getetag>%s</D:getetag>",
                                     (long)st->st_size, content_type_for(rel), etag)) &&
+              (!quota || append_fmt(buf, size, &pos,
+                                    "<D:quota-available-bytes>%llu</D:quota-available-bytes>"
+                                    "<D:quota-used-bytes>%llu</D:quota-used-bytes>",
+                                    (unsigned long long)fs_free,
+                                    (unsigned long long)(fs_total - fs_free))) &&
               append_fmt(buf, size, &pos,
                          "<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope>"
                          "<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>"

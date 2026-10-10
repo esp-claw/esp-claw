@@ -33,6 +33,7 @@ set(http_server_requires
     cap_im_local
     claw_cap
     esp_http_server
+    fatfs
     heap
     mbedtls
 )
