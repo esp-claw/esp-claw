@@ -13,7 +13,7 @@
 # Needs apps built (apps/build.sh). The private key is only passed to ecapp.py, never printed.
 set -euo pipefail
 APPS=$(cd "$(dirname "$0")/.." && pwd)
-ECAPP="python3 $APPS/sdk/ecapp.py"
+ECAPP="python3 $APPS/sdk/tools/ecapp.py"
 OUT=${OUT:-/tmp/ecapp-device-test}
 PORT=${PORT:-8765}
 

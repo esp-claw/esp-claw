@@ -21,7 +21,7 @@ for app in "${apps[@]}"; do
     # -mcpu=mvp -mbulk-memory: features WAMR's interpreter is built with (memcpy -> memory.copy).
     # No --allow-undefined: anything but a claw.* import is a link error, not a runtime rejection.
     "$CC" --target=wasm32 -mcpu=mvp -mbulk-memory -O2 -nostdlib -ffreestanding -Wall -Wextra \
-        -I sdk -Wl,--no-entry -Wl,--strip-all \
+        -I sdk/include -Wl,--no-entry -Wl,--strip-all \
         -Wl,--export=app_init -Wl,--export=app_alloc -Wl,--export=tool_call \
         -Wl,--initial-memory=$mem -Wl,--max-memory=$mem -Wl,-z,stack-size=8192 \
         -o "$app/build/app.wasm" "$app"/*.c

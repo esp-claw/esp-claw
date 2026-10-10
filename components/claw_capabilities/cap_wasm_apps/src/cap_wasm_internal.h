@@ -18,7 +18,7 @@
 
 #define CAP_WASM_PSRAM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
-/* Host API error codes (returned negated). Must match apps/sdk/claw.h. */
+/* Host API error codes (returned negated). Must match apps/sdk/include/claw.h. */
 enum {
     CAP_WASM_EPERM = 1,
     CAP_WASM_ENOENT = 2,

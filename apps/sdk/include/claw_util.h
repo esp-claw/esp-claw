@@ -12,6 +12,8 @@
 
 #include <stdint.h>
 
+#include "claw.h" /* claw_strlen() */
+
 /* ---- output buffer (silently stops at cap; `full` tells) ---- */
 
 typedef struct {

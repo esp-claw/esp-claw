@@ -6,12 +6,14 @@ memory, a per-call time budget and only the host functions its manifest grants.
 
 ```
 apps/
-  sdk/claw.h        host API v1 (import module "claw") + helper macros
-  sdk/claw_util.h   optional output buffer / minimal JSON reader used by the examples
+  sdk/include/claw.h       host API v1 (import module "claw") + helper macros
+  sdk/include/claw_util.h  optional output buffer / minimal JSON reader used by the examples
   hello/            echo, benchmark, persistent counter, runaway loop (runtime test app)
   cf_dns/           read-only Cloudflare DNS via the device's "cloudflare" API profile
   ping/             ICMP echo (ping) to a host from the device
-  sdk/ecapp.py      packs and signs apps/<name>/build into an .ecapp package
+  sdk/tools/ecapp.py           packs and signs apps/<name>/build into an .ecapp package
+  sdk/tools/manifest_check.py  checks manifest.json against the firmware's rules
+  sdk/tools/wasm_check.py      checks a built app.wasm: imports, exports, memory, size
   sdk/device_test.sh  install/update/remove test steps for a flashed device
   build.sh          builds apps/<name>/build/{app.wasm,manifest.json}
 ```
@@ -24,7 +26,12 @@ Fedora: `dnf install clang lld`). `CC="zig cc"` works too.
 ```
 apps/build.sh            # all apps
 apps/build.sh hello      # one app
+python3 apps/sdk/tools/manifest_check.py apps/hello        # manifest rules, same as the firmware
+python3 apps/sdk/tools/wasm_check.py apps/hello/build      # imports/exports/memory, same as the runtime
 ```
+
+`apps/sdk` mirrors [esp-claw/app-sdk](https://github.com/esp-claw/app-sdk) (`include/`, `tools/`);
+change both together.
 
 The linear memory is sized from `limits.memory_kb` in the manifest. Link errors about undefined
 symbols mean the code needs something besides `claw.*` (e.g. libc's `memcpy` for a struct copy
@@ -38,9 +45,9 @@ during development). Both are read at boot.
 
 ```
 openssl genpkey -algorithm ed25519 -out key.pem      # once; keep it out of the repo
-apps/sdk/ecapp.py pubkey key.pem                       # base64 public key for app_trusted_keys
-apps/sdk/ecapp.py pack apps/hello/build --key key.pem # -> apps/hello/build/hello-1.0.0.ecapp
-apps/sdk/ecapp.py verify apps/hello/build/hello-1.0.0.ecapp --pub <base64>
+apps/sdk/tools/ecapp.py pubkey key.pem                       # base64 public key for app_trusted_keys
+apps/sdk/tools/ecapp.py pack apps/hello/build --key key.pem # -> apps/hello/build/hello-1.0.0.ecapp
+apps/sdk/tools/ecapp.py verify apps/hello/build/hello-1.0.0.ecapp --pub <base64>
 ```
 
 An `.ecapp` is `"ECAP"`, u8 format 1, u8 entry count 3, u16 0, then per entry u8 name length, name,
