@@ -60,6 +60,8 @@ typedef struct {
     char llm_visible_cap_groups[APP_CONFIG_STR_LEN];
     char enabled_lua_modules[APP_CONFIG_STR_LEN];
     char time_timezone[APP_CONFIG_TIMEZONE_LEN];
+    char webdav_user[64];
+    char webdav_password[64];
 } app_config_t;
 
 esp_err_t app_config_init(void);

@@ -94,6 +94,9 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
     CONFIG_FIELD("time",         time_timezone),
+
+    CONFIG_FIELD("webdav",       webdav_user),
+    CONFIG_SECRET_FIELD("webdav", webdav_password),
 };
 
 static const size_t CONFIG_FIELD_COUNT = sizeof(CONFIG_FIELDS) / sizeof(CONFIG_FIELDS[0]);
@@ -408,6 +411,9 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
 
     err = ctx->services.save_config(config);
+    if (err == ESP_OK) {
+        http_server_webdav_apply_config(config);
+    }
     free(config);
     if (err != ESP_OK) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save config");

@@ -5,10 +5,20 @@
  */
 #include "http_server_priv.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+
+static const char *TAG = "http_server";
 
 char *http_server_alloc_scratch_buffer(void)
 {
@@ -134,4 +144,103 @@ bool http_server_build_child_relative_path(const char *base_path,
     }
 
     return strlcat(out_path, entry_name, out_path_size) < out_path_size;
+}
+
+/* Streams the request body into a freshly created file. Returns 0 or an errno
+ * value (ENOSPC when the volume is full); the partial file is removed on error. */
+int http_server_recv_to_file(httpd_req_t *req, const char *path)
+{
+    char *scratch = http_server_alloc_scratch_buffer();
+    if (!scratch) {
+        return ENOMEM;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    if (fd < 0) {
+        free(scratch);
+        return errno ? errno : EIO;
+    }
+
+    int rc = 0;
+    int timeouts = 0;
+    size_t remaining = req->content_len;
+    while (remaining > 0 && rc == 0) {
+        int received = httpd_req_recv(req, scratch, MIN(remaining, HTTP_SERVER_SCRATCH_SIZE));
+        if (received == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) {
+            continue;
+        }
+        if (received <= 0) {
+            rc = EIO;
+            break;
+        }
+        ssize_t written = write(fd, scratch, received);
+        if (written != received) {
+            /* FAT reports a full volume as a short write or ENOSPC. */
+            rc = (written >= 0 || errno == ENOSPC) ? ENOSPC : (errno ? errno : EIO);
+            break;
+        }
+        remaining -= received;
+    }
+
+    if (close(fd) != 0 && rc == 0) {
+        rc = errno ? errno : EIO;
+    }
+    free(scratch);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Writing %s failed: errno %d", path, rc);
+        unlink(path);
+    }
+    return rc;
+}
+
+/* Replaces dst with src. FAT cannot rename over an existing file, so an
+ * existing dst is moved aside first and restored if the final rename fails. */
+int http_server_replace_file(const char *src, const char *dst)
+{
+    struct stat st;
+    if (stat(dst, &st) != 0) {
+        return rename(src, dst);
+    }
+    if (S_ISDIR(st.st_mode)) {
+        return -1;
+    }
+
+    char backup[HTTP_SERVER_PATH_MAX];
+    if (snprintf(backup, sizeof(backup), "%s.davbak", dst) >= (int)sizeof(backup)) {
+        return -1;
+    }
+    unlink(backup);
+    if (rename(dst, backup) != 0) {
+        return -1;
+    }
+    if (rename(src, dst) != 0) {
+        rename(backup, dst);
+        return -1;
+    }
+    unlink(backup);
+    return 0;
+}
+
+int http_server_rmdir_recursive(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char child[HTTP_SERVER_PATH_MAX];
+        strlcpy(child, path, sizeof(child));
+        strlcat(child, "/", sizeof(child));
+        strlcat(child, entry->d_name, sizeof(child));
+
+        struct stat st = {0};
+        if (stat(child, &st) != 0) { closedir(dir); return -1; }
+
+        int rc = S_ISDIR(st.st_mode) ? http_server_rmdir_recursive(child) : unlink(child);
+        if (rc != 0) { closedir(dir); return -1; }
+    }
+    closedir(dir);
+    return rmdir(path);
 }
