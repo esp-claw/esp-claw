@@ -596,6 +596,35 @@ static void cap_im_tg_queue_attachment(const char *chat_id,
     }
 }
 
+static void cap_im_tg_send_typing(const char *chat_id)
+{
+    cJSON *body = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err;
+
+    body = cJSON_CreateObject();
+    if (!body) {
+        return;
+    }
+
+    cJSON_AddStringToObject(body, "chat_id", chat_id);
+    cJSON_AddStringToObject(body, "action", "typing");
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_json) {
+        return;
+    }
+
+    /* Typing is cosmetic: a failure must never affect message handling. */
+    err = cap_im_tg_api_call("sendChatAction", body_json, &resp);
+    free(body_json);
+    free(resp);
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "Telegram typing action failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void cap_im_tg_handle_update(cJSON *update_json)
 {
     cJSON *update_id_json;
@@ -707,6 +736,7 @@ static void cap_im_tg_handle_update(cJSON *update_json)
                                            sender_id,
                                            message_id,
                                            text_json->valuestring) == ESP_OK) {
+            cap_im_tg_send_typing(chat_id);
             ESP_LOGI(TAG, "Telegram inbound %s: %.48s%s",
                      chat_id,
                      text_json->valuestring,
@@ -771,7 +801,258 @@ static esp_err_t cap_im_tg_poll_once(void)
     return ESP_OK;
 }
 
-static esp_err_t cap_im_tg_send_text_chunk(const char *chat_id, const char *message)
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} cap_im_tg_html_buf_t;
+
+static bool cap_im_tg_html_put(cap_im_tg_html_buf_t *out, const char *text, size_t len)
+{
+    if (out->len + len + 1 > out->cap) {
+        size_t new_cap = out->cap * 2;
+        char *tmp = NULL;
+
+        while (new_cap < out->len + len + 1) {
+            new_cap *= 2;
+        }
+
+        tmp = realloc(out->buf, new_cap);
+        if (!tmp) {
+            return false;
+        }
+
+        out->buf = tmp;
+        out->cap = new_cap;
+    }
+
+    memcpy(out->buf + out->len, text, len);
+    out->len += len;
+    out->buf[out->len] = '\0';
+    return true;
+}
+
+static bool cap_im_tg_html_put_escaped(cap_im_tg_html_buf_t *out, const char *text, size_t len, bool quote)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        const char *entity = NULL;
+
+        switch (text[i]) {
+        case '&':
+            entity = "&amp;";
+            break;
+        case '<':
+            entity = "&lt;";
+            break;
+        case '>':
+            entity = "&gt;";
+            break;
+        case '"':
+            entity = quote ? "&quot;" : NULL;
+            break;
+        default:
+            break;
+        }
+
+        if (entity ? !cap_im_tg_html_put(out, entity, strlen(entity))
+                   : !cap_im_tg_html_put(out, text + i, 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* First occurrence of `c` in [from, end), or NULL. */
+static const char *cap_im_tg_md_find_char(const char *from, const char *end, char c)
+{
+    return from < end ? memchr(from, c, (size_t)(end - from)) : NULL;
+}
+
+/* First occurrence of the two-character marker `c c` in [from, end), or NULL. */
+static const char *cap_im_tg_md_find_pair(const char *from, const char *end, char c)
+{
+    const char *p;
+
+    for (p = from; p + 1 < end; p++) {
+        if (p[0] == c && p[1] == c) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Converts inline Markdown in [line, end). Inline spans never nest, so the output tags always balance. */
+static bool cap_im_tg_md_inline(cap_im_tg_html_buf_t *out, const char *line, const char *end)
+{
+    const char *p = line;
+
+    while (p < end) {
+        const char *q = NULL;
+
+        if (p[0] == '`') {
+            q = cap_im_tg_md_find_char(p + 1, end, '`');
+            if (q && q > p + 1) {
+                if (!cap_im_tg_html_put(out, "<code>", 6) ||
+                    !cap_im_tg_html_put_escaped(out, p + 1, (size_t)(q - p - 1), false) ||
+                    !cap_im_tg_html_put(out, "</code>", 7)) {
+                    return false;
+                }
+                p = q + 1;
+                continue;
+            }
+        } else if (p + 2 < end && p[0] == '*' && p[1] == '*' && p[2] != ' ') {
+            q = cap_im_tg_md_find_pair(p + 3, end, '*');
+            if (q && q[-1] != ' ') {
+                if (!cap_im_tg_html_put(out, "<b>", 3) ||
+                    !cap_im_tg_html_put_escaped(out, p + 2, (size_t)(q - p - 2), false) ||
+                    !cap_im_tg_html_put(out, "</b>", 4)) {
+                    return false;
+                }
+                p = q + 2;
+                continue;
+            }
+        } else if (p + 1 < end && (p[0] == '*' || p[0] == '_') && p[1] != ' ' && p[1] != '*' &&
+                   (p[0] == '*' || p == line || !isalnum((unsigned char)p[-1]))) {
+            /* Closer: not after a space, not part of a "**" or "__" run, and for '_' not followed by a word char. */
+            for (q = p + 2; q < end; q++) {
+                if (q[0] == p[0] && q[-1] != ' ' && q[-1] != p[0] && (q + 1 == end || q[1] != p[0]) &&
+                    (p[0] == '*' || q + 1 == end || !isalnum((unsigned char)q[1]))) {
+                    break;
+                }
+            }
+            if (q < end) {
+                if (!cap_im_tg_html_put(out, "<i>", 3) ||
+                    !cap_im_tg_html_put_escaped(out, p + 1, (size_t)(q - p - 1), false) ||
+                    !cap_im_tg_html_put(out, "</i>", 4)) {
+                    return false;
+                }
+                p = q + 1;
+                continue;
+            }
+        } else if (p[0] == '[') {
+            q = cap_im_tg_md_find_char(p + 1, end, ']');
+            if (q && q > p + 1 && q + 1 < end && q[1] == '(') {
+                const char *r = cap_im_tg_md_find_char(q + 2, end, ')');
+
+                if (r && r > q + 2) {
+                    if (!cap_im_tg_html_put(out, "<a href=\"", 9) ||
+                        !cap_im_tg_html_put_escaped(out, q + 2, (size_t)(r - q - 2), true) ||
+                        !cap_im_tg_html_put(out, "\">", 2) ||
+                        !cap_im_tg_html_put_escaped(out, p + 1, (size_t)(q - p - 1), false) ||
+                        !cap_im_tg_html_put(out, "</a>", 4)) {
+                        return false;
+                    }
+                    p = r + 1;
+                    continue;
+                }
+            }
+        }
+
+        if (!cap_im_tg_html_put_escaped(out, p, 1, false)) {
+            return false;
+        }
+        p++;
+    }
+    return true;
+}
+
+/* Drops the newline that ends the last code line, then closes the <pre> block. */
+static bool cap_im_tg_html_close_pre(cap_im_tg_html_buf_t *out, const char *nl)
+{
+    if (out->len > 0 && out->buf[out->len - 1] == '\n') {
+        out->len--;
+        out->buf[out->len] = '\0';
+    }
+    return cap_im_tg_html_put(out, "</pre>", 6) && cap_im_tg_html_put(out, nl, strlen(nl));
+}
+
+/* Converts LLM Markdown to Telegram HTML. Returns a heap string the caller frees, or NULL on OOM. */
+static char *cap_im_tg_markdown_to_html(const char *md)
+{
+    cap_im_tg_html_buf_t out = {0};
+    const char *line = md;
+    bool in_fence = false;
+    bool in_table = false;
+    bool ok = true;
+
+    out.cap = 256;
+    out.buf = malloc(out.cap);
+    if (!out.buf) {
+        return NULL;
+    }
+    out.buf[0] = '\0';
+
+    while (ok && *line) {
+        const char *eol = strchr(line, '\n');
+        const char *end = eol ? eol : line + strlen(line);
+        const char *next = eol ? eol + 1 : end;
+        const char *nl = eol ? "\n" : "";
+        bool is_fence = strncmp(line, "```", 3) == 0;
+        size_t hashes = 0;
+
+        if (in_fence) {
+            if (is_fence) {
+                in_fence = false;
+                ok = cap_im_tg_html_close_pre(&out, nl);
+            } else {
+                ok = cap_im_tg_html_put_escaped(&out, line, (size_t)(end - line), false) &&
+                     cap_im_tg_html_put(&out, nl, strlen(nl));
+            }
+        } else if (is_fence) {
+            /* The language tag on the opening fence is ignored. */
+            if (in_table) {
+                in_table = false;
+                ok = cap_im_tg_html_close_pre(&out, "\n");
+            }
+            in_fence = true;
+            ok = ok && cap_im_tg_html_put(&out, "<pre>", 5);
+        } else if (line[0] == '|') {
+            if (!in_table) {
+                in_table = true;
+                ok = cap_im_tg_html_put(&out, "<pre>", 5);
+            }
+            ok = ok && cap_im_tg_html_put_escaped(&out, line, (size_t)(end - line), false) &&
+                 cap_im_tg_html_put(&out, nl, strlen(nl));
+        } else {
+            if (in_table) {
+                in_table = false;
+                ok = cap_im_tg_html_close_pre(&out, "\n");
+            }
+
+            while (line + hashes < end && line[hashes] == '#' && hashes < 6) {
+                hashes++;
+            }
+            if (hashes > 0 && line + hashes < end && line[hashes] == ' ') {
+                const char *text = line + hashes + 1;
+
+                ok = ok && cap_im_tg_html_put(&out, "<b>", 3) &&
+                     cap_im_tg_html_put_escaped(&out, text, (size_t)(end - text), false) &&
+                     cap_im_tg_html_put(&out, "</b>", 4);
+            } else {
+                ok = ok && cap_im_tg_md_inline(&out, line, end);
+            }
+            ok = ok && cap_im_tg_html_put(&out, nl, strlen(nl));
+        }
+
+        line = next;
+    }
+
+    if (ok && in_fence) {
+        ok = cap_im_tg_html_close_pre(&out, "");
+    } else if (ok && in_table) {
+        ok = cap_im_tg_html_close_pre(&out, "");
+    }
+
+    if (!ok) {
+        free(out.buf);
+        return NULL;
+    }
+    return out.buf;
+}
+
+static esp_err_t cap_im_tg_send_message_body(const char *chat_id, const char *text, const char *parse_mode)
 {
     cJSON *body = NULL;
     char *body_json = NULL;
@@ -784,7 +1065,10 @@ static esp_err_t cap_im_tg_send_text_chunk(const char *chat_id, const char *mess
     }
 
     cJSON_AddStringToObject(body, "chat_id", chat_id);
-    cJSON_AddStringToObject(body, "text", message);
+    cJSON_AddStringToObject(body, "text", text);
+    if (parse_mode) {
+        cJSON_AddStringToObject(body, "parse_mode", parse_mode);
+    }
     body_json = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
     if (!body_json) {
@@ -794,6 +1078,23 @@ static esp_err_t cap_im_tg_send_text_chunk(const char *chat_id, const char *mess
     err = cap_im_tg_api_call("sendMessage", body_json, &resp);
     free(body_json);
     free(resp);
+    return err;
+}
+
+static esp_err_t cap_im_tg_send_text_chunk(const char *chat_id, const char *message)
+{
+    char *html = cap_im_tg_markdown_to_html(message);
+    esp_err_t err = ESP_ERR_NO_MEM;
+
+    if (html) {
+        err = cap_im_tg_send_message_body(chat_id, html, "HTML");
+    }
+    /* Retry once as plain text only when Telegram rejects the HTML (ESP_FAIL = non-2xx).
+     * Transport errors are not retried: Telegram may already have accepted the message. */
+    if (!html || err == ESP_FAIL) {
+        err = cap_im_tg_send_message_body(chat_id, message, NULL);
+    }
+    free(html);
     return err;
 }
 
@@ -1109,10 +1410,57 @@ static esp_err_t cap_im_tg_send_media(const char *chat_id,
     return ESP_OK;
 }
 
+static void cap_im_tg_set_commands(void)
+{
+    static const struct {
+        const char *command;
+        const char *description;
+    } commands[] = {
+        {"session", "Manage chat sessions (new, list, switch, delete)"},
+        {"llm", "Configure the LLM model and endpoint"},
+    };
+    cJSON *body = NULL;
+    cJSON *list = NULL;
+    char *body_json = NULL;
+    char *resp = NULL;
+    esp_err_t err = ESP_ERR_NO_MEM;
+
+    body = cJSON_CreateObject();
+    list = cJSON_AddArrayToObject(body, "commands");
+    if (!list) {
+        cJSON_Delete(body);
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        cJSON *item = cJSON_CreateObject();
+
+        if (!item) {
+            cJSON_Delete(body);
+            return;
+        }
+        cJSON_AddStringToObject(item, "command", commands[i].command);
+        cJSON_AddStringToObject(item, "description", commands[i].description);
+        cJSON_AddItemToArray(list, item);
+    }
+
+    body_json = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (body_json) {
+        err = cap_im_tg_api_call("setMyCommands", body_json, &resp);
+    }
+    free(body_json);
+    free(resp);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Telegram setMyCommands failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void cap_im_tg_poll_task(void *arg)
 {
     (void)arg;
 
+    cap_im_tg_set_commands();
     while (!s_tg.stop_requested) {
         if (cap_im_tg_poll_once() != ESP_OK) {
             if (s_tg.stop_requested) {

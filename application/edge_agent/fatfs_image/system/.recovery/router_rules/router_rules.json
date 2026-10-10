@@ -90,28 +90,6 @@
     ]
   },
   {
-    "id": "im_any_message_working_reply",
-    "description": "Reply to any IM text message before other automation handling.",
-    "enabled": true,
-    "consume_on_match": false,
-    "ack": "{{event.source_channel}} working reply sent",
-    "match": {
-      "event_type": "message",
-      "event_key": "text",
-      "content_type": "text"
-    },
-    "actions": [
-      {
-        "type": "send_message",
-        "input": {
-          "channel": "{{event.source_channel}}",
-          "chat_id": "{{event.chat_id}}",
-          "message": "🦞 ESP-Claw is snapping on it..."
-        }
-      }
-    ]
-  },
-  {
     "id": "im_attachment_saved_reply",
     "description": "Reply when an IM attachment is saved.",
     "enabled": true,
