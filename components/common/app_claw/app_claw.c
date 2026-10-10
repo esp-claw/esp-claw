@@ -83,6 +83,14 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
     "Return concise findings, decisions, changed state, verification results, and blockers. " \
     "Keep detailed intermediate work in your own session and report only what the root needs to continue or answer the user."
 
+#if CONFIG_APP_CLAW_CAP_SSH
+#define APP_SYSTEM_PROMPT_STORAGE \
+    "Work files (code, prototypes, downloads, generated data) go to the remote workdir via remote_write_file (cap_ssh skill) when a host with a workdir is configured and reachable; wake it with wol_wake (cap_wol skill) if needed. " \
+    "The device flash is for configuration, skills, apps and memory only.\n"
+#else
+#define APP_SYSTEM_PROMPT_STORAGE ""
+#endif
+
 #if CONFIG_APP_CLAW_MEMORY_MODE_FULL
 #define APP_SYSTEM_PROMPT_SUFFIX \
     "When long-term memory is needed, activate the 'memory_ops' skill first and follow its instructions. " \
@@ -98,6 +106,7 @@ static const char *APP_STARTUP_EVENT_KEY = "boot_completed";
 
 #define APP_SYSTEM_PROMPT \
     APP_SYSTEM_PROMPT_COMMON \
+    APP_SYSTEM_PROMPT_STORAGE \
     APP_SYSTEM_PROMPT_SUFFIX
 
 #define APP_CLAW_LAUNCHER_OUTPUT_LEN 128
