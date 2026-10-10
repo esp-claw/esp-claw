@@ -777,7 +777,9 @@ static esp_err_t app_cap_register_wol(const app_claw_config_t *config,
 static esp_err_t app_cap_register_wasm_apps(const app_claw_config_t *config,
                                             const app_claw_storage_paths_t *paths)
 {
-    (void)config;
+    cap_wasm_apps_set_trust(config->app_trusted_keys,
+                            strcmp(config->app_allow_unsigned, "true") == 0 ||
+                            strcmp(config->app_allow_unsigned, "1") == 0);
     return cap_wasm_apps_register_group(paths->fatfs_base_path);
 }
 #endif
@@ -993,7 +995,8 @@ esp_err_t app_capabilities_init(const app_claw_config_t *config,
     entries = calloc(entry_count > 0 ? entry_count : 1, sizeof(entries[0]));
     enabled_map = calloc(entry_count > 0 ? entry_count : 1, sizeof(enabled_map[0]));
     llm_visible_map = calloc(entry_count > 0 ? entry_count : 1, sizeof(llm_visible_map[0]));
-    llm_visible_groups = calloc(entry_count > 0 ? entry_count : 1, sizeof(llm_visible_groups[0]));
+    /* +1: the WASM app manager group rides along with cap_wasm_apps (see below). */
+    llm_visible_groups = calloc(entry_count + 1, sizeof(llm_visible_groups[0]));
     if (!entries || !enabled_map || !llm_visible_map || !llm_visible_groups) {
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
@@ -1044,6 +1047,13 @@ esp_err_t app_capabilities_init(const app_claw_config_t *config,
 
         if (llm_visible_map[i]) {
             llm_visible_groups[llm_visible_group_count++] = entry->group_id;
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+            /* cap_wasm_apps re-registers its app tool group, so its management tools live in a
+             * second group that must be visible whenever the app tools are. */
+            if (strcmp(entry->group_id, "cap_wasm_apps") == 0) {
+                llm_visible_groups[llm_visible_group_count++] = "cap_wasm_apps_mgr";
+            }
+#endif
         }
     }
 

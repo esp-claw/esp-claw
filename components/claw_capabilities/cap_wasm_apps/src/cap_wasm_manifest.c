@@ -25,7 +25,7 @@ bool cap_wasm_name_valid(const char *name, size_t len, size_t max_len)
     return true;
 }
 
-static bool cap_wasm_keys_known(const cJSON *obj, const char *const *keys, size_t key_count,
+bool cap_wasm_keys_known(const cJSON *obj, const char *const *keys, size_t key_count,
                                 const char *where, char *err, size_t err_size)
 {
     const cJSON *item = NULL;
@@ -172,7 +172,7 @@ bool cap_wasm_manifest_parse(const char *json, const char *dir_name, cap_wasm_ma
                  CAP_WASM_APP_NAME_MAX);
         goto done;
     }
-    if (strcmp(out->name, dir_name) != 0) {
+    if (dir_name && strcmp(out->name, dir_name) != 0) {
         snprintf(err, err_size, "name '%s' does not match the app directory", out->name);
         goto done;
     }

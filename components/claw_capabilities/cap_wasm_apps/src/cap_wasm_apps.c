@@ -5,7 +5,8 @@
  */
 
 /*
- * Sandboxed WASM apps (WAMR fast interpreter) loaded from <storage>/apps/<name>/{manifest.json,app.wasm}.
+ * Sandboxed WASM apps (WAMR fast interpreter) loaded from
+ * <storage>/apps/<name>/{manifest.json,app.wasm,signature.json}.
  *
  * Threads: all WAMR calls run on one pthread ("wasm_apps", PSRAM stack; WAMR's ESP-IDF port calls
  * pthread_self()). Requesters (tool calls, /apps, boot) hand it a request, then act as its
@@ -15,9 +16,17 @@
  * A trapped or terminated instance is torn down and re-instantiated lazily on the next call;
  * after CAP_WASM_MAX_FAILURES consecutive failures the app is disabled until reload or reboot.
  *
- * Capability groups: "cap_wasm_apps" holds apps_status and the app tools; it is unregistered and
- * re-registered when /apps reload|disable changes the tool set. "cap_wasm_apps_mgr" holds the
- * restricted /apps command handler, which must not live in the group it re-registers.
+ * On-demand loading: at boot every enabled app with a valid signature registers its tools from
+ * <name>/tools.json (written after its last successful app_init, bound to the wasm hash) without
+ * staying in memory. A call to an unloaded app loads it first. An app is unloaded after
+ * CAP_WASM_IDLE_MS without calls, and the least recently used ones are unloaded when PSRAM would
+ * drop below the reserve. Calls run one at a time on the WASM thread, which is also the only
+ * place apps are unloaded, so an app with a call in progress is never evicted.
+ *
+ * Capability groups: "cap_wasm_apps" holds the app tools; it is unregistered and re-registered
+ * when the tool set changes. "cap_wasm_apps_mgr" holds the management tools and the restricted
+ * /apps command handler, which must not live in the group they re-register (app_capabilities.c
+ * makes it LLM-visible together with cap_wasm_apps).
  */
 #include "cap_wasm_apps.h"
 
@@ -29,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cJSON.h"
@@ -42,6 +52,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 static const char *TAG = "cap_wasm_apps";
 
@@ -49,8 +60,7 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_MGR_GROUP        "cap_wasm_apps_mgr"
 #define CAP_WASM_MAX_APPS         8
 #define CAP_WASM_MAX_TOOLS        32   /* dispatch slots, see CAP_WASM_SLOTS */
-#define CAP_WASM_MAX_FILE_SIZE    (256 * 1024)
-#define CAP_WASM_MANIFEST_MAX     4096
+#define CAP_WASM_TOOLS_JSON_MAX   (CAP_WASM_MAX_TOOLS * 3 * 1024)
 #define CAP_WASM_TOOL_DESC_MAX    256  /* claw_cap truncates longer tool descriptions */
 #define CAP_WASM_TOOL_SCHEMA_MAX  2048
 #define CAP_WASM_EXEC_STACK       (16 * 1024) /* WASM operand/frame stack */
@@ -62,31 +72,31 @@ static const char *TAG = "cap_wasm_apps";
 #define CAP_WASM_WATCHDOG_TICK_MS 50
 #define CAP_WASM_STATUS_WAIT_MS   3000
 #define CAP_WASM_DRAIN_MS         10000
-
-typedef enum {
-    CAP_WASM_REQ_BOOT,
-    CAP_WASM_REQ_CALL,
-    CAP_WASM_REQ_RELOAD,
-    CAP_WASM_REQ_DISABLE,
-    CAP_WASM_REQ_STATUS,
-} cap_wasm_req_type_t;
+#define CAP_WASM_IDLE_MS          (10 * 60 * 1000)
+#define CAP_WASM_SWEEP_MS         (30 * 1000)
 
 typedef struct {
     cap_wasm_req_type_t type;
     int slot;                             /* CALL */
-    const char *arg;                      /* CALL: input JSON; RELOAD/DISABLE: app name; STATUS: "json" */
+    const char *arg;                      /* CALL: input JSON; admin: app name; STATUS: "json" */
+    const char *extra;                    /* INSTALL: source URL */
     const claw_cap_call_context_t *ctx;   /* CALL */
     char *output;
     size_t output_size;
     esp_err_t err;
 } cap_wasm_req_t;
 
-static char s_apps_dir[64];
+char g_cap_wasm_apps_dir[64];
+EXT_RAM_BSS_ATTR cap_wasm_key_t g_cap_wasm_trusted[CAP_WASM_MAX_TRUSTED];
+size_t g_cap_wasm_trusted_count;
+static bool s_allow_unsigned;
+
+/* Slots of removed apps have an empty name and are reused; s_app_count is the high-water mark. */
 static EXT_RAM_BSS_ATTR cap_wasm_app_t s_apps[CAP_WASM_MAX_APPS];
 static size_t s_app_count;
 static EXT_RAM_BSS_ATTR cap_wasm_tool_t s_tools[CAP_WASM_MAX_TOOLS];
 static size_t s_tool_count;
-static EXT_RAM_BSS_ATTR claw_cap_descriptor_t s_descriptors[1 + CAP_WASM_MAX_TOOLS];
+static EXT_RAM_BSS_ATTR claw_cap_descriptor_t s_descriptors[CAP_WASM_MAX_TOOLS];
 static claw_cap_group_t s_group;
 static bool s_runtime_ok;
 
@@ -171,6 +181,96 @@ static void cap_wasm_watchdog(void)
     xSemaphoreGive(s_exec.lock);
 }
 
+/* ---------- Files ---------- */
+
+char *cap_wasm_read_file(const char *path, size_t max_size, size_t *out_size)
+{
+    struct stat st;
+    FILE *f = NULL;
+    char *buf = NULL;
+
+    if (stat(path, &st) != 0 || st.st_size <= 0 || (size_t)st.st_size > max_size) {
+        return NULL;
+    }
+    buf = heap_caps_malloc(st.st_size + 1, CAP_WASM_PSRAM_CAPS);
+    f = buf ? fopen(path, "rb") : NULL;
+    if (!f || fread(buf, 1, st.st_size, f) != (size_t)st.st_size) {
+        heap_caps_free(buf);
+        buf = NULL;
+    } else {
+        buf[st.st_size] = '\0';
+        *out_size = (size_t)st.st_size;
+    }
+    if (f) {
+        fclose(f);
+    }
+    return buf;
+}
+
+bool cap_wasm_write_file(const char *path, const char *data, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    bool ok = f && fwrite(data, 1, len, f) == len;
+
+    if (f && fclose(f) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        unlink(path);
+    }
+    return ok;
+}
+
+/* Writes via a temp file. FAT cannot rename over an existing file, so the old one is moved aside
+ * first and restored if the final rename fails (as http_server_replace_file() does). */
+static bool cap_wasm_write_file_atomic(const char *path, const char *data)
+{
+    char tmp[128];
+    char bak[128];
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    snprintf(bak, sizeof(bak), "%s.bak", path);
+    if (!cap_wasm_write_file(tmp, data, strlen(data))) {
+        return false;
+    }
+    unlink(bak);
+    if (access(path, F_OK) == 0 && rename(path, bak) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    if (rename(tmp, path) != 0) {
+        rename(bak, path);
+        unlink(tmp);
+        return false;
+    }
+    unlink(bak);
+    return true;
+}
+
+bool cap_wasm_rmdir(const char *path)
+{
+    DIR *dir = opendir(path);
+    struct dirent *ent;
+    char child[sizeof(g_cap_wasm_apps_dir) + 2 * sizeof(ent->d_name)];
+
+    if (!dir) {
+        return access(path, F_OK) != 0;
+    }
+    while ((ent = readdir(dir)) != NULL) {
+        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+            snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+            unlink(child);
+        }
+    }
+    closedir(dir);
+    return rmdir(path) == 0;
+}
+
+static void cap_wasm_app_path(const cap_wasm_app_t *app, const char *file, char *out, size_t size)
+{
+    snprintf(out, size, "%s/%s/%s", g_cap_wasm_apps_dir, app->name, file);
+}
+
 /* ---------- Tools ---------- */
 
 static cap_wasm_tool_t *cap_wasm_find_tool(const char *name)
@@ -241,10 +341,15 @@ int32_t cap_wasm_tool_add(cap_wasm_app_t *app, const char *name, uint32_t name_l
     }
     tool = cap_wasm_find_tool(full);
     if (app->tools_frozen) {
-        /* Re-instantiation after a failure: the registered tool set must not change. */
-        return tool && tool->app == app ? tool->local_idx : -CAP_WASM_EPERM;
+        /* Tools come from tools.json or an earlier app_init: the registered set must not change. */
+        if (tool && tool->app == app) {
+            app->init_tools++;
+            return tool->local_idx;
+        }
+        app->tools_changed = true;
+        return -CAP_WASM_EPERM;
     }
-    if (tool || claw_cap_find(full) || strcmp(full, "apps_status") == 0) {
+    if (tool || claw_cap_find(full)) {
         ESP_LOGW(TAG, "[%s] tool '%s' collides with an existing tool", app->name, full);
         return -CAP_WASM_EEXIST;
     }
@@ -287,6 +392,69 @@ int32_t cap_wasm_tool_add(cap_wasm_app_t *app, const char *name, uint32_t name_l
     return tool->local_idx;
 }
 
+/* Registers the tools cached in tools.json if it belongs to the current app.wasm. */
+static bool cap_wasm_tools_from_cache(cap_wasm_app_t *app)
+{
+    char path[128];
+    size_t size = 0;
+    char *json;
+    cJSON *root;
+    const cJSON *tool = NULL;
+    const char *sha;
+    bool ok;
+
+    cap_wasm_app_path(app, "tools.json", path, sizeof(path));
+    json = cap_wasm_read_file(path, CAP_WASM_TOOLS_JSON_MAX, &size);
+    root = json ? cJSON_Parse(json) : NULL;
+    heap_caps_free(json);
+    sha = cJSON_GetStringValue(cJSON_GetObjectItem(root, "wasm_sha256"));
+    ok = cJSON_IsArray(cJSON_GetObjectItem(root, "tools")) && sha && strcmp(sha, app->wasm_sha256) == 0;
+    cJSON_ArrayForEach(tool, (ok ? cJSON_GetObjectItem(root, "tools") : NULL)) {
+        const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(tool, "name"));
+        const char *desc = cJSON_GetStringValue(cJSON_GetObjectItem(tool, "description"));
+        const char *schema = cJSON_GetStringValue(cJSON_GetObjectItem(tool, "schema"));
+
+        if (!name || !desc || !schema ||
+                cap_wasm_tool_add(app, name, strlen(name), desc, strlen(desc), schema, strlen(schema)) < 0) {
+            ok = false;
+            break;
+        }
+    }
+    cJSON_Delete(root);
+    if (!ok) {
+        cap_wasm_remove_tools(app);
+    }
+    return ok;
+}
+
+static void cap_wasm_tools_to_cache(const cap_wasm_app_t *app)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *tools = cJSON_AddArrayToObject(root, "tools");
+    size_t prefix = strlen(app->name) + 1;
+    char path[128];
+    char *json;
+
+    cJSON_AddStringToObject(root, "wasm_sha256", app->wasm_sha256);
+    for (size_t i = 0; i < s_tool_count; i++) {
+        if (s_tools[i].app == app) {
+            cJSON *tool = cJSON_CreateObject();
+
+            cJSON_AddStringToObject(tool, "name", s_tools[i].name + prefix);
+            cJSON_AddStringToObject(tool, "description", s_tools[i].desc);
+            cJSON_AddStringToObject(tool, "schema", s_tools[i].schema);
+            cJSON_AddItemToArray(tools, tool);
+        }
+    }
+    json = cJSON_PrintUnformatted(root);
+    cap_wasm_app_path(app, "tools.json", path, sizeof(path));
+    if (!json || !cap_wasm_write_file_atomic(path, json)) {
+        ESP_LOGW(TAG, "[%s] cannot write tools.json; the app is loaded at every boot", app->name);
+    }
+    free(json);
+    cJSON_Delete(root);
+}
+
 /* ---------- Instance lifecycle (WASM thread) ---------- */
 
 static void cap_wasm_set_error(cap_wasm_app_t *app, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -315,6 +483,7 @@ static void cap_wasm_teardown(cap_wasm_app_t *app)
     app->fn_call = NULL;
 }
 
+/* Frees the module and instance; registered tools stay. */
 static void cap_wasm_unload(cap_wasm_app_t *app)
 {
     cap_wasm_teardown(app);
@@ -322,7 +491,10 @@ static void cap_wasm_unload(cap_wasm_app_t *app)
         wasm_runtime_unload(app->module);
         app->module = NULL;
     }
-    cap_wasm_remove_tools(app);
+    if (app->state == CAP_WASM_APP_LOADED) {
+        app->state = CAP_WASM_APP_UNLOADED;
+    }
+    app->psram_bytes = 0;
 }
 
 /* Instantiates the loaded module and runs app_init(). */
@@ -364,6 +536,7 @@ static bool cap_wasm_instantiate(cap_wasm_app_t *app)
     }
 
     app->initializing = true;
+    app->init_tools = 0;
     cap_wasm_budget_begin(app, CAP_WASM_INIT_MS);
     ok = wasm_runtime_call_wasm(app->env, fn_init, 0, NULL);
     terminated = cap_wasm_budget_end();
@@ -377,7 +550,13 @@ static bool cap_wasm_instantiate(cap_wasm_app_t *app)
         cap_wasm_teardown(app);
         return false;
     }
-    app->state = CAP_WASM_APP_READY;
+    if (app->tools_frozen && app->init_tools != cap_wasm_app_tool_count(app)) {
+        app->tools_changed = true;
+    }
+    if (app->tools_changed) {
+        ESP_LOGW(TAG, "[%s] app_init registered a different tool set than cached; refreshing", app->name);
+    }
+    app->state = CAP_WASM_APP_LOADED;
     return true;
 }
 
@@ -408,40 +587,98 @@ static bool cap_wasm_check_imports(cap_wasm_app_t *app)
     return true;
 }
 
-static char *cap_wasm_read_file(const char *path, size_t max_size, size_t *out_size)
-{
-    struct stat st;
-    FILE *f = NULL;
-    char *buf = NULL;
-
-    if (stat(path, &st) != 0 || st.st_size <= 0 || (size_t)st.st_size > max_size) {
-        return NULL;
-    }
-    buf = heap_caps_malloc(st.st_size + 1, CAP_WASM_PSRAM_CAPS);
-    f = buf ? fopen(path, "rb") : NULL;
-    if (!f || fread(buf, 1, st.st_size, f) != (size_t)st.st_size) {
-        heap_caps_free(buf);
-        buf = NULL;
-    } else {
-        buf[st.st_size] = '\0';
-        *out_size = (size_t)st.st_size;
-    }
-    if (f) {
-        fclose(f);
-    }
-    return buf;
-}
-
-/* Reads, validates, loads and instantiates one app. `boot` honours the crash marker. */
-static void cap_wasm_load(cap_wasm_app_t *app, bool boot)
+/*
+ * Reads and validates manifest.json, reads app.wasm and checks signature.json. Returns app.wasm
+ * (caller frees) or NULL with the state set to FAILED or UNSIGNED and last_error saying why.
+ */
+static char *cap_wasm_read_verified(cap_wasm_app_t *app, size_t *wasm_size)
 {
     char path[128];
-    char marker[128];
     char err[128];
     char *manifest = NULL;
     char *wasm = NULL;
+    char *sig = NULL;
+    size_t manifest_size = 0;
+    size_t sig_size = 0;
+
+    app->state = CAP_WASM_APP_FAILED;
+    cap_wasm_app_path(app, "manifest.json", path, sizeof(path));
+    manifest = cap_wasm_read_file(path, CAP_WASM_MANIFEST_MAX, &manifest_size);
+    if (!manifest) {
+        cap_wasm_set_error(app, "manifest.json missing or larger than %d bytes", CAP_WASM_MANIFEST_MAX);
+        return NULL;
+    }
+    if (!cap_wasm_manifest_parse(manifest, app->name, &app->mf, err, sizeof(err))) {
+        cap_wasm_set_error(app, "manifest.json: %s", err);
+        goto done;
+    }
+    cap_wasm_nvs_namespace(app->name, app->nvs_ns);
+    cap_wasm_app_path(app, "app.wasm", path, sizeof(path));
+    wasm = cap_wasm_read_file(path, CAP_WASM_WASM_MAX, wasm_size);
+    if (!wasm) {
+        cap_wasm_set_error(app, "app.wasm missing or larger than %d KB", CAP_WASM_WASM_MAX / 1024);
+        goto done;
+    }
+    cap_wasm_sha256_hex((const uint8_t *)wasm, *wasm_size, app->wasm_sha256);
+    cap_wasm_app_path(app, "signature.json", path, sizeof(path));
+    sig = cap_wasm_read_file(path, CAP_WASM_SIGNATURE_MAX, &sig_size);
+    snprintf(err, sizeof(err), "no signature.json");
+    if (sig && cap_wasm_sig_verify(sig, &app->mf, (const uint8_t *)manifest, manifest_size,
+                                   (const uint8_t *)wasm, *wasm_size, g_cap_wasm_trusted,
+                                   g_cap_wasm_trusted_count, app->key_id, err, sizeof(err))) {
+        goto done;
+    }
+    app->key_id[0] = '\0';
+    if (s_allow_unsigned) {
+        ESP_LOGW(TAG, "[%s] loading without a valid signature (%s): app_allow_unsigned is on", app->name, err);
+        goto done;
+    }
+    app->state = CAP_WASM_APP_UNSIGNED;
+    cap_wasm_set_error(app, "not loaded: %s (install signed packages with /app install)", err);
+    heap_caps_free(wasm);
+    wasm = NULL;
+
+done:
+    heap_caps_free(manifest);
+    heap_caps_free(sig);
+    return wasm;
+}
+
+/* Unloads least recently used apps until `need` bytes fit above the PSRAM reserve. */
+static bool cap_wasm_make_room(const cap_wasm_app_t *app, size_t need)
+{
+    while (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < CAP_WASM_PSRAM_RESERVE + need) {
+        int64_t last_used[CAP_WASM_MAX_APPS];
+        bool loaded[CAP_WASM_MAX_APPS];
+        int victim;
+
+        for (size_t i = 0; i < s_app_count; i++) {
+            last_used[i] = s_apps[i].last_used_us;
+            loaded[i] = s_apps[i].module != NULL;
+        }
+        victim = cap_wasm_lru_pick(last_used, loaded, s_app_count, (int)(app - s_apps));
+        if (victim < 0) {
+            return false;
+        }
+        ESP_LOGI(TAG, "[%s] unloaded (least recently used) to make room for %s", s_apps[victim].name, app->name);
+        cap_wasm_unload(&s_apps[victim]);
+    }
+    return true;
+}
+
+/*
+ * Verifies, loads and instantiates one app. `frozen`: its tools are registered already and app_init
+ * must name the same ones; otherwise they are registered now and cached in tools.json. `boot`
+ * guards the load with a crash marker. On failure the app stays UNLOADED when frozen (the next
+ * call retries) and is FAILED or UNSIGNED otherwise.
+ */
+static bool cap_wasm_load(cap_wasm_app_t *app, bool frozen, bool boot)
+{
+    char marker[128];
+    char err[128];
+    char *wasm;
     size_t size = 0;
-    size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t psram_before;
     size_t internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     int64_t t0 = esp_timer_get_time();
     int64_t t_load;
@@ -451,91 +688,143 @@ static void cap_wasm_load(cap_wasm_app_t *app, bool boot)
         .wasm_binary_freeable = true,
     };
 
-    app->state = CAP_WASM_APP_FAILED;
     app->failures = 0;
     app->last_error[0] = '\0';
-    snprintf(marker, sizeof(marker), "%s/%s/.loading", s_apps_dir, app->name);
-    if (boot && access(marker, F_OK) == 0) {
-        cap_wasm_set_error(app, "did not finish loading on a previous boot; /apps reload %s retries", app->name);
-        return;
-    }
-
-    snprintf(path, sizeof(path), "%s/%s/manifest.json", s_apps_dir, app->name);
-    manifest = cap_wasm_read_file(path, CAP_WASM_MANIFEST_MAX, &size);
-    if (!manifest) {
-        cap_wasm_set_error(app, "manifest.json missing or larger than %d bytes", CAP_WASM_MANIFEST_MAX);
-        return;
-    }
-    if (!cap_wasm_manifest_parse(manifest, app->name, &app->mf, err, sizeof(err))) {
-        cap_wasm_set_error(app, "manifest.json: %s", err);
-        goto done;
-    }
-    cap_wasm_nvs_namespace(app->name, app->nvs_ns);
-
-    snprintf(path, sizeof(path), "%s/%s/app.wasm", s_apps_dir, app->name);
-    wasm = cap_wasm_read_file(path, CAP_WASM_MAX_FILE_SIZE, &size);
+    wasm = cap_wasm_read_verified(app, &size);
     if (!wasm) {
-        cap_wasm_set_error(app, "app.wasm missing or larger than %d KB", CAP_WASM_MAX_FILE_SIZE / 1024);
-        goto done;
+        goto failed;
     }
     /* Module + instance need roughly twice the binary plus the linear memory and stacks. */
-    if (psram_before < CAP_WASM_PSRAM_RESERVE + 2 * size + app->mf.memory_kb * 1024 +
-            2 * CAP_WASM_EXEC_STACK + CAP_WASM_LOAD_OVERHEAD) {
+    if (!cap_wasm_make_room(app, 2 * size + app->mf.memory_kb * 1024 + 2 * CAP_WASM_EXEC_STACK +
+                            CAP_WASM_LOAD_OVERHEAD)) {
         cap_wasm_set_error(app, "not enough PSRAM (%u KB free, %u KB must stay free)",
-                           (unsigned)(psram_before / 1024), CAP_WASM_PSRAM_RESERVE / 1024);
-        goto done;
+                           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                           CAP_WASM_PSRAM_RESERVE / 1024);
+        heap_caps_free(wasm);
+        goto failed;
     }
 
-    m = fopen(marker, "w");
-    if (m) {
+    psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    cap_wasm_app_path(app, ".loading", marker, sizeof(marker));
+    if (boot && (m = fopen(marker, "w")) != NULL) {
         fclose(m);
     }
     app->wasm_size = (uint32_t)size;
+    app->tools_frozen = frozen;
+    app->tools_changed = false;
     app->module = wasm_runtime_load_ex((uint8_t *)wasm, (uint32_t)size, &load_args, err, sizeof(err));
     heap_caps_free(wasm);
-    wasm = NULL;
     t_load = esp_timer_get_time();
     if (!app->module) {
         cap_wasm_set_error(app, "load failed: %s", err);
     } else if (!cap_wasm_check_imports(app) || !cap_wasm_instantiate(app)) {
         cap_wasm_unload(app);
     }
-    unlink(marker);
-    if (app->state != CAP_WASM_APP_READY) {
-        goto done;
+    app->tools_frozen = false;
+    if (boot) {
+        unlink(marker);
+    }
+    if (!app->module) {
+        if (!frozen) {
+            cap_wasm_remove_tools(app);
+        }
+        goto failed;
     }
 
     app->psram_bytes = (uint32_t)(psram_before - heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     app->load_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
-    ESP_LOGI(TAG, "[%s] v%s loaded: %" PRIu32 " B wasm, %u tools, mem cap %" PRIu32 " KB, "
-             "load %" PRId64 " ms + init %" PRId64 " ms, psram -%" PRIu32 " B (free %u), internal -%d B",
-             app->name, app->mf.version, app->wasm_size,
-             (unsigned)cap_wasm_app_tool_count(app),
-             app->mf.memory_kb, (t_load - t0) / 1000, (esp_timer_get_time() - t_load) / 1000,
-             app->psram_bytes, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+    app->last_used_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "[%s] v%s loaded%s in %" PRIu32 " ms (load %" PRId64 " ms, init %" PRId64 " ms): %" PRIu32
+             " B wasm, %u tools, mem cap %" PRIu32 " KB, psram -%" PRIu32 " B (free %u), internal -%d B",
+             app->name, app->mf.version, frozen ? " on demand" : "", app->load_ms, (t_load - t0) / 1000,
+             (esp_timer_get_time() - t_load) / 1000, app->wasm_size, (unsigned)cap_wasm_app_tool_count(app),
+             app->mf.memory_kb, app->psram_bytes, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (int)(internal_before - heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
-    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < CAP_WASM_PSRAM_RESERVE) {
-        cap_wasm_set_error(app, "unloaded: PSRAM free dropped below %d KB", CAP_WASM_PSRAM_RESERVE / 1024);
-        cap_wasm_unload(app);
-        app->state = CAP_WASM_APP_FAILED;
+    if (!frozen) {
+        cap_wasm_tools_to_cache(app);
     }
+    return true;
 
-done:
-    heap_caps_free(manifest);
+failed:
+    if (frozen && app->state != CAP_WASM_APP_UNSIGNED) {
+        app->state = CAP_WASM_APP_UNLOADED;
+    }
+    return false;
+}
+
+/* Registers an enabled app's tools (from tools.json, else by loading it once) and leaves it unloaded. */
+static void cap_wasm_probe(cap_wasm_app_t *app, bool boot)
+{
+    char marker[128];
+    char *wasm;
+    size_t size = 0;
+
+    if (!app->enabled) {
+        app->state = CAP_WASM_APP_DISABLED;
+        snprintf(app->last_error, sizeof(app->last_error), "disabled; /apps enable %s turns it on", app->name);
+        return;
+    }
+    cap_wasm_app_path(app, ".loading", marker, sizeof(marker));
+    if (boot && access(marker, F_OK) == 0) {
+        app->state = CAP_WASM_APP_FAILED;
+        cap_wasm_set_error(app, "did not finish loading on a previous boot; /apps reload %s retries", app->name);
+        return;
+    }
+    wasm = cap_wasm_read_verified(app, &size);
+    if (!wasm) {
+        return;
+    }
     heap_caps_free(wasm);
+    if (cap_wasm_tools_from_cache(app)) {
+        app->state = CAP_WASM_APP_UNLOADED;
+    } else if (cap_wasm_load(app, false, boot)) {
+        cap_wasm_unload(app);
+    }
+}
+
+/* Loads an unloaded app for a call or apps_load. */
+static bool cap_wasm_ensure_loaded(cap_wasm_app_t *app)
+{
+    return app->module || (app->state == CAP_WASM_APP_UNLOADED && cap_wasm_load(app, true, false));
 }
 
 static const char *cap_wasm_state_name(cap_wasm_app_state_t state)
 {
     switch (state) {
-    case CAP_WASM_APP_READY:
-        return "ready";
-    case CAP_WASM_APP_IDLE:
-        return "idle";
+    case CAP_WASM_APP_LOADED:
+        return "loaded";
+    case CAP_WASM_APP_UNLOADED:
+        return "unloaded";
     case CAP_WASM_APP_DISABLED:
         return "disabled";
+    case CAP_WASM_APP_UNSIGNED:
+        return "unsigned";
     default:
         return "failed";
+    }
+}
+
+static void cap_wasm_refresh_task(void *arg)
+{
+    char out[160];
+
+    cap_wasm_admin(CAP_WASM_REQ_RELOAD, arg, NULL, out, sizeof(out));
+    ESP_LOGI(TAG, "tool refresh: %s", out);
+    free(arg);
+    vTaskDeleteWithCaps(NULL);
+}
+
+/* A frozen app_init registered other tools: reload it non-frozen once the current call is done
+ * (re-registering the group drains it, which cannot happen from inside one of its calls). */
+static void cap_wasm_schedule_refresh(cap_wasm_app_t *app)
+{
+    char *name = strdup(app->name);
+
+    app->tools_changed = false;
+    if (!name || xTaskCreateWithCaps(cap_wasm_refresh_task, "wasm_refresh", 6144, name, 5, NULL,
+                                     CAP_WASM_PSRAM_CAPS) != pdPASS) {
+        free(name);
+        ESP_LOGW(TAG, "[%s] cannot schedule the tool refresh; /apps reload %s does it", app->name, app->name);
     }
 }
 
@@ -552,7 +841,7 @@ static void cap_wasm_do_call(cap_wasm_req_t *req)
     int32_t rc = 0;
 
     req->err = ESP_FAIL;
-    if (app->state == CAP_WASM_APP_DISABLED || app->state == CAP_WASM_APP_FAILED) {
+    if (!cap_wasm_ensure_loaded(app)) {
         snprintf(req->output, req->output_size, "Error: WASM app '%s' is %s: %s", app->name,
                  cap_wasm_state_name(app->state), app->last_error[0] ? app->last_error : "see /apps");
         req->err = ESP_ERR_INVALID_STATE;
@@ -594,6 +883,7 @@ static void cap_wasm_do_call(cap_wasm_req_t *req)
     terminated = cap_wasm_budget_end();
     heap_caps_free(call->resp);
     *call = (cap_wasm_call_t) {0};
+    app->last_used_us = esp_timer_get_time();
 
     if (!ok) {
         if (terminated) {
@@ -610,7 +900,6 @@ static void cap_wasm_do_call(cap_wasm_req_t *req)
         /* Finished just as the budget ran out: the result stands, but the instance carries a
          * pending terminate flag and must be recreated. */
         cap_wasm_teardown(app);
-        app->state = CAP_WASM_APP_IDLE;
     }
     app->failures = 0;
     if (rc != 0) {
@@ -622,37 +911,55 @@ static void cap_wasm_do_call(cap_wasm_req_t *req)
     } else {
         req->err = ESP_OK;
     }
-    return;
+    goto done;
 
 failure:
     cap_wasm_teardown(app);
-    app->state = CAP_WASM_APP_IDLE;
     if (++app->failures >= CAP_WASM_MAX_FAILURES) {
+        cap_wasm_unload(app);
         app->state = CAP_WASM_APP_DISABLED;
         ESP_LOGE(TAG, "[%s] disabled after %d consecutive failures (last: %s); /apps reload %s re-enables it",
                  app->name, CAP_WASM_MAX_FAILURES, app->last_error, app->name);
     } else {
         ESP_LOGW(TAG, "[%s] failure %u/%d: %s", app->name, app->failures, CAP_WASM_MAX_FAILURES, app->last_error);
     }
+
+done:
+    if (app->tools_changed) {
+        cap_wasm_schedule_refresh(app);
+    }
+}
+
+/* Unloads apps without calls for CAP_WASM_IDLE_MS. */
+static void cap_wasm_idle_sweep(void)
+{
+    int64_t now = esp_timer_get_time();
+
+    for (size_t i = 0; i < s_app_count; i++) {
+        if (s_apps[i].module && now - s_apps[i].last_used_us > (int64_t)CAP_WASM_IDLE_MS * 1000) {
+            ESP_LOGI(TAG, "[%s] unloaded after %d min without calls", s_apps[i].name, CAP_WASM_IDLE_MS / 60000);
+            cap_wasm_unload(&s_apps[i]);
+        }
+    }
 }
 
 static void cap_wasm_render_status(char *out, size_t size, bool json)
 {
     cJSON *list = json ? cJSON_CreateArray() : NULL;
+    int64_t now = esp_timer_get_time();
     size_t len = 0;
     char *rendered;
 
     out[0] = '\0';
-    if (!json && s_app_count == 0) {
-        snprintf(out, size, "No WASM apps. Upload to %s/<name>/{manifest.json,app.wasm}, then /apps reload <name>.",
-                 s_apps_dir);
-        return;
-    }
     for (size_t i = 0; i < s_app_count; i++) {
         cap_wasm_app_t *app = &s_apps[i];
         wasm_memory_inst_t mem = app->inst ? wasm_runtime_get_default_memory(app->inst) : NULL;
         uint32_t mem_kb = mem ? (uint32_t)(wasm_memory_get_cur_page_count(mem) * 64) : 0;
+        int64_t idle_s = app->last_used_us ? (now - app->last_used_us) / 1000000 : -1;
 
+        if (!app->name[0]) {
+            continue;
+        }
         if (json) {
             cJSON *item = cJSON_CreateObject();
             cJSON *tools = cJSON_AddArrayToObject(item, "tools");
@@ -660,28 +967,46 @@ static void cap_wasm_render_status(char *out, size_t size, bool json)
             cJSON_AddStringToObject(item, "name", app->name);
             cJSON_AddStringToObject(item, "version", app->mf.version);
             cJSON_AddStringToObject(item, "state", cap_wasm_state_name(app->state));
+            cJSON_AddBoolToObject(item, "enabled", app->enabled);
+            cJSON_AddBoolToObject(item, "loaded", app->module != NULL);
+            cJSON_AddStringToObject(item, "key_id", app->key_id);
             cJSON_AddStringToObject(item, "description", app->mf.description);
             for (size_t t = 0; t < s_tool_count; t++) {
                 if (s_tools[t].app == app) {
                     cJSON_AddItemToArray(tools, cJSON_CreateString(s_tools[t].name));
                 }
             }
-            cJSON_AddNumberToObject(item, "memory_kb", mem_kb);
+            if (app->module) {
+                cJSON_AddNumberToObject(item, "psram_bytes", app->psram_bytes);
+                cJSON_AddNumberToObject(item, "memory_kb", mem_kb);
+            }
             cJSON_AddNumberToObject(item, "memory_cap_kb", app->mf.memory_kb);
-            cJSON_AddNumberToObject(item, "psram_kb", app->psram_bytes / 1024);
             cJSON_AddNumberToObject(item, "calls", app->calls);
+            if (idle_s >= 0) {
+                cJSON_AddNumberToObject(item, "last_used_s_ago", (double)idle_s);
+            }
             cJSON_AddNumberToObject(item, "failures", app->failures);
+            if (app->installed_at) {
+                cJSON_AddNumberToObject(item, "installed_at", app->installed_at);
+            }
             if (app->last_error[0]) {
                 cJSON_AddStringToObject(item, "last_error", app->last_error);
             }
             cJSON_AddItemToArray(list, item);
             continue;
         }
-        len += snprintf(out + len, len < size ? size - len : 0,
-                        "%s`%s` %s — %s, mem %" PRIu32 "/%" PRIu32 " KB, psram %" PRIu32 " KB, calls %" PRIu32 "\n",
-                        i ? "\n" : "", app->name, app->mf.version[0] ? app->mf.version : "?",
-                        cap_wasm_state_name(app->state), mem_kb, app->mf.memory_kb,
-                        app->psram_bytes / 1024, app->calls);
+        len += snprintf(out + len, len < size ? size - len : 0, "%s`%s` %s — %s", len ? "\n" : "", app->name,
+                        app->mf.version[0] ? app->mf.version : "?", cap_wasm_state_name(app->state));
+        if (app->module) {
+            len += snprintf(out + len, len < size ? size - len : 0, ", psram %" PRIu32 " KB, mem %" PRIu32 "/%" PRIu32 " KB",
+                            app->psram_bytes / 1024, mem_kb, app->mf.memory_kb);
+        }
+        len += snprintf(out + len, len < size ? size - len : 0, ", key %s, calls %" PRIu32,
+                        app->key_id[0] ? app->key_id : "none", app->calls);
+        if (idle_s >= 0) {
+            len += snprintf(out + len, len < size ? size - len : 0, ", last used %" PRId64 " s ago", idle_s);
+        }
+        len += snprintf(out + len, len < size ? size - len : 0, "\n");
         for (size_t t = 0; t < s_tool_count; t++) {
             if (s_tools[t].app == app) {
                 len += snprintf(out + len, len < size ? size - len : 0, "  tool `%s`\n", s_tools[t].name);
@@ -696,13 +1021,15 @@ static void cap_wasm_render_status(char *out, size_t size, bool json)
         snprintf(out, size, "%s", rendered ? rendered : "Error: out of memory");
         free(rendered);
         cJSON_Delete(list);
+    } else if (!len) {
+        snprintf(out, size, "No WASM apps. /app install <https-url> installs a signed .ecapp package.");
     }
 }
 
 static cap_wasm_app_t *cap_wasm_find_app(const char *name)
 {
     for (size_t i = 0; i < s_app_count; i++) {
-        if (strcmp(s_apps[i].name, name) == 0) {
+        if (s_apps[i].name[0] && strcmp(s_apps[i].name, name) == 0) {
             return &s_apps[i];
         }
     }
@@ -712,41 +1039,189 @@ static cap_wasm_app_t *cap_wasm_find_app(const char *name)
 /* Adds a slot for a directory name; NULL when invalid or full. */
 static cap_wasm_app_t *cap_wasm_add_app(const char *name)
 {
-    cap_wasm_app_t *app;
+    cap_wasm_app_t *app = NULL;
 
     if (!cap_wasm_name_valid(name, strlen(name), CAP_WASM_APP_NAME_MAX)) {
         ESP_LOGW(TAG, "ignoring %s/%s: app names are 1-%d chars of [a-z0-9_] starting with a letter",
-                 s_apps_dir, name, CAP_WASM_APP_NAME_MAX);
+                 g_cap_wasm_apps_dir, name, CAP_WASM_APP_NAME_MAX);
         return NULL;
     }
-    if (s_app_count >= CAP_WASM_MAX_APPS) {
-        ESP_LOGW(TAG, "ignoring %s/%s: at most %d apps", s_apps_dir, name, CAP_WASM_MAX_APPS);
+    for (size_t i = 0; i < s_app_count && !app; i++) {
+        app = s_apps[i].name[0] ? NULL : &s_apps[i];
+    }
+    if (!app && s_app_count >= CAP_WASM_MAX_APPS) {
+        ESP_LOGW(TAG, "ignoring %s/%s: at most %d apps", g_cap_wasm_apps_dir, name, CAP_WASM_MAX_APPS);
         return NULL;
     }
-    app = &s_apps[s_app_count++];
+    app = app ? app : &s_apps[s_app_count++];
     memset(app, 0, sizeof(*app));
     strlcpy(app->name, name, sizeof(app->name));
+    app->enabled = true;
     return app;
+}
+
+/* ---------- index.json: installed apps and whether they are enabled ---------- */
+
+static void cap_wasm_index_save(void)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *list = cJSON_AddArrayToObject(root, "apps");
+    char path[96];
+    char *json;
+
+    for (size_t i = 0; i < s_app_count; i++) {
+        cap_wasm_app_t *app = &s_apps[i];
+        cJSON *item;
+
+        if (!app->name[0]) {
+            continue;
+        }
+        item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "name", app->name);
+        cJSON_AddStringToObject(item, "version", app->mf.version);
+        cJSON_AddStringToObject(item, "key_id", app->key_id);
+        cJSON_AddStringToObject(item, "state", app->enabled ? "enabled" : "disabled");
+        cJSON_AddNumberToObject(item, "installed_at", app->installed_at);
+        cJSON_AddStringToObject(item, "source", app->source_url);
+        cJSON_AddItemToArray(list, item);
+    }
+    json = cJSON_Print(root);
+    snprintf(path, sizeof(path), "%s/index.json", g_cap_wasm_apps_dir);
+    if (!json || !cap_wasm_write_file_atomic(path, json)) {
+        ESP_LOGE(TAG, "cannot write %s", path);
+    }
+    free(json);
+    cJSON_Delete(root);
+}
+
+static void cap_wasm_index_load(void)
+{
+    char path[96];
+    size_t size = 0;
+    char *json;
+    cJSON *root;
+    const cJSON *item = NULL;
+
+    snprintf(path, sizeof(path), "%s/index.json", g_cap_wasm_apps_dir);
+    json = cap_wasm_read_file(path, 16 * 1024, &size);
+    root = json ? cJSON_Parse(json) : NULL;
+    heap_caps_free(json);
+    cJSON_ArrayForEach(item, cJSON_GetObjectItem(root, "apps")) {
+        const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(item, "name"));
+        const char *state = cJSON_GetStringValue(cJSON_GetObjectItem(item, "state"));
+        const char *source = cJSON_GetStringValue(cJSON_GetObjectItem(item, "source"));
+        cap_wasm_app_t *app = name ? cap_wasm_find_app(name) : NULL;
+
+        if (app) {
+            app->enabled = !state || strcmp(state, "disabled") != 0;
+            app->installed_at = (uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItem(item, "installed_at"));
+            strlcpy(app->source_url, source ? source : "", sizeof(app->source_url));
+        }
+    }
+    cJSON_Delete(root);
+}
+
+/* An install interrupted between moving the old version aside and loading the new one leaves
+ * <name>.old/: put it back. Leftover <name>.new/ directories are partial downloads. */
+static void cap_wasm_recover_installs(void)
+{
+    char names[CAP_WASM_MAX_APPS * 2][CAP_WASM_APP_NAME_MAX + 5];
+    size_t count = 0;
+    DIR *dir = opendir(g_cap_wasm_apps_dir);
+    struct dirent *ent;
+    char path[96];
+    char base[96];
+
+    while (dir && (ent = readdir(dir)) != NULL && count < sizeof(names) / sizeof(names[0])) {
+        size_t len = strlen(ent->d_name);
+
+        if (len > 4 && len < sizeof(names[0]) &&
+                (strcmp(ent->d_name + len - 4, ".new") == 0 || strcmp(ent->d_name + len - 4, ".old") == 0)) {
+            strcpy(names[count++], ent->d_name);
+        }
+    }
+    if (dir) {
+        closedir(dir);
+    }
+    for (size_t i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/%s", g_cap_wasm_apps_dir, names[i]);
+        snprintf(base, sizeof(base), "%s/%.*s", g_cap_wasm_apps_dir, (int)strlen(names[i]) - 4, names[i]);
+        if (strcmp(names[i] + strlen(names[i]) - 4, ".new") == 0) {
+            cap_wasm_rmdir(path);
+        } else if (cap_wasm_rmdir(base) && rename(path, base) == 0) {
+            ESP_LOGW(TAG, "rolled back the interrupted install of %s", base);
+        }
+    }
 }
 
 static void cap_wasm_do_boot(void)
 {
-    DIR *dir = opendir(s_apps_dir);
+    DIR *dir;
     struct dirent *ent;
 
+    if (g_cap_wasm_trusted_count == 0 && !s_allow_unsigned) {
+        ESP_LOGW(TAG, "app_trusted_keys is empty: no WASM app can load");
+    }
+    cap_wasm_recover_installs();
+    dir = opendir(g_cap_wasm_apps_dir);
     if (!dir) {
-        ESP_LOGI(TAG, "no %s directory, no WASM apps", s_apps_dir);
+        ESP_LOGI(TAG, "no %s directory, no WASM apps", g_cap_wasm_apps_dir);
         return;
     }
     while ((ent = readdir(dir)) != NULL) {
-        cap_wasm_app_t *app;
-
-        if (ent->d_name[0] == '.' || ent->d_type != DT_DIR || !(app = cap_wasm_add_app(ent->d_name))) {
-            continue;
+        if (ent->d_name[0] != '.' && ent->d_type == DT_DIR) {
+            cap_wasm_add_app(ent->d_name);
         }
-        cap_wasm_load(app, true);
     }
     closedir(dir);
+    cap_wasm_index_load();
+    for (size_t i = 0; i < s_app_count; i++) {
+        cap_wasm_probe(&s_apps[i], true);
+    }
+}
+
+/* Moves <name>.new/ into place and loads it; the previous version is restored if that fails. */
+static bool cap_wasm_do_install(cap_wasm_app_t *app, const char *source, char *out, size_t size)
+{
+    char dir[96];
+    char new_dir[sizeof(dir) + 4];
+    char old_dir[sizeof(dir) + 4];
+    bool was_enabled = app->enabled;
+    bool had_old;
+
+    snprintf(dir, sizeof(dir), "%s/%s", g_cap_wasm_apps_dir, app->name);
+    snprintf(new_dir, sizeof(new_dir), "%s.new", dir);
+    snprintf(old_dir, sizeof(old_dir), "%s.old", dir);
+    cap_wasm_rmdir(old_dir);
+    had_old = access(dir, F_OK) == 0;
+    if ((had_old && rename(dir, old_dir) != 0) || rename(new_dir, dir) != 0) {
+        if (had_old) {
+            rename(old_dir, dir);
+        }
+        snprintf(out, size, "Install failed: cannot move %s into place.", new_dir);
+        return false;
+    }
+    app->enabled = true;
+    if (cap_wasm_load(app, false, false)) {
+        cap_wasm_rmdir(old_dir);
+        app->installed_at = (uint32_t)time(NULL);
+        strlcpy(app->source_url, source && strlen(source) < sizeof(app->source_url) ? source : "",
+                sizeof(app->source_url));
+        snprintf(out, size, "Installed `%s` %s: %u tools.", app->name, app->mf.version,
+                 (unsigned)cap_wasm_app_tool_count(app));
+        return true;
+    }
+    snprintf(out, size, "Install of `%s` failed: %s", app->name, app->last_error);
+    cap_wasm_rmdir(dir);
+    if (had_old && rename(old_dir, dir) == 0) {
+        app->enabled = was_enabled;
+        cap_wasm_probe(app, false);
+        snprintf(out + strlen(out), size - strlen(out), "\nKept the previous version (%s).",
+                 cap_wasm_state_name(app->state));
+    } else if (!had_old) {
+        memset(app, 0, sizeof(*app));
+    }
+    return false;
 }
 
 static void cap_wasm_do_admin(cap_wasm_req_t *req)
@@ -754,10 +1229,13 @@ static void cap_wasm_do_admin(cap_wasm_req_t *req)
     cap_wasm_app_t *app = cap_wasm_find_app(req->arg);
     char path[96];
     struct stat st;
+    nvs_handle_t nvs;
 
     req->err = ESP_OK;
-    if (req->type == CAP_WASM_REQ_RELOAD && !app) {
-        snprintf(path, sizeof(path), "%s/%s", s_apps_dir, req->arg);
+    snprintf(path, sizeof(path), "%s/%s%s", g_cap_wasm_apps_dir, req->arg,
+             req->type == CAP_WASM_REQ_INSTALL ? ".new" : "");
+    if (!app && (req->type == CAP_WASM_REQ_RELOAD || req->type == CAP_WASM_REQ_ENABLE ||
+                 req->type == CAP_WASM_REQ_INSTALL)) {
         app = stat(path, &st) == 0 && S_ISDIR(st.st_mode) ? cap_wasm_add_app(req->arg) : NULL;
     }
     if (!app) {
@@ -765,19 +1243,87 @@ static void cap_wasm_do_admin(cap_wasm_req_t *req)
         req->err = ESP_ERR_NOT_FOUND;
         return;
     }
-    cap_wasm_unload(app);
-    if (req->type == CAP_WASM_REQ_DISABLE) {
+
+    switch (req->type) {
+    case CAP_WASM_REQ_LOAD:
+        if (!cap_wasm_ensure_loaded(app)) {
+            snprintf(req->output, req->output_size, "Cannot load `%s` (%s): %s", app->name,
+                     cap_wasm_state_name(app->state), app->last_error);
+            req->err = ESP_FAIL;
+        } else {
+            app->last_used_us = esp_timer_get_time();
+            snprintf(req->output, req->output_size, "`%s` is loaded (psram %" PRIu32 " KB, load %" PRIu32 " ms).",
+                     app->name, app->psram_bytes / 1024, app->load_ms);
+        }
+        if (app->tools_changed) {
+            cap_wasm_schedule_refresh(app);
+        }
+        return;
+    case CAP_WASM_REQ_UNLOAD:
+        snprintf(req->output, req->output_size, "`%s` %s.", app->name, app->module ? "unloaded" : "was not loaded");
+        cap_wasm_unload(app);
+        return;
+    case CAP_WASM_REQ_DISABLE:
+        cap_wasm_unload(app);
+        cap_wasm_remove_tools(app);
+        app->enabled = false;
         app->state = CAP_WASM_APP_DISABLED;
-        snprintf(app->last_error, sizeof(app->last_error), "disabled by /apps disable");
-        snprintf(req->output, req->output_size, "Disabled `%s` until /apps reload %s or reboot.", app->name, app->name);
+        snprintf(app->last_error, sizeof(app->last_error), "disabled; /apps enable %s turns it on", app->name);
+        cap_wasm_index_save();
+        snprintf(req->output, req->output_size, "Disabled `%s` (persists across reboots).", app->name);
+        return;
+    case CAP_WASM_REQ_REMOVE:
+        cap_wasm_unload(app);
+        cap_wasm_remove_tools(app);
+        snprintf(path, sizeof(path), "%s/%s", g_cap_wasm_apps_dir, app->name);
+        if (!cap_wasm_rmdir(path)) {
+            snprintf(req->output, req->output_size, "Could not delete %s completely.", path);
+            req->err = ESP_FAIL;
+        } else {
+            snprintf(req->output, req->output_size, "Removed `%s`.", app->name);
+        }
+        cap_wasm_nvs_namespace(app->name, app->nvs_ns);
+        if (nvs_open(app->nvs_ns, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_erase_all(nvs);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        memset(app, 0, sizeof(*app));
+        cap_wasm_index_save();
+        return;
+    case CAP_WASM_REQ_INSTALL:
+        cap_wasm_unload(app);
+        cap_wasm_remove_tools(app);
+        if (!cap_wasm_do_install(app, req->extra, req->output, req->output_size)) {
+            req->err = ESP_FAIL;
+        }
+        cap_wasm_index_save();
+        return;
+    default: /* RELOAD, ENABLE */
+        break;
+    }
+
+    if (req->type == CAP_WASM_REQ_RELOAD && !app->enabled) {
+        snprintf(req->output, req->output_size, "`%s` is disabled; /apps enable %s turns it on.", app->name, app->name);
+        req->err = ESP_ERR_INVALID_STATE;
         return;
     }
-    cap_wasm_load(app, false);
-    if (app->state == CAP_WASM_APP_READY) {
-        snprintf(req->output, req->output_size, "Reloaded `%s` %s: %u tools.", app->name, app->mf.version,
+    cap_wasm_unload(app);
+    cap_wasm_remove_tools(app);
+    if (req->type == CAP_WASM_REQ_ENABLE) {
+        app->enabled = true;
+        cap_wasm_probe(app, false);
+        cap_wasm_index_save();
+    } else {
+        cap_wasm_load(app, false, false);
+    }
+    if (app->state == CAP_WASM_APP_LOADED || app->state == CAP_WASM_APP_UNLOADED) {
+        snprintf(req->output, req->output_size, "%s `%s` %s: %u tools.",
+                 req->type == CAP_WASM_REQ_ENABLE ? "Enabled" : "Reloaded", app->name, app->mf.version,
                  (unsigned)cap_wasm_app_tool_count(app));
     } else {
-        snprintf(req->output, req->output_size, "Failed to load `%s`: %s", app->name, app->last_error);
+        snprintf(req->output, req->output_size, "`%s` is %s: %s", app->name, cap_wasm_state_name(app->state),
+                 app->last_error);
         req->err = ESP_FAIL;
     }
 }
@@ -809,7 +1355,11 @@ static void *cap_wasm_task(void *arg)
     if (!s_runtime_ok) {
         ESP_LOGE(TAG, "wasm_runtime_full_init failed, WASM apps are unavailable");
     }
-    while (xQueueReceive(s_req_queue, &req, portMAX_DELAY) == pdTRUE) {
+    while (true) {
+        if (xQueueReceive(s_req_queue, &req, pdMS_TO_TICKS(CAP_WASM_SWEEP_MS)) != pdTRUE) {
+            cap_wasm_idle_sweep();
+            continue;
+        }
         if (!s_runtime_ok) {
             snprintf(req->output, req->output_size, "Error: WASM runtime failed to start");
             req->err = ESP_ERR_INVALID_STATE;
@@ -824,6 +1374,7 @@ static void *cap_wasm_task(void *arg)
             cap_wasm_do_admin(req);
         }
         xSemaphoreGive(s_done);
+        cap_wasm_idle_sweep();
     }
     return NULL;
 }
@@ -880,36 +1431,14 @@ CAP_WASM_SLOTS(CAP_WASM_SLOT_FN)
 static const claw_cap_execute_fn s_slot_fns[] = { CAP_WASM_SLOTS(CAP_WASM_SLOT_REF) };
 _Static_assert(sizeof(s_slot_fns) / sizeof(s_slot_fns[0]) == CAP_WASM_MAX_TOOLS, "one trampoline per tool slot");
 
-static esp_err_t cap_wasm_status_execute(const char *input_json, const claw_cap_call_context_t *ctx,
-                                         char *output, size_t output_size)
-{
-    cap_wasm_req_t req = {
-        .type = CAP_WASM_REQ_STATUS,
-        .arg = "json",
-        .output = output,
-        .output_size = output_size,
-    };
-
-    (void)input_json;
-    (void)ctx;
-    return cap_wasm_submit(&req, pdMS_TO_TICKS(CAP_WASM_STATUS_WAIT_MS));
-}
-
-/* (Re-)registers the cap_wasm_apps group with apps_status and the current tools. */
+/* (Re-)registers the cap_wasm_apps group with the current tools (a group cannot be empty). */
 static void cap_wasm_publish_tools(void)
 {
-    s_descriptors[0] = (claw_cap_descriptor_t) {
-        .id = "apps_status",
-        .name = "apps_status",
-        .family = "wasm_app",
-        .description = "List installed WASM apps with version, state, tools, memory use and last error.",
-        .kind = CLAW_CAP_KIND_CALLABLE,
-        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
-        .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
-        .execute = cap_wasm_status_execute,
-    };
+    if (s_tool_count == 0) {
+        return;
+    }
     for (size_t i = 0; i < s_tool_count; i++) {
-        s_descriptors[1 + i] = (claw_cap_descriptor_t) {
+        s_descriptors[i] = (claw_cap_descriptor_t) {
             .id = s_tools[i].name,
             .name = s_tools[i].name,
             .family = "wasm_app",
@@ -925,24 +1454,34 @@ static void cap_wasm_publish_tools(void)
         .plugin_name = "cap_wasm_apps",
         .version = "1",
         .descriptors = s_descriptors,
-        .descriptor_count = 1 + s_tool_count,
+        .descriptor_count = s_tool_count,
     };
     if (claw_cap_register_group(&s_group) != ESP_OK) {
         ESP_LOGE(TAG, "failed to register the %s group", CAP_WASM_GROUP);
     }
 }
 
-/* /apps reload|disable <name>: the tool set may change, so the group is drained and re-registered. */
-static esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, char *output, size_t output_size)
+esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char *extra,
+                         char *output, size_t output_size)
 {
     cap_wasm_req_t req = {
         .type = type,
         .arg = name,
+        .extra = extra,
         .output = output,
         .output_size = output_size,
     };
-    esp_err_t err = claw_cap_unregister_group(CAP_WASM_GROUP, CAP_WASM_DRAIN_MS);
+    esp_err_t err;
 
+    if (!cap_wasm_name_valid(name, strlen(name), CAP_WASM_APP_NAME_MAX)) {
+        snprintf(output, output_size, "Invalid app name '%.32s'.", name);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (type < CAP_WASM_REQ_RELOAD) {
+        return cap_wasm_submit(&req, pdMS_TO_TICKS(CAP_WASM_DRAIN_MS));
+    }
+    /* The tool set may change, so the group is drained and re-registered. */
+    err = claw_cap_unregister_group(CAP_WASM_GROUP, CAP_WASM_DRAIN_MS);
     if (err == ESP_ERR_TIMEOUT) {
         claw_cap_enable_group(CAP_WASM_GROUP);
         snprintf(output, output_size, "A WASM app call is still running, try again.");
@@ -953,50 +1492,241 @@ static esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, char
     return err;
 }
 
+const char *cap_wasm_confirm_chat(const claw_cap_call_context_t *ctx)
+{
+    /* Agent calls and /app commands from an allowed Telegram chat, like http_request mutations. */
+    if (!ctx || (ctx->caller != CLAW_CAP_CALLER_AGENT && ctx->caller != CLAW_CAP_CALLER_SYSTEM) ||
+            !ctx->channel || strcmp(ctx->channel, "telegram") != 0 || !ctx->source_cap ||
+            strcmp(ctx->source_cap, "tg_gateway") != 0 || !ctx->chat_id || !ctx->chat_id[0]) {
+        return NULL;
+    }
+    return ctx->chat_id;
+}
+
+/* ---------- Management tools and /apps ---------- */
+
+static esp_err_t cap_wasm_status(bool json, char *output, size_t output_size)
+{
+    cap_wasm_req_t req = {
+        .type = CAP_WASM_REQ_STATUS,
+        .arg = json ? "json" : NULL,
+        .output = output,
+        .output_size = output_size,
+    };
+
+    return cap_wasm_submit(&req, pdMS_TO_TICKS(CAP_WASM_STATUS_WAIT_MS));
+}
+
+/* Parses the tool input and returns its string field `key` (copied into `out`). */
+static bool cap_wasm_input_str(const char *input_json, const char *key, char *out, size_t size)
+{
+    cJSON *input = cJSON_Parse(input_json);
+    const char *value = cJSON_GetStringValue(cJSON_GetObjectItem(input, key));
+    bool ok = value && strlen(value) < size;
+
+    if (ok) {
+        strcpy(out, value);
+    }
+    cJSON_Delete(input);
+    return ok;
+}
+
+static esp_err_t cap_wasm_status_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                         char *output, size_t output_size)
+{
+    (void)input_json;
+    (void)ctx;
+    return cap_wasm_status(true, output, output_size);
+}
+
+static esp_err_t cap_wasm_name_tool(cap_wasm_req_type_t type, const char *input_json, char *output, size_t output_size)
+{
+    char name[CAP_WASM_APP_NAME_MAX + 1];
+
+    if (!cap_wasm_input_str(input_json, "name", name, sizeof(name))) {
+        snprintf(output, output_size, "Error: name (an installed app) is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cap_wasm_admin(type, name, NULL, output, output_size);
+}
+
+static esp_err_t cap_wasm_load_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                       char *output, size_t output_size)
+{
+    (void)ctx;
+    return cap_wasm_name_tool(CAP_WASM_REQ_LOAD, input_json, output, output_size);
+}
+
+static esp_err_t cap_wasm_unload_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                         char *output, size_t output_size)
+{
+    (void)ctx;
+    return cap_wasm_name_tool(CAP_WASM_REQ_UNLOAD, input_json, output, output_size);
+}
+
+static esp_err_t cap_wasm_set_enabled_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                              char *output, size_t output_size)
+{
+    cJSON *input = cJSON_Parse(input_json);
+    bool enabled = cJSON_IsTrue(cJSON_GetObjectItem(input, "enabled"));
+    bool valid = cJSON_IsBool(cJSON_GetObjectItem(input, "enabled"));
+
+    (void)ctx;
+    cJSON_Delete(input);
+    if (!valid) {
+        snprintf(output, output_size, "Error: enabled (boolean) is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cap_wasm_name_tool(enabled ? CAP_WASM_REQ_ENABLE : CAP_WASM_REQ_DISABLE, input_json, output, output_size);
+}
+
+static esp_err_t cap_wasm_install_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                          char *output, size_t output_size)
+{
+    char url[256];
+
+    if (!cap_wasm_input_str(input_json, "url", url, sizeof(url))) {
+        snprintf(output, output_size, "Error: url (https, at most 255 chars) is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cap_wasm_install(url, NULL, false, ctx, output, output_size);
+}
+
+static esp_err_t cap_wasm_remove_execute(const char *input_json, const claw_cap_call_context_t *ctx,
+                                         char *output, size_t output_size)
+{
+    char name[CAP_WASM_APP_NAME_MAX + 1];
+
+    if (!cap_wasm_input_str(input_json, "name", name, sizeof(name))) {
+        snprintf(output, output_size, "Error: name (an installed app) is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    return cap_wasm_remove(name, ctx, output, output_size);
+}
+
 static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap_call_context_t *ctx,
                                           char *output, size_t output_size)
 {
-    cJSON *input = cJSON_Parse(input_json);
-    const char *command = cJSON_GetStringValue(cJSON_GetObjectItem(input, "command"));
+    static const struct {
+        const char *verb;
+        cap_wasm_req_type_t type;
+    } verbs[] = {
+        {"reload", CAP_WASM_REQ_RELOAD},
+        {"enable", CAP_WASM_REQ_ENABLE},
+        {"disable", CAP_WASM_REQ_DISABLE},
+        {"load", CAP_WASM_REQ_LOAD},
+        {"unload", CAP_WASM_REQ_UNLOAD},
+    };
+    char command[320] = "";
     char verb[16] = "";
     char name[CAP_WASM_APP_NAME_MAX + 2] = "";
     esp_err_t err = ESP_OK;
 
-    (void)ctx;
-    if (command) {
-        sscanf(command, "%15s %25s", verb, name);
-    }
+    cap_wasm_input_str(input_json, "command", command, sizeof(command));
+    sscanf(command, "%15s %25s", verb, name);
     if (!verb[0] || strcmp(verb, "list") == 0) {
-        cap_wasm_req_t req = {
-            .type = CAP_WASM_REQ_STATUS,
-            .output = output,
-            .output_size = output_size,
-        };
-
-        err = cap_wasm_submit(&req, pdMS_TO_TICKS(CAP_WASM_STATUS_WAIT_MS));
-    } else if (name[0] && strlen(name) <= CAP_WASM_APP_NAME_MAX &&
-               (strcmp(verb, "reload") == 0 || strcmp(verb, "disable") == 0)) {
-        err = cap_wasm_admin(verb[0] == 'r' ? CAP_WASM_REQ_RELOAD : CAP_WASM_REQ_DISABLE, name,
-                             output, output_size);
-    } else {
-        snprintf(output, output_size,
-                 "Usage:\n/apps  List WASM apps\n/apps reload <name>  (Re)load an app from %s/<name>/\n"
-                 "/apps disable <name>  Unload an app until reload or reboot", s_apps_dir);
+        return cap_wasm_status(false, output, output_size);
     }
-    cJSON_Delete(input);
+    if (strcmp(verb, "install") == 0 || strcmp(verb, "update") == 0 || strcmp(verb, "remove") == 0) {
+        /* Confirmation is answered through the Telegram poll task this handler runs on. */
+        const char *chat = cap_wasm_confirm_chat(ctx);
+
+        err = chat ? cap_wasm_start_job(command, chat) : ESP_ERR_NOT_SUPPORTED;
+        snprintf(output, output_size, "%s", err == ESP_OK ? "⏳ Working on it…" :
+                 chat ? "Error: cannot start the installer task" : "Error: needs a Telegram chat to confirm in");
+        return err;
+    }
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcmp(verb, verbs[i].verb) == 0 && name[0]) {
+            return cap_wasm_admin(verbs[i].type, name, NULL, output, output_size);
+        }
+    }
+    snprintf(output, output_size,
+             "Usage:\n/apps  List WASM apps\n"
+             "/app install [--force] <https-url>  Install a signed .ecapp (--force allows a downgrade)\n"
+             "/app update <name> [url]  Update from url or where it was installed from\n"
+             "/app remove <name>  Delete an app and its data\n"
+             "/apps enable|disable <name>  Turn an app on/off (persists)\n"
+             "/apps load|unload <name>  Load into / free from memory now\n"
+             "/apps reload <name>  Reload an app from %s/<name>/", g_cap_wasm_apps_dir);
     return err;
 }
+
+#define CAP_WASM_NAME_SCHEMA "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}"
 
 static const claw_cap_descriptor_t s_mgr_descriptors[] = {
     {
         .id = "apps_command",
         .name = "apps_command",
         .family = "wasm_app",
-        .description = "Handle the /apps chat command.",
+        .description = "Handle the /apps and /app chat commands.",
         .kind = CLAW_CAP_KIND_CALLABLE,
         .cap_flags = CLAW_CAP_FLAG_RESTRICTED,
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
         .execute = cap_wasm_command_execute,
+    },
+    {
+        .id = "apps_status",
+        .name = "apps_status",
+        .family = "wasm_app",
+        .description = "List installed WASM apps: version, state, enabled, loaded, PSRAM use, last use, tools, last error.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+        .execute = cap_wasm_status_execute,
+    },
+    {
+        .id = "apps_load",
+        .name = "apps_load",
+        .family = "wasm_app",
+        .description = "Load an installed WASM app into memory now (apps also load on their first tool call).",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = CAP_WASM_NAME_SCHEMA,
+        .execute = cap_wasm_load_execute,
+    },
+    {
+        .id = "apps_unload",
+        .name = "apps_unload",
+        .family = "wasm_app",
+        .description = "Free a loaded WASM app's memory; its tools stay available and reload it on demand.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = CAP_WASM_NAME_SCHEMA,
+        .execute = cap_wasm_unload_execute,
+    },
+    {
+        .id = "apps_set_enabled",
+        .name = "apps_set_enabled",
+        .family = "wasm_app",
+        .description = "Enable or disable an installed WASM app (persists across reboots; disabled apps have no tools).",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},"
+                             "\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"name\",\"enabled\"]}",
+        .execute = cap_wasm_set_enabled_execute,
+    },
+    {
+        .id = "apps_install",
+        .name = "apps_install",
+        .family = "wasm_app",
+        .description = "Install or update a signed WASM app package (.ecapp) from an https URL. The user confirms "
+                       "in Telegram; only works in a Telegram chat.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}",
+        .execute = cap_wasm_install_execute,
+    },
+    {
+        .id = "apps_remove",
+        .name = "apps_remove",
+        .family = "wasm_app",
+        .description = "Remove an installed WASM app and its stored data. The user confirms in Telegram; only works "
+                       "in a Telegram chat.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_CALLABLE_BY_LLM,
+        .input_schema_json = CAP_WASM_NAME_SCHEMA,
+        .execute = cap_wasm_remove_execute,
     },
 };
 
@@ -1035,6 +1765,28 @@ static bool cap_wasm_start_thread(void)
     return true;
 }
 
+void cap_wasm_apps_set_trust(const char *trusted_keys_json, bool allow_unsigned)
+{
+    cJSON *keys = cJSON_Parse(trusted_keys_json ? trusted_keys_json : "");
+    const cJSON *item = NULL;
+
+    s_allow_unsigned = allow_unsigned;
+    g_cap_wasm_trusted_count = 0;
+    if (trusted_keys_json && trusted_keys_json[0] && !cJSON_IsArray(keys)) {
+        ESP_LOGW(TAG, "app_trusted_keys is not a JSON array; no keys trusted");
+    }
+    cJSON_ArrayForEach(item, (cJSON_IsArray(keys) ? keys : NULL)) {
+        if (g_cap_wasm_trusted_count >= CAP_WASM_MAX_TRUSTED ||
+                !cap_wasm_key_parse(cJSON_GetStringValue(item), &g_cap_wasm_trusted[g_cap_wasm_trusted_count])) {
+            ESP_LOGW(TAG, "app_trusted_keys: skipping an entry (not a base64 32-byte key, or more than %d keys)",
+                     CAP_WASM_MAX_TRUSTED);
+            continue;
+        }
+        ESP_LOGI(TAG, "trusting app signing key %s", g_cap_wasm_trusted[g_cap_wasm_trusted_count++].key_id);
+    }
+    cJSON_Delete(keys);
+}
+
 esp_err_t cap_wasm_apps_register_group(const char *base_path)
 {
     char unused[1];
@@ -1047,12 +1799,16 @@ esp_err_t cap_wasm_apps_register_group(const char *base_path)
     if (!base_path) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (claw_cap_group_exists(CAP_WASM_GROUP)) {
+    if (claw_cap_group_exists(CAP_WASM_MGR_GROUP)) {
         return ESP_OK;
     }
-    snprintf(s_apps_dir, sizeof(s_apps_dir), "%s/apps", base_path);
+    snprintf(g_cap_wasm_apps_dir, sizeof(g_cap_wasm_apps_dir), "%s/apps", base_path);
 
-    /* Failures below are logged but never fail boot (app_claw_start would abort). */
+    /* Failures below are logged but never fail boot (app_claw_start would abort). Registering the
+     * management group first lets app tools be checked against its names. */
+    if (claw_cap_register_group(&s_mgr_group) != ESP_OK) {
+        ESP_LOGE(TAG, "failed to register the %s group", CAP_WASM_MGR_GROUP);
+    }
     s_req_queue = xQueueCreate(1, sizeof(cap_wasm_req_t *));
     s_done = xSemaphoreCreateBinary();
     s_call_lock = xSemaphoreCreateMutex();
@@ -1063,9 +1819,6 @@ esp_err_t cap_wasm_apps_register_group(const char *base_path)
         return ESP_OK;
     }
     cap_wasm_submit(&boot, portMAX_DELAY);
-    if (claw_cap_register_group(&s_mgr_group) != ESP_OK) {
-        ESP_LOGE(TAG, "failed to register the %s group", CAP_WASM_MGR_GROUP);
-    }
     cap_wasm_publish_tools();
     return ESP_OK;
 }

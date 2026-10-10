@@ -56,6 +56,8 @@ typedef struct {
     char ssh_hosts[APP_CLAW_SSH_HOSTS_LEN];
     char wol_targets[APP_CLAW_WOL_TARGETS_LEN];
     char api_profiles[APP_CLAW_API_PROFILES_LEN];
+    char app_trusted_keys[APP_CLAW_STR_LEN];
+    char app_allow_unsigned[8];
     char stt_base_url[APP_CLAW_STR_LEN];
     char stt_api_key[APP_CLAW_STR_LEN];
     char stt_model[APP_CLAW_MODEL_LEN];

@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "mbedtls/base64.h"
 
 /*
  * Field catalogue
@@ -95,6 +96,8 @@ static const config_field_def_t CONFIG_FIELDS[] = {
     CONFIG_FIELD("capabilities", ssh_hosts),
     CONFIG_FIELD("capabilities", wol_targets),
     CONFIG_SECRET_FIELD("capabilities", api_profiles),
+    CONFIG_FIELD("capabilities", app_trusted_keys),
+    CONFIG_FIELD("capabilities", app_allow_unsigned),
 
     CONFIG_FIELD("skills",       enabled_lua_modules),
 
@@ -194,6 +197,26 @@ static bool is_boolean_string(const char *value)
             strcmp(value, "false") == 0 ||
             strcmp(value, "1") == 0 ||
             strcmp(value, "0") == 0);
+}
+
+/* app_trusted_keys: "" or a JSON array of base64 raw 32-byte Ed25519 public keys. */
+static bool is_trusted_keys_json(const char *value, size_t field_size)
+{
+    cJSON *keys = cJSON_Parse(value);
+    const cJSON *key = NULL;
+    bool valid = cJSON_IsArray(keys) && strlen(value) < field_size;
+
+    cJSON_ArrayForEach(key, (valid ? keys : NULL)) {
+        const char *b64 = cJSON_GetStringValue(key);
+        unsigned char raw[33];
+        size_t len = 0;
+
+        valid = valid && b64 &&
+                mbedtls_base64_decode(raw, sizeof(raw), &len, (const unsigned char *)b64, strlen(b64)) == 0 &&
+                len == 32;
+    }
+    cJSON_Delete(keys);
+    return valid;
 }
 
 static esp_err_t validate_wifi_config_fields(const app_config_t *config, const char **message)
@@ -372,13 +395,22 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         }
         if ((strcmp(field->name, "llm_supports_tools") == 0 ||
                 strcmp(field->name, "llm_supports_vision") == 0 ||
-                strcmp(field->name, "llm_image_remote_url_only") == 0) &&
+                strcmp(field->name, "llm_image_remote_url_only") == 0 ||
+                strcmp(field->name, "app_allow_unsigned") == 0) &&
                 !is_boolean_string(item->valuestring)) {
             cJSON_Delete(root);
             free(config);
             return httpd_resp_send_err(req,
                                        HTTPD_400_BAD_REQUEST,
-                                       "LLM boolean fields must be true/false");
+                                       "Boolean fields must be true/false");
+        }
+        if (strcmp(field->name, "app_trusted_keys") == 0 && item->valuestring[0] &&
+                !is_trusted_keys_json(item->valuestring, field->size)) {
+            cJSON_Delete(root);
+            free(config);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                       "app_trusted_keys must be a JSON array of base64 32-byte Ed25519 "
+                                       "public keys, at most 319 bytes");
         }
         if ((strcmp(field->name, "ssh_hosts") == 0 || strcmp(field->name, "wol_targets") == 0 ||
                 strcmp(field->name, "api_profiles") == 0) &&

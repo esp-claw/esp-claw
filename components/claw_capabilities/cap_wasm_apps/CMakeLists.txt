@@ -2,18 +2,26 @@ idf_component_register(
     SRCS
         "src/cap_wasm_apps.c"
         "src/cap_wasm_host.c"
+        "src/cap_wasm_install.c"
         "src/cap_wasm_manifest.c"
+        "src/cap_wasm_pkg.c"
+        "third_party/monocypher/monocypher.c"
+        "third_party/monocypher/monocypher-ed25519.c"
     INCLUDE_DIRS
         "include"
+    PRIV_INCLUDE_DIRS
+        "third_party/monocypher"
     REQUIRES
         claw_cap
     PRIV_REQUIRES
         cap_http_request
         cap_im_platform
+        esp_http_client
         esp_hw_support
         esp_timer
         json
         lwip
+        mbedtls
         nvs_flash
         pthread
 )

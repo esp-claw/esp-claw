@@ -61,6 +61,8 @@ typedef struct {
 #define APP_DEFAULT_SSH_HOSTS                ""
 #define APP_DEFAULT_WOL_TARGETS              ""
 #define APP_DEFAULT_API_PROFILES             ""
+#define APP_DEFAULT_APP_TRUSTED_KEYS         ""
+#define APP_DEFAULT_APP_ALLOW_UNSIGNED       "false"
 #define APP_DEFAULT_STT_BASE_URL             "https://api.openai.com/v1"
 #define APP_DEFAULT_STT_API_KEY              ""
 #define APP_DEFAULT_STT_MODEL                "gpt-4o-mini-transcribe"
@@ -107,6 +109,8 @@ static const app_config_field_t s_fields[] = {
     APP_CONFIG_FIELD(ssh_hosts, "ssh_hosts", APP_DEFAULT_SSH_HOSTS),
     APP_CONFIG_FIELD(wol_targets, "wol_targets", APP_DEFAULT_WOL_TARGETS),
     APP_CONFIG_FIELD(api_profiles, "api_profiles", APP_DEFAULT_API_PROFILES),
+    APP_CONFIG_FIELD(app_trusted_keys, "app_trust_keys", APP_DEFAULT_APP_TRUSTED_KEYS),
+    APP_CONFIG_FIELD(app_allow_unsigned, "app_allow_uns", APP_DEFAULT_APP_ALLOW_UNSIGNED),
     APP_CONFIG_FIELD(stt_base_url, "stt_base_url", APP_DEFAULT_STT_BASE_URL),
     APP_CONFIG_FIELD(stt_api_key, "stt_api_key", APP_DEFAULT_STT_API_KEY),
     APP_CONFIG_FIELD(stt_model, "stt_model", APP_DEFAULT_STT_MODEL),
@@ -610,6 +614,8 @@ void app_config_to_claw(const app_config_t *config, app_claw_config_t *out)
     strlcpy(out->ssh_hosts, config->ssh_hosts, sizeof(out->ssh_hosts));
     strlcpy(out->wol_targets, config->wol_targets, sizeof(out->wol_targets));
     strlcpy(out->api_profiles, config->api_profiles, sizeof(out->api_profiles));
+    strlcpy(out->app_trusted_keys, config->app_trusted_keys, sizeof(out->app_trusted_keys));
+    strlcpy(out->app_allow_unsigned, config->app_allow_unsigned, sizeof(out->app_allow_unsigned));
     strlcpy(out->stt_base_url, config->stt_base_url, sizeof(out->stt_base_url));
     strlcpy(out->stt_api_key, config->stt_api_key, sizeof(out->stt_api_key));
     strlcpy(out->stt_model, config->stt_model, sizeof(out->stt_model));
