@@ -325,6 +325,37 @@ void cap_wasm_floor_update(const char *app_name, const char *version, bool downg
     nvs_close(h);
 }
 
+uint32_t cap_wasm_index_issued_load(const char *app_name)
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    uint32_t issued = 0;
+    nvs_handle_t h;
+
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, "_issued", &issued);
+        nvs_close(h);
+    }
+    return issued;
+}
+
+void cap_wasm_index_issued_store(const char *app_name, uint32_t issued)
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    uint32_t old = 0;
+    nvs_handle_t h;
+
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    if (nvs_get_u32(h, "_issued", &old) != ESP_OK || old != issued) {
+        nvs_set_u32(h, "_issued", issued);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
 void cap_wasm_cfg_erase(const char *app_name)
 {
     char ns[CAP_WASM_NVS_NS_LEN];

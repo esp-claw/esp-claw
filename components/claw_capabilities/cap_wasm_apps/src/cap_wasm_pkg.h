@@ -149,6 +149,64 @@ bool cap_wasm_fw_sig_verify(const char *sig_json, const cap_wasm_key_t *keys, si
  */
 bool cap_wasm_version_cmp(const char *a, const char *b, int *out);
 
+/*
+ * Signed update index: index.json
+ *   {"format":1,"issued":<unix>,"expires":<unix>,"apps":[{"name","version","url","sha256","size"},...]}
+ * next to index.sig {"alg":"ed25519","key_id":"<8 hex>","expires":<unix>,"sig":"<base64>"}, where
+ * "sig" signs this record (cap_wasm_index_record()):
+ *
+ *   offset  size  value
+ *   0       15    "ecapp-index-v1" followed by one NUL byte
+ *   15      32    SHA-256 of the index.json bytes exactly as served
+ *   47      8     u64 little-endian expires (unix seconds)
+ *
+ * The expires inside index.json must equal the signed one. The device refuses an index that has
+ * expired or that was issued before the last index it accepted for the app (freeze protection),
+ * and cannot judge either without a synced clock. For an app installed from
+ * https://github.com/<owner>/<repo>/releases/download/<tag>/<file> the index is fetched from
+ * .../releases/latest/download/index.json; for any other https source from <its directory>/index.json.
+ * tools/ecapp.py index of the SDK writes and signs both files.
+ */
+#define CAP_WASM_INDEX_MAX        (8 * 1024)
+#define CAP_WASM_INDEX_FORMAT     1
+#define CAP_WASM_INDEX_PREFIX     "ecapp-index-v1"
+#define CAP_WASM_INDEX_RECORD_LEN (sizeof(CAP_WASM_INDEX_PREFIX) + CAP_WASM_SHA_LEN + 8)
+#define CAP_WASM_INDEX_URL_MAX    256
+#define CAP_WASM_INDEX_FILE       "index.json"
+#define CAP_WASM_INDEX_SIG_FILE   "index.sig"
+#define CAP_WASM_CLOCK_VALID_S    1767225600 /* 2026-01-01: an earlier wall clock was never set */
+
+typedef struct {
+    int64_t issued;
+    int64_t expires;
+    char key_id[CAP_WASM_KEY_ID_LEN + 1];
+} cap_wasm_index_t;
+
+typedef struct {
+    char name[CAP_WASM_APP_NAME_MAX + 1];
+    char version[CAP_WASM_VERSION_MAX + 1];
+    char url[CAP_WASM_INDEX_URL_MAX];
+    char sha256[CAP_WASM_SHA_HEX_LEN + 1];
+    uint32_t size;
+} cap_wasm_index_entry_t;
+
+/* Writes the signed record of an index; returns its length, or 0 when `size` is too small. */
+size_t cap_wasm_index_record(const uint8_t index_sha[CAP_WASM_SHA_LEN], uint64_t expires, uint8_t *out, size_t size);
+
+/*
+ * Verifies index.json (`index`, `index_len` bytes) against index.sig (`sig_json`) and `keys`,
+ * checks format and times (`now`, `clock_synced`, `last_issued`: the issued time of the last
+ * accepted index, 0 when none) and, with `name`, looks up that app's entry. On success `out` has
+ * the issued/expires times and the signing key.
+ */
+bool cap_wasm_index_check(const char *index, size_t index_len, const char *sig_json,
+                          const cap_wasm_key_t *keys, size_t key_count, int64_t now, bool clock_synced,
+                          int64_t last_issued, const char *name, cap_wasm_index_t *out,
+                          cap_wasm_index_entry_t *entry, char *err, size_t err_size);
+
+/* The index.json URL of an app's source URL (see above); false when the source is not an https URL with a path. */
+bool cap_wasm_index_url(const char *source_url, char *out, size_t size);
+
 #define CAP_WASM_DOWNGRADE_FLAG "--allow-downgrade"
 
 /*

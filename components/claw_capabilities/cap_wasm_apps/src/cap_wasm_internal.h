@@ -157,6 +157,10 @@ void cap_wasm_timer_store_last(const char *app_name, uint32_t last_unix);
 void cap_wasm_floor_load(const char *app_name, char out[CAP_WASM_VERSION_MAX + 1]);
 void cap_wasm_floor_update(const char *app_name, const char *version, bool downgrade);
 
+/* Issued time of the last update index accepted for the app (freeze protection), 0 when none; erased with the app. */
+uint32_t cap_wasm_index_issued_load(const char *app_name);
+void cap_wasm_index_issued_store(const char *app_name, uint32_t issued);
+
 /* ---------- Timers (cap_wasm_apps.c, WASM thread) ---------- */
 
 #define CAP_WASM_MAX_TIMERS 4 /* apps with an active timer */
@@ -229,15 +233,16 @@ esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char 
 
 /*
  * Downloads an .ecapp from an https URL, verifies it, asks for confirmation in the Telegram chat
- * of `ctx` and installs it. `expect_name` (update) must match the package; a version older than
+ * of `ctx` and installs it. `expect_name` (update) must match the package, and so must the size,
+ * SHA-256 and version of `expect` (the signed index entry, NULL when installing by URL); a version older than
  * the installed one or below the app's version floor needs `force` (--allow-downgrade) and is
  * confirmed with a "Downgrade" button. A successful install raises the floor to the new version
  * (or lowers it to it after an allowed downgrade). `confirmed` (the update was confirmed in a
  * list) skips the question unless the new version adds permissions. Must not run on the WASM
  * thread or the Telegram poll task.
  */
-esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force, bool confirmed,
-                           const claw_cap_call_context_t *ctx, char *output, size_t output_size);
+esp_err_t cap_wasm_install(const char *url, const char *expect_name, const cap_wasm_index_entry_t *expect, bool force,
+                           bool confirmed, const claw_cap_call_context_t *ctx, char *output, size_t output_size);
 
 /* Asks for confirmation, then deletes the app, its files and its key-value data. */
 esp_err_t cap_wasm_remove(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size);

@@ -5,14 +5,17 @@
  */
 
 /*
- * Update checks against the latest GitHub release of the firmware and of every app installed
- * from one (https://github.com/<owner>/<repo>/releases/download/...): /app updates, /app update
+ * Update checks against the latest GitHub release of the firmware and the signed update index of
+ * every app's source (cap_wasm_index_url(): releases/latest/download/index.json of a GitHub
+ * release, else <directory>/index.json; index.sig next to it): /app updates, /app update
  * <name>|all and a Telegram notice from a background check: daily at update_check_time (local
  * time), once per boot (after UPD_BOOT_DELAY_US) and when a new chat session starts
  * (cap_wasm_updates_kick). One check at a time; boot and session checks at most once per
- * UPD_THROTTLE_US (GitHub allows 60 unauthenticated requests per hour), and a notice repeats only
- * for new versions (cap_wasm_should_notify). Nothing is installed without a confirmation. One HTTP
- * request at a time, on the caller's task or a short-lived one.
+ * UPD_THROTTLE_US (GitHub allows 60 unauthenticated API requests per hour), and a notice repeats
+ * only for new versions (cap_wasm_should_notify). An index must be signed by a trusted key, not
+ * expired and not older than the last one accepted for the app (its issued time is kept in NVS);
+ * the package it names must match its size and SHA-256. Nothing is installed without a
+ * confirmation. One HTTP request at a time, on the caller's task or a short-lived one.
  */
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -50,10 +53,11 @@ static const char *TAG = "cap_wasm_upd";
 typedef struct {
     char name[CAP_WASM_APP_NAME_MAX + 1]; /* "firmware" for the firmware */
     char installed[CAP_WASM_FW_TEXT_MAX + 1];
-    char available[CAP_WASM_FW_TEXT_MAX + 1]; /* latest release, "" when unknown */
+    char available[CAP_WASM_FW_TEXT_MAX + 1]; /* latest version, "" when unknown */
     char url[CAP_WASM_REL_URL_MAX];           /* the source URL, then the latest package */
-    char err[96];
-    bool github;                              /* the source is a GitHub release */
+    cap_wasm_index_entry_t entry;             /* the latest package per the signed index (apps) */
+    char err[128];
+    bool has_source;                          /* a source with an update index (or the firmware release) */
     bool newer;
 } upd_item_t;
 
@@ -120,27 +124,51 @@ static size_t upd_read_index(const char *only, upd_item_t *items, size_t max)
     return count;
 }
 
-/* Looks up the latest release when the app came from a GitHub release URL. */
+/* Fetches and verifies the signed index of the app's source and picks the app's entry. */
 static void upd_lookup_app(upd_item_t *u)
 {
-    char repo[CAP_WASM_GH_REPO_MAX];
-    cap_wasm_rel_app_t pick = { .name = u->name };
-    cap_wasm_rel_scan_t scan = { .on_asset = cap_wasm_rel_app_asset, .ctx = &pick };
+    char index_url[CAP_WASM_INDEX_URL_MAX];
+    char sig_url[CAP_WASM_INDEX_URL_MAX];
+    char err[96];
+    char *index = NULL;
+    char *sig = NULL;
+    size_t index_len = 0;
+    size_t sig_len = 0;
+    int64_t now = time(NULL);
+    cap_wasm_index_t info;
     int cmp = 0;
 
-    u->github = cap_wasm_gh_release_repo(u->url, repo, sizeof(repo));
-    if (!u->github || !cap_wasm_release_latest(repo, &scan, u->err, sizeof(u->err))) {
+    u->has_source = cap_wasm_index_url(u->url, index_url, sizeof(index_url));
+    if (!u->has_source) {
         return;
     }
-    if (!cap_wasm_rel_app_pick(&pick, scan.tag)) {
-        snprintf(u->err, sizeof(u->err), "no %s-<version>.ecapp in the latest release", u->name);
-    } else if (!cap_wasm_version_cmp(pick.version, u->installed, &cmp)) {
-        snprintf(u->err, sizeof(u->err), "cannot compare version '%s' with '%s'", pick.version, u->installed);
+    snprintf(sig_url, sizeof(sig_url), "%.*s%s", (int)(strlen(index_url) - strlen(CAP_WASM_INDEX_FILE)), index_url,
+             CAP_WASM_INDEX_SIG_FILE);
+    index = (char *)cap_wasm_download(index_url, CAP_WASM_INDEX_MAX, &index_len, err, sizeof(err));
+    if (!index) {
+        snprintf(u->err, sizeof(u->err), "%s: %s", CAP_WASM_INDEX_FILE, err);
+        return;
+    }
+    sig = (char *)cap_wasm_download(sig_url, CAP_WASM_SIGNATURE_MAX, &sig_len, err, sizeof(err));
+    if (!sig) {
+        snprintf(u->err, sizeof(u->err), "%s: %.80s (an unsigned index is refused)", CAP_WASM_INDEX_SIG_FILE, err);
+        heap_caps_free(index);
+        return;
+    }
+    if (!cap_wasm_index_check(index, index_len, sig, g_cap_wasm_trusted, g_cap_wasm_trusted_count, now,
+                              now >= CAP_WASM_CLOCK_VALID_S, cap_wasm_index_issued_load(u->name), u->name, &info,
+                              &u->entry, u->err, sizeof(u->err))) {
+        ESP_LOGW(TAG, "%s: index refused: %s", u->name, u->err);
+    } else if (!cap_wasm_version_cmp(u->entry.version, u->installed, &cmp)) {
+        snprintf(u->err, sizeof(u->err), "cannot compare version '%s' with '%s'", u->entry.version, u->installed);
     } else {
-        strcpy(u->url, pick.url);
-        strcpy(u->available, pick.version);
+        cap_wasm_index_issued_store(u->name, (uint32_t)info.issued);
+        strcpy(u->url, u->entry.url);
+        strcpy(u->available, u->entry.version);
         u->newer = cmp > 0;
     }
+    heap_caps_free(index);
+    heap_caps_free(sig);
 }
 
 /* The firmware (when asked for) and every installed app, looked up one after the other. */
@@ -154,7 +182,7 @@ static void upd_collect(upd_list_t *list, bool firmware)
         memset(fw, 0, sizeof(*fw));
         strcpy(fw->name, "firmware");
         strlcpy(fw->installed, esp_app_get_description()->version, sizeof(fw->installed));
-        fw->github = true;
+        fw->has_source = true;
         fw->newer = cap_wasm_fw_latest(fw->available, &cmp, fw->err, sizeof(fw->err)) && cmp > 0;
     }
     list->count += upd_read_index(NULL, list->items + list->count, CAP_WASM_MAX_APPS);
@@ -184,8 +212,9 @@ static void upd_describe(const upd_list_t *list, char *out, size_t size)
             upd_append(out, size, "\n%s %s → %s", u->name, u->installed, u->available);
         } else if (u->err[0]) {
             upd_append(out, size, "\n%s %s: check failed: %s", u->name, u->installed, u->err);
-        } else if (!u->github) {
-            upd_append(out, size, "\n%s %s: not installed from a GitHub release", u->name, u->installed);
+        } else if (!u->has_source) {
+            upd_append(out, size, "\n%s %s: no source URL (copied by hand?), /app update %s <https-url> sets one",
+                       u->name, u->installed, u->name);
         } else {
             upd_append(out, size, "\n%s %s ✓", u->name, u->installed);
         }
@@ -239,11 +268,16 @@ esp_err_t cap_wasm_update(const char *name, const claw_cap_call_context_t *ctx, 
         snprintf(output, output_size, "Error: %s: %s", name, u.err);
         return ESP_FAIL;
     }
-    if (u.github && !u.newer) {
-        snprintf(output, output_size, "%s %s is up to date (latest release: %s)", name, u.installed, u.available);
+    if (!u.has_source) {
+        snprintf(output, output_size, "Error: %s has no source URL; /app update %s <https-url> installs from one", name,
+                 name);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!u.newer) {
+        snprintf(output, output_size, "%s %s is up to date (index: %s)", name, u.installed, u.available);
         return ESP_OK;
     }
-    return cap_wasm_install(u.url, name, false, false, ctx, output, output_size);
+    return cap_wasm_install(u.url, name, &u.entry, false, false, ctx, output, output_size);
 }
 
 esp_err_t cap_wasm_update_all(const claw_cap_call_context_t *ctx, char *output, size_t output_size)
@@ -300,7 +334,7 @@ esp_err_t cap_wasm_update_all(const claw_cap_call_context_t *ctx, char *output, 
         }
         upd_append(output, output_size, "%s%s: ", output[0] ? "\n" : "", u->name);
         len = strlen(output);
-        ret = cap_wasm_install(u->url, u->name, false, true, ctx, output + len, output_size - len);
+        ret = cap_wasm_install(u->url, u->name, &u->entry, false, true, ctx, output + len, output_size - len);
         if (ret != ESP_OK) {
             upd_append(output, output_size, "\nStopped: the remaining updates were not installed.");
             break;

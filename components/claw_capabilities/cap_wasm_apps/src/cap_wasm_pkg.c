@@ -464,6 +464,205 @@ bool cap_wasm_version_cmp(const char *a, const char *b, int *out)
     return true;
 }
 
+size_t cap_wasm_index_record(const uint8_t index_sha[CAP_WASM_SHA_LEN], uint64_t expires, uint8_t *out, size_t size)
+{
+    uint8_t *p = out;
+
+    if (size < CAP_WASM_INDEX_RECORD_LEN) {
+        return 0;
+    }
+    memcpy(p, CAP_WASM_INDEX_PREFIX, sizeof(CAP_WASM_INDEX_PREFIX)); /* including the NUL */
+    p += sizeof(CAP_WASM_INDEX_PREFIX);
+    memcpy(p, index_sha, CAP_WASM_SHA_LEN);
+    p += CAP_WASM_SHA_LEN;
+    for (int i = 0; i < 8; i++) {
+        *p++ = (uint8_t)(expires >> (8 * i));
+    }
+    return CAP_WASM_INDEX_RECORD_LEN;
+}
+
+/* A non-negative integer that survives the double; unix times and sizes. */
+static bool cap_wasm_json_int64(const cJSON *item, int64_t *out)
+{
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0 || item->valuedouble > 9007199254740992.0 ||
+            item->valuedouble != (double)(int64_t)item->valuedouble) {
+        return false;
+    }
+    *out = (int64_t)item->valuedouble;
+    return true;
+}
+
+static bool cap_wasm_index_entry_parse(const cJSON *item, cap_wasm_index_entry_t *out)
+{
+    static const char *const keys[] = {"name", "version", "url", "sha256", "size"};
+    const char *name = cap_wasm_json_str(item, "name");
+    const char *version = cap_wasm_json_str(item, "version");
+    const char *url = cap_wasm_json_str(item, "url");
+    const char *sha256 = cap_wasm_json_str(item, "sha256");
+    char unused[8];
+    int64_t size = 0;
+    int cmp;
+
+    if (!cJSON_IsObject(item) || !cap_wasm_keys_known(item, keys, 5, "index entry key", unused, sizeof(unused)) ||
+            !name || !cap_wasm_name_valid(name, strlen(name), CAP_WASM_APP_NAME_MAX) || !version ||
+            strlen(version) > CAP_WASM_VERSION_MAX || !cap_wasm_version_cmp(version, version, &cmp) || !url ||
+            strncmp(url, "https://", 8) != 0 || strlen(url) >= CAP_WASM_INDEX_URL_MAX || !sha256 ||
+            strlen(sha256) != CAP_WASM_SHA_HEX_LEN || strspn(sha256, "0123456789abcdef") != CAP_WASM_SHA_HEX_LEN ||
+            !cap_wasm_json_int64(cJSON_GetObjectItemCaseSensitive(item, "size"), &size) || size < 1 ||
+            size > CAP_WASM_PKG_MAX) {
+        return false;
+    }
+    strcpy(out->name, name);
+    strcpy(out->version, version);
+    strcpy(out->url, url);
+    strcpy(out->sha256, sha256);
+    out->size = (uint32_t)size;
+    return true;
+}
+
+bool cap_wasm_index_check(const char *index, size_t index_len, const char *sig_json,
+                          const cap_wasm_key_t *keys, size_t key_count, int64_t now, bool clock_synced,
+                          int64_t last_issued, const char *name, cap_wasm_index_t *out,
+                          cap_wasm_index_entry_t *entry, char *err, size_t err_size)
+{
+    static const char *const keys_sig[] = {"alg", "key_id", "expires", "sig"};
+    static const char *const keys_index[] = {"format", "issued", "expires", "apps"};
+    cJSON *sig_root = cJSON_Parse(sig_json);
+    cJSON *root = NULL;
+    const cJSON *apps = NULL;
+    const cJSON *item = NULL;
+    const char *alg = cap_wasm_json_str(sig_root, "alg");
+    const char *kid = cap_wasm_json_str(sig_root, "key_id");
+    const char *sig_b64 = cap_wasm_json_str(sig_root, "sig");
+    uint8_t index_sha[CAP_WASM_SHA_LEN];
+    uint8_t record[CAP_WASM_INDEX_RECORD_LEN];
+    uint8_t sig[64];
+    int64_t sig_expires = 0;
+    int64_t format = 0;
+    size_t k;
+    bool found = false;
+    bool ok = false;
+
+    memset(out, 0, sizeof(*out));
+    if (!cJSON_IsObject(sig_root)) {
+        snprintf(err, err_size, "index.sig is not a signature object");
+        goto done;
+    }
+    if (!cap_wasm_keys_known(sig_root, keys_sig, 4, "index.sig key", err, err_size)) {
+        goto done;
+    }
+    if (!alg || strcmp(alg, "ed25519") != 0 || !kid || !sig_b64 ||
+            !cap_wasm_json_int64(cJSON_GetObjectItemCaseSensitive(sig_root, "expires"), &sig_expires)) {
+        snprintf(err, err_size, "index.sig needs alg \"ed25519\", key_id, expires and sig");
+        goto done;
+    }
+    for (k = 0; k < key_count && strcmp(keys[k].key_id, kid) != 0; k++) {
+    }
+    if (k == key_count) {
+        snprintf(err, err_size, "index signed by untrusted key %.8s", kid);
+        goto done;
+    }
+    /* The signature covers the bytes as served, so it is checked before they are parsed. */
+    cap_wasm_sha256((const uint8_t *)index, index_len, index_sha);
+    cap_wasm_index_record(index_sha, (uint64_t)sig_expires, record, sizeof(record));
+    if (!cap_wasm_b64_decode(sig_b64, sig, sizeof(sig)) ||
+            crypto_ed25519_check(sig, keys[k].pub, record, sizeof(record)) != 0) {
+        snprintf(err, err_size, "invalid index signature (key %s)", keys[k].key_id);
+        goto done;
+    }
+    root = cJSON_ParseWithLength(index, index_len);
+    if (!cJSON_IsObject(root)) {
+        snprintf(err, err_size, "index.json is not a JSON object");
+        goto done;
+    }
+    if (!cap_wasm_keys_known(root, keys_index, 4, "index key", err, err_size)) {
+        goto done;
+    }
+    if (!cap_wasm_json_int64(cJSON_GetObjectItemCaseSensitive(root, "format"), &format) || format != CAP_WASM_INDEX_FORMAT) {
+        snprintf(err, err_size, "unsupported index format (device supports %d)", CAP_WASM_INDEX_FORMAT);
+        goto done;
+    }
+    if (!cap_wasm_json_int64(cJSON_GetObjectItemCaseSensitive(root, "issued"), &out->issued) ||
+            !cap_wasm_json_int64(cJSON_GetObjectItemCaseSensitive(root, "expires"), &out->expires) ||
+            out->issued > out->expires) {
+        snprintf(err, err_size, "index.json needs integer issued and expires times, issued first");
+        goto done;
+    }
+    if (out->expires != sig_expires) {
+        snprintf(err, err_size, "index.json expires (%lld) does not match the signed expires (%lld)",
+                 (long long)out->expires, (long long)sig_expires);
+        goto done;
+    }
+    if (!clock_synced) {
+        snprintf(err, err_size, "clock not synced, cannot verify index freshness");
+        goto done;
+    }
+    if (now > out->expires) {
+        snprintf(err, err_size, "index expired at %lld (now %lld); the publisher must sign a new one",
+                 (long long)out->expires, (long long)now);
+        goto done;
+    }
+    if (out->issued < last_issued) {
+        snprintf(err, err_size, "index issued %lld is older than the last accepted index (%lld): stale or replayed",
+                 (long long)out->issued, (long long)last_issued);
+        goto done;
+    }
+    strcpy(out->key_id, keys[k].key_id);
+    apps = cJSON_GetObjectItemCaseSensitive(root, "apps");
+    if (!cJSON_IsArray(apps)) {
+        snprintf(err, err_size, "index.json apps must be an array");
+        goto done;
+    }
+    if (!name) {
+        ok = true;
+        goto done;
+    }
+    cJSON_ArrayForEach(item, apps) {
+        const char *item_name = cap_wasm_json_str(item, "name");
+
+        if (item_name && strcmp(item_name, name) == 0) {
+            if (!cap_wasm_index_entry_parse(item, entry)) {
+                snprintf(err, err_size, "the index entry for %s is invalid", name);
+                goto done;
+            }
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        snprintf(err, err_size, "no entry for app %s in the index", name);
+        goto done;
+    }
+    ok = true;
+
+done:
+    cJSON_Delete(sig_root);
+    cJSON_Delete(root);
+    return ok;
+}
+
+bool cap_wasm_index_url(const char *source_url, char *out, size_t size)
+{
+    static const char gh[] = "https://github.com/";
+    static const char dl[] = "/releases/download/";
+    const char *path = strncmp(source_url, "https://", 8) == 0 ? strchr(source_url + 8, '/') : NULL;
+    const char *rel = strncmp(source_url, gh, sizeof(gh) - 1) == 0 ? strstr(source_url + sizeof(gh) - 1, dl) : NULL;
+    const char *dir;
+    int n;
+
+    if (!path || strpbrk(source_url, "?#")) {
+        return false;
+    }
+    if (rel) {
+        n = snprintf(out, size, "%.*s/releases/latest/download/%s", (int)(rel - source_url), source_url,
+                     CAP_WASM_INDEX_FILE);
+    } else {
+        dir = strrchr(path, '/');
+        n = snprintf(out, size, "%.*s/%s", (int)(dir - source_url), source_url, CAP_WASM_INDEX_FILE);
+    }
+    return n > 0 && (size_t)n < size;
+}
+
 bool cap_wasm_rollback_check(const char *name, const char *version, const char *floor, bool allow_downgrade,
                              char *err, size_t err_size)
 {

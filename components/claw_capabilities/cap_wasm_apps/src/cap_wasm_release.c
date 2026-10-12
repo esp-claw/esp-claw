@@ -8,52 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define ECAPP_SUFFIX ".ecapp"
-
 /* Scanner states between strings: the last string may be a key (a ':' follows), then its value. */
 enum { SCAN_IDLE, SCAN_AFTER_STR, SCAN_VALUE };
 enum { KEY_OTHER, KEY_TAG, KEY_URL, KEY_END };
-
-bool cap_wasm_gh_release_repo(const char *url, char *repo, size_t repo_size)
-{
-    static const char prefix[] = "https://github.com/";
-    const char *owner = url + sizeof(prefix) - 1;
-    const char *slash;
-    const char *rel;
-
-    if (strncmp(url, prefix, sizeof(prefix) - 1) != 0 || !(slash = strchr(owner, '/')) || slash == owner ||
-            !(rel = strstr(slash + 1, "/releases/download/")) || rel == slash + 1 ||
-            memchr(slash + 1, '/', rel - slash - 1) || (size_t)(rel - owner) >= repo_size) {
-        return false;
-    }
-    memcpy(repo, owner, rel - owner);
-    repo[rel - owner] = '\0';
-    return true;
-}
-
-bool cap_wasm_ecapp_name_version(const char *file, char name[CAP_WASM_APP_NAME_MAX + 1],
-                                 char version[CAP_WASM_VERSION_MAX + 1])
-{
-    const size_t suffix_len = sizeof(ECAPP_SUFFIX) - 1;
-    const char *dash = strchr(file, '-');
-    size_t len = strlen(file);
-    size_t ver_len;
-
-    if (!dash || len <= suffix_len || strcmp(file + len - suffix_len, ECAPP_SUFFIX) != 0 ||
-            !cap_wasm_name_valid(file, dash - file, CAP_WASM_APP_NAME_MAX)) {
-        return false;
-    }
-    /* App names have no '-' and the suffix none either, so the dash is before the suffix. */
-    ver_len = (size_t)(file + len - suffix_len - dash - 1);
-    if (ver_len == 0 || ver_len > CAP_WASM_VERSION_MAX) {
-        return false;
-    }
-    memcpy(name, file, dash - file);
-    name[dash - file] = '\0';
-    memcpy(version, dash + 1, ver_len);
-    version[ver_len] = '\0';
-    return true;
-}
 
 static void scan_string_done(cap_wasm_rel_scan_t *s)
 {
@@ -102,40 +59,6 @@ void cap_wasm_rel_scan_feed(cap_wasm_rel_scan_t *s, const char *data, size_t len
             s->state = SCAN_IDLE;
         }
     }
-}
-
-void cap_wasm_rel_app_asset(void *ctx, const char *url)
-{
-    cap_wasm_rel_app_t *a = ctx;
-    const char *file = strrchr(url, '/');
-    const size_t suffix_len = sizeof(ECAPP_SUFFIX) - 1;
-    size_t len = strlen(url);
-    char name[CAP_WASM_APP_NAME_MAX + 1];
-    char version[CAP_WASM_VERSION_MAX + 1];
-    bool exact;
-
-    if (!file || strncmp(url, "https://", 8) != 0 || len >= sizeof(a->url) || len <= suffix_len ||
-            strcmp(url + len - suffix_len, ECAPP_SUFFIX) != 0) {
-        return;
-    }
-    a->ecapps++;
-    exact = cap_wasm_ecapp_name_version(file + 1, name, version) && strcmp(name, a->name) == 0;
-    if (exact || (!a->exact && a->ecapps == 1)) {
-        strcpy(a->url, url);
-        strcpy(a->version, exact ? version : "");
-        a->exact = exact;
-    }
-}
-
-bool cap_wasm_rel_app_pick(cap_wasm_rel_app_t *a, const char *tag)
-{
-    if (!a->exact && a->ecapps != 1) {
-        return false;
-    }
-    if (!a->version[0]) {
-        snprintf(a->version, sizeof(a->version), "%s", tag + (tag[0] == 'v'));
-    }
-    return a->version[0] != '\0';
 }
 
 /* True when the ';'-separated `list` contains `entry` (`len` bytes). */

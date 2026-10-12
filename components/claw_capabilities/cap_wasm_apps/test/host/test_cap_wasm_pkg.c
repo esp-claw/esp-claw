@@ -5,7 +5,8 @@
  */
 /*
  * Host tests for cap_wasm_pkg.c: package formats 1 and 2, the format 2 signature record, the api
- * check. Run with test/host/run.sh. ecapp_vectors.json (shared with esp-claw/app-sdk, written by its
+ * check, the version floor and the signed update index. Run with test/host/run.sh.
+ * ecapp_vectors.json (shared with esp-claw/app-sdk, written by its
  * tests/make_vectors.py) holds the test key and the expected records and signatures.
  */
 #include <stdio.h>
@@ -360,6 +361,139 @@ static void test_rollback(void)
     CHECK(cap_wasm_rollback_check("hello", "1.0.0", "garbage", true, s_err, sizeof(s_err)));
 }
 
+/* index.sig for `index` with the test key; `sig_expires` may differ from the index on purpose. */
+static void index_sig(const char *index, int64_t sig_expires, char *out, size_t size)
+{
+    uint8_t index_sha[CAP_WASM_SHA_LEN];
+    uint8_t record[CAP_WASM_INDEX_RECORD_LEN];
+    uint8_t sig[64];
+    char sig_b64[96];
+
+    cap_wasm_sha256((const uint8_t *)index, strlen(index), index_sha);
+    cap_wasm_index_record(index_sha, (uint64_t)sig_expires, record, sizeof(record));
+    crypto_ed25519_sign(sig, s_secret, record, sizeof(record));
+    b64(sig, sizeof(sig), sig_b64, sizeof(sig_b64));
+    snprintf(out, size, "{\"alg\":\"ed25519\",\"key_id\":\"%s\",\"expires\":%lld,\"sig\":\"%s\"}", s_key.key_id,
+             (long long)sig_expires, sig_b64);
+}
+
+static bool index_ok(const char *index, const char *sig, int64_t now, bool synced, int64_t last_issued, const char *name,
+                     cap_wasm_index_entry_t *entry)
+{
+    cap_wasm_index_t info;
+
+    return cap_wasm_index_check(index, strlen(index), sig, &s_key, 1, now, synced, last_issued, name, &info, entry, s_err,
+                                sizeof(s_err));
+}
+
+static void test_index(void)
+{
+    const char *index = vec("index_v1", "index_json");
+    const char *sig = vec("index_v1", "index_sig");
+    const int64_t issued = 1780000000;
+    const int64_t expires = 1800000000;
+    const int64_t now = 1790000000;
+    uint8_t index_sha[CAP_WASM_SHA_LEN];
+    uint8_t record[CAP_WASM_INDEX_RECORD_LEN];
+    uint8_t expected[CAP_WASM_INDEX_RECORD_LEN];
+    uint8_t raw[64];
+    char sig_b64[96];
+    char own[320];
+    char tampered[1024];
+    cap_wasm_index_t info;
+    cap_wasm_index_entry_t entry;
+
+    /* The record and the signature of the vectors. */
+    cap_wasm_sha256((const uint8_t *)index, strlen(index), index_sha);
+    CHECK(cap_wasm_index_record(index_sha, (uint64_t)expires, record, sizeof(record)) == 55);
+    CHECK(unhex(vec("index_v1", "record_hex"), expected, sizeof(expected)) == 55 && memcmp(record, expected, 55) == 0);
+    CHECK(memcmp(record, "ecapp-index-v1\0", 15) == 0 && memcmp(record + 47, "\x00\xd2\x49\x6b\x00\x00\x00\x00", 8) == 0);
+    crypto_ed25519_sign(raw, s_secret, record, sizeof(record));
+    b64(raw, sizeof(raw), sig_b64, sizeof(sig_b64));
+    CHECK(strcmp(sig_b64, vec("index_v1", "sig_b64")) == 0);
+
+    /* Accepted: the entry of the app is returned, the times and key reported. */
+    CHECK(cap_wasm_index_check(index, strlen(index), sig, &s_key, 1, now, true, 0, "hello", &info, &entry, s_err,
+                               sizeof(s_err)));
+    CHECK(info.issued == issued && info.expires == expires && strcmp(info.key_id, s_key.key_id) == 0);
+    CHECK(strcmp(entry.name, "hello") == 0 && strcmp(entry.version, "1.2.3") == 0 && entry.size == 250 &&
+          strcmp(entry.url, "https://example.com/apps/hello-1.2.3.ecapp") == 0 && strlen(entry.sha256) == 64);
+    CHECK(index_ok(index, sig, now, true, issued, "other", &entry) && strcmp(entry.version, "0.9.0") == 0);
+    CHECK(index_ok(index, sig, expires, true, 0, NULL, &entry));
+    CHECK(!index_ok(index, sig, now, true, 0, "nope", &entry));
+    CHECK_ERR(s_err, "no entry for app nope");
+
+    /* Expired, frozen (older than the last accepted), unsynced clock. */
+    CHECK(!index_ok(index, sig, expires + 1, true, 0, "hello", &entry));
+    CHECK_ERR(s_err, "index expired at 1800000000");
+    CHECK(!index_ok(index, sig, now, true, issued + 1, "hello", &entry));
+    CHECK_ERR(s_err, "older than the last accepted index");
+    CHECK(!index_ok(index, sig, now, false, 0, "hello", &entry));
+    CHECK_ERR(s_err, "clock not synced, cannot verify index freshness");
+
+    /* Unsigned, wrong key, tampered index, tampered signature. */
+    CHECK(!index_ok(index, "", now, true, 0, "hello", &entry));
+    CHECK_ERR(s_err, "not a signature object");
+    CHECK(!index_ok(index, "{}", now, true, 0, "hello", &entry));
+    CHECK(!cap_wasm_index_check(index, strlen(index), sig, &s_other, 1, now, true, 0, "hello", &info, &entry, s_err,
+                                sizeof(s_err)));
+    CHECK_ERR(s_err, "untrusted key");
+    snprintf(tampered, sizeof(tampered), "%s", index);
+    tampered[strlen(tampered) - 3] = '}'; /* "]}\n" -> "]}}" : different bytes, no longer valid JSON either */
+    CHECK(!index_ok(tampered, sig, now, true, 0, "hello", &entry));
+    CHECK_ERR(s_err, "invalid index signature");
+    snprintf(own, sizeof(own), "%s", sig);
+    own[strlen(own) - 6] ^= 1;
+    CHECK(!index_ok(index, own, now, true, 0, "hello", &entry));
+    CHECK_ERR(s_err, "invalid index signature");
+
+    /* A signature over the index with another expires than index.json says. */
+    index_sig(index, expires + 1, own, sizeof(own));
+    CHECK(!index_ok(index, own, now, true, 0, "hello", &entry));
+    CHECK_ERR(s_err, "expires (1800000000) does not match the signed expires (1800000001)");
+    index_sig(index, expires, own, sizeof(own));
+    CHECK(index_ok(index, own, now, true, 0, "hello", &entry));
+
+    /* Content rules: format, unknown keys, invalid entries. */
+    snprintf(tampered, sizeof(tampered), "{\"format\":2,\"issued\":1,\"expires\":%lld,\"apps\":[]}", (long long)expires);
+    index_sig(tampered, expires, own, sizeof(own));
+    CHECK(!index_ok(tampered, own, now, true, 0, NULL, &entry));
+    CHECK_ERR(s_err, "unsupported index format");
+    snprintf(tampered, sizeof(tampered), "{\"format\":1,\"issued\":1,\"expires\":%lld,\"apps\":[],\"x\":1}", (long long)expires);
+    index_sig(tampered, expires, own, sizeof(own));
+    CHECK(!index_ok(tampered, own, now, true, 0, NULL, &entry));
+    CHECK_ERR(s_err, "unknown index key 'x'");
+    snprintf(tampered, sizeof(tampered), "{\"format\":1,\"issued\":1,\"expires\":%lld,\"apps\":[{\"name\":\"hello\","
+             "\"version\":\"1.2.3\",\"url\":\"http://example.com/h.ecapp\",\"sha256\":\"%064d\",\"size\":1}]}",
+             (long long)expires, 0);
+    index_sig(tampered, expires, own, sizeof(own));
+    CHECK(!index_ok(tampered, own, now, true, 0, "hello", &entry));
+    CHECK_ERR(s_err, "entry for hello is invalid");
+    snprintf(tampered, sizeof(tampered), "{\"format\":1,\"issued\":%lld,\"expires\":%lld,\"apps\":[]}",
+             (long long)expires + 1, (long long)expires);
+    index_sig(tampered, expires, own, sizeof(own));
+    CHECK(!index_ok(tampered, own, now, true, 0, NULL, &entry));
+    CHECK_ERR(s_err, "issued first");
+}
+
+static void test_index_url(void)
+{
+    char url[CAP_WASM_INDEX_URL_MAX];
+
+    CHECK(cap_wasm_index_url("https://github.com/esp-claw/app-hello/releases/download/v1.0.1/hello-1.0.1.ecapp", url,
+                             sizeof(url)) &&
+          strcmp(url, "https://github.com/esp-claw/app-hello/releases/latest/download/index.json") == 0);
+    CHECK(cap_wasm_index_url("https://example.com/apps/hello-1.2.3.ecapp", url, sizeof(url)) &&
+          strcmp(url, "https://example.com/apps/index.json") == 0);
+    CHECK(cap_wasm_index_url("https://example.com/h.ecapp", url, sizeof(url)) &&
+          strcmp(url, "https://example.com/index.json") == 0);
+    CHECK(!cap_wasm_index_url("http://example.com/apps/h.ecapp", url, sizeof(url)));
+    CHECK(!cap_wasm_index_url("https://example.com", url, sizeof(url)));
+    CHECK(!cap_wasm_index_url("https://example.com/apps/h.ecapp?token=1", url, sizeof(url)));
+    CHECK(!cap_wasm_index_url("", url, sizeof(url)));
+    CHECK(!cap_wasm_index_url("https://example.com/apps/h.ecapp", url, 24));
+}
+
 int main(void)
 {
     FILE *f = fopen("ecapp_vectors.json", "rb");
@@ -404,6 +538,8 @@ int main(void)
     test_api();
     test_versions();
     test_rollback();
+    test_index();
+    test_index_url();
     cJSON_Delete(s_vectors);
     if (s_failed) {
         printf("%d check(s) failed\n", s_failed);

@@ -303,13 +303,14 @@ static bool cap_wasm_stage(const char *name, const cap_wasm_pkg_t *pkg)
     return true;
 }
 
-esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force, bool confirmed,
-                           const claw_cap_call_context_t *ctx, char *output, size_t output_size)
+esp_err_t cap_wasm_install(const char *url, const char *expect_name, const cap_wasm_index_entry_t *expect, bool force,
+                           bool confirmed, const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
     const char *chat = cap_im_tg_confirm_chat(ctx);
     const size_t html_size = 1536;
     char key_id[CAP_WASM_KEY_ID_LEN + 1];
     char floor[CAP_WASM_VERSION_MAX + 1];
+    char pkg_sha[CAP_WASM_SHA_HEX_LEN + 1];
     char perms[320];
     char err[160];
     char *manifest = NULL;
@@ -347,6 +348,15 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
         snprintf(output, output_size, "Error: %s", err);
         goto done;
     }
+    /* An update: the signed index pins the exact package. */
+    if (expect) {
+        cap_wasm_sha256_hex(buf, len, pkg_sha);
+        if (len != expect->size || strcmp(pkg_sha, expect->sha256) != 0) {
+            snprintf(output, output_size, "Error: the download (%u bytes, sha256 %.8s) is not the package the update "
+                     "index names (%u bytes, sha256 %.8s)", (unsigned)len, pkg_sha, (unsigned)expect->size, expect->sha256);
+            goto done;
+        }
+    }
     manifest = heap_caps_calloc(1, pkg.manifest.len + 1, CAP_WASM_PSRAM_CAPS);
     sig = heap_caps_calloc(1, pkg.signature.len + 1, CAP_WASM_PSRAM_CAPS);
     html = heap_caps_malloc(html_size, CAP_WASM_PSRAM_CAPS);
@@ -370,6 +380,11 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     }
     if (expect_name && strcmp(expect_name, mf->name) != 0) {
         snprintf(output, output_size, "Error: the package contains app '%s', not '%s'", mf->name, expect_name);
+        goto done;
+    }
+    if (expect && strcmp(expect->version, mf->version) != 0) {
+        snprintf(output, output_size, "Error: the package is %s %s, the update index says %s", mf->name, mf->version,
+                 expect->version);
         goto done;
     }
     installed = cap_wasm_installed_manifest(mf->name, old);
@@ -492,13 +507,13 @@ static void cap_wasm_job_task(void *arg)
     } else if (strcmp(verb, "fw") == 0) {
         cap_wasm_fw_command(job->command + 2, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "install") == 0) {
-        cap_wasm_install(force ? b : a, NULL, force, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
+        cap_wasm_install(force ? b : a, NULL, NULL, force, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "updates") == 0) {
         cap_wasm_check_updates(output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "update") == 0 && strcmp(a, "all") == 0) {
         cap_wasm_update_all(&ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "update") == 0 && b[0]) {
-        cap_wasm_install(b, a, false, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
+        cap_wasm_install(b, a, NULL, false, false, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "update") == 0 && a[0]) {
         cap_wasm_update(a, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else if (strcmp(verb, "remove") == 0 && a[0]) {

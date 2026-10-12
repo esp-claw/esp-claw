@@ -1889,7 +1889,7 @@ static esp_err_t cap_wasm_install_execute(const char *input_json, const claw_cap
         snprintf(output, output_size, "Error: url (https, at most 255 chars) is required");
         return ESP_ERR_INVALID_ARG;
     }
-    return cap_wasm_install(url, NULL, false, false, ctx, output, output_size);
+    return cap_wasm_install(url, NULL, NULL, false, false, ctx, output, output_size);
 }
 
 static esp_err_t cap_wasm_remove_execute(const char *input_json, const claw_cap_call_context_t *ctx,
