@@ -656,30 +656,34 @@ NativeSymbol g_cap_wasm_natives[] = {
 };
 const size_t g_cap_wasm_native_count = sizeof(g_cap_wasm_natives) / sizeof(g_cap_wasm_natives[0]);
 
-bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm)
+bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm, uint16_t *out_api)
 {
+    /* Imports not listed need no permission and exist since api 1. */
     static const struct {
         const char *name;
         uint32_t perm;
+        uint16_t api;
     } perms[] = {
-        { "log", CAP_WASM_PERM_LOG },
-        { "kv_get", CAP_WASM_PERM_KV },
-        { "kv_set", CAP_WASM_PERM_KV },
-        { "kv_del", CAP_WASM_PERM_KV },
-        { "http_profile_request", CAP_WASM_PERM_HTTP },
-        { "http_response_read", CAP_WASM_PERM_HTTP },
-        { "confirm", CAP_WASM_PERM_CONFIRM },
-        { "ping", CAP_WASM_PERM_PING },
-        { "timer_set", CAP_WASM_PERM_TIMER },
-        { "notify", CAP_WASM_PERM_NOTIFY },
+        { "log", CAP_WASM_PERM_LOG, 1 },
+        { "kv_get", CAP_WASM_PERM_KV, 1 },
+        { "kv_set", CAP_WASM_PERM_KV, 1 },
+        { "kv_del", CAP_WASM_PERM_KV, 1 },
+        { "http_profile_request", CAP_WASM_PERM_HTTP, 1 },
+        { "http_response_read", CAP_WASM_PERM_HTTP, 1 },
+        { "confirm", CAP_WASM_PERM_CONFIRM, 1 },
+        { "ping", CAP_WASM_PERM_PING, 1 },
+        { "timer_set", CAP_WASM_PERM_TIMER, 1 },
+        { "notify", CAP_WASM_PERM_NOTIFY, 1 },
     };
 
     for (size_t i = 0; i < g_cap_wasm_native_count; i++) {
         if (strcmp(g_cap_wasm_natives[i].symbol, name) == 0) {
             *out_perm = 0;
+            *out_api = 1;
             for (size_t j = 0; j < sizeof(perms) / sizeof(perms[0]); j++) {
                 if (strcmp(perms[j].name, name) == 0) {
                     *out_perm = perms[j].perm;
+                    *out_api = perms[j].api;
                 }
             }
             return true;

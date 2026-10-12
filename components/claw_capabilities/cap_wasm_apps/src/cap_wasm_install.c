@@ -355,9 +355,9 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     }
     memcpy(manifest, pkg.manifest.data, pkg.manifest.len);
     memcpy(sig, pkg.signature.data, pkg.signature.len);
-    if (!cap_wasm_manifest_parse(manifest, NULL, mf, err, sizeof(err)) ||
+    if (!cap_wasm_manifest_parse(manifest, NULL, mf, err, sizeof(err)) || !cap_wasm_api_check(mf, err, sizeof(err)) ||
             !cap_wasm_sig_verify(sig, mf, pkg.manifest.data, pkg.manifest.len, pkg.wasm.data, pkg.wasm.len,
-                                 g_cap_wasm_trusted, g_cap_wasm_trusted_count, key_id, err, sizeof(err))) {
+                                 g_cap_wasm_trusted, g_cap_wasm_trusted_count, pkg.format, key_id, err, sizeof(err))) {
         snprintf(output, output_size, "Error: package rejected: %s", err);
         goto done;
     }

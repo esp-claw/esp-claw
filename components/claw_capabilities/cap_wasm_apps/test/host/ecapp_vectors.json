@@ -1,0 +1,33 @@
+{
+  "key": {
+    "seed_hex": "3e16305a023ddc044abf8acde3dc8795fdbcb7b52ed5a0090cfd9bbccbc8feb9",
+    "pub_hex": "1a55de3691aa4e445a40995b0cb20f8456eb5de20c654cf5f188f86a3c997636",
+    "pub_b64": "GlXeNpGqTkRaQJlbDLIPhFbrXeIMZUz18Yj4ajyZdjY=",
+    "key_id": "490d27f5"
+  },
+  "sig_v2": {
+    "manifest": "{\"name\":\"hello\",\"version\":\"1.2.3\",\"api\":2}",
+    "wasm_hex": "0061736d01000000",
+    "name": "hello",
+    "version": "1.2.3",
+    "api": 2,
+    "manifest_sha256": "cf10c53a24bf7d8e1b1d987ea72216c72b3a1c5f2e4d1781e350624d77f29e5a",
+    "wasm_sha256": "93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
+    "record_hex": "65636170702d7369672d7632000202000568656c6c6f05312e322e33cf10c53a24bf7d8e1b1d987ea72216c72b3a1c5f2e4d1781e350624d77f29e5a93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
+    "sig_b64": "N9OT2qmQ2H2MlrWmYvvevc1+1j7Txf4QsSZs0mH5i4JqTEVCbeptHoZx1LFD2hI/QzkjL7Wtpcfu1QBVExG9BQ==",
+    "signature_json": "{\"alg\":\"ed25519\",\"key_id\":\"490d27f5\",\"sdk\":2,\"sig\":\"N9OT2qmQ2H2MlrWmYvvevc1+1j7Txf4QsSZs0mH5i4JqTEVCbeptHoZx1LFD2hI/QzkjL7Wtpcfu1QBVExG9BQ==\"}"
+  },
+  "sig_v1": {
+    "canonical": "{\"name\":\"hello\",\"version\":\"1.2.3\",\"manifest_sha256\":\"cf10c53a24bf7d8e1b1d987ea72216c72b3a1c5f2e4d1781e350624d77f29e5a\",\"wasm_sha256\":\"93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476\"}",
+    "sig_b64": "D1j1rvWgObaJyoWyVS9JK4Hy1aoNaYFHzBX+cbPKH3cJlh/ByV+a05Ksuyur4qneKhglf7zTMNn8vOkZSz7bBQ==",
+    "signature_json": "{\"alg\":\"ed25519\",\"key_id\":\"490d27f5\",\"sdk\":1,\"signed\":{\"name\":\"hello\",\"version\":\"1.2.3\",\"manifest_sha256\":\"cf10c53a24bf7d8e1b1d987ea72216c72b3a1c5f2e4d1781e350624d77f29e5a\",\"wasm_sha256\":\"93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476\"},\"sig\":\"D1j1rvWgObaJyoWyVS9JK4Hy1aoNaYFHzBX+cbPKH3cJlh/ByV+a05Ksuyur4qneKhglf7zTMNn8vOkZSz7bBQ==\"}"
+  },
+  "index_v1": {
+    "index_json": "{\"format\":1,\"issued\":1780000000,\"expires\":1800000000,\"apps\":[{\"name\":\"hello\",\"version\":\"1.2.3\",\"url\":\"https://example.com/apps/hello-1.2.3.ecapp\",\"sha256\":\"1916c139223c961040b8c2215660c403c28c6fb110b9aa6915051ded2243a5fb\",\"size\":250},{\"name\":\"other\",\"version\":\"0.9.0\",\"url\":\"https://example.com/apps/other-0.9.0.ecapp\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"size\":1000}]}\n",
+    "issued": 1780000000,
+    "expires": 1800000000,
+    "record_hex": "65636170702d696e6465782d763100d22405a062411cac26d0885ecd1204621a3c9694a7f4b2f585751d3c9c35a1e500d2496b00000000",
+    "sig_b64": "dKzoS8dM5ofQG4L4ENs7e+dYq++E5xEnhArmoYgWmoPO3WKaFP7QRSXDKVXoBqGmAJi0qOjOcCKULsZB4hxABg==",
+    "index_sig": "{\"alg\":\"ed25519\",\"key_id\":\"490d27f5\",\"expires\":1800000000,\"sig\":\"dKzoS8dM5ofQG4L4ENs7e+dYq++E5xEnhArmoYgWmoPO3WKaFP7QRSXDKVXoBqGmAJi0qOjOcCKULsZB4hxABg==\"}\n"
+  }
+}

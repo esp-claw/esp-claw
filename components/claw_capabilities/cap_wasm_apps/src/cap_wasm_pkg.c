@@ -29,10 +29,12 @@ bool cap_wasm_pkg_parse(const uint8_t *buf, size_t len, cap_wasm_pkg_t *out, cha
     size_t off = 8;
 
     memset(out, 0, sizeof(*out));
-    if (len < off || memcmp(buf, "ECAP", 4) != 0 || buf[4] != 1 || buf[5] != 3 || buf[6] || buf[7]) {
-        snprintf(err, err_size, "not an .ecapp package (format 1)");
+    if (len < off || memcmp(buf, "ECAP", 4) != 0 || buf[4] < 1 || buf[4] > CAP_WASM_PKG_FORMAT_MAX || buf[5] != 3 ||
+            buf[6] || buf[7]) {
+        snprintf(err, err_size, "not an .ecapp package (format 1 or %d)", CAP_WASM_PKG_FORMAT_MAX);
         return false;
     }
+    out->format = buf[4];
     for (int e = 0; e < 3; e++) {
         size_t name_len = off < len ? buf[off] : 0;
         size_t i;
@@ -78,11 +80,45 @@ size_t cap_wasm_sig_canonical(const char *name, const char *version, const char 
     return n > 0 && (size_t)n < size ? (size_t)n : 0;
 }
 
+size_t cap_wasm_sig_record(uint16_t api, const char *name, const char *version,
+                           const uint8_t manifest_sha[CAP_WASM_SHA_LEN], const uint8_t wasm_sha[CAP_WASM_SHA_LEN],
+                           uint8_t *out, size_t size)
+{
+    size_t name_len = strlen(name);
+    size_t version_len = strlen(version);
+    size_t len = sizeof(CAP_WASM_SIG_V2_PREFIX) + 1 + 2 + 1 + name_len + 1 + version_len + 2 * CAP_WASM_SHA_LEN;
+    uint8_t *p = out;
+
+    if (name_len == 0 || name_len > CAP_WASM_APP_NAME_MAX || version_len == 0 || version_len > CAP_WASM_VERSION_MAX ||
+            len > size) {
+        return 0;
+    }
+    memcpy(p, CAP_WASM_SIG_V2_PREFIX, sizeof(CAP_WASM_SIG_V2_PREFIX)); /* including the NUL */
+    p += sizeof(CAP_WASM_SIG_V2_PREFIX);
+    *p++ = 2;
+    *p++ = (uint8_t)(api & 0xff);
+    *p++ = (uint8_t)(api >> 8);
+    *p++ = (uint8_t)name_len;
+    memcpy(p, name, name_len);
+    p += name_len;
+    *p++ = (uint8_t)version_len;
+    memcpy(p, version, version_len);
+    p += version_len;
+    memcpy(p, manifest_sha, CAP_WASM_SHA_LEN);
+    memcpy(p + CAP_WASM_SHA_LEN, wasm_sha, CAP_WASM_SHA_LEN);
+    return len;
+}
+
+void cap_wasm_sha256(const uint8_t *data, size_t len, uint8_t out[CAP_WASM_SHA_LEN])
+{
+    mbedtls_sha256(data, len, out, 0);
+}
+
 void cap_wasm_sha256_hex(const uint8_t *data, size_t len, char out[CAP_WASM_SHA_HEX_LEN + 1])
 {
-    uint8_t hash[32];
+    uint8_t hash[CAP_WASM_SHA_LEN];
 
-    mbedtls_sha256(data, len, hash, 0);
+    cap_wasm_sha256(data, len, hash);
     for (size_t i = 0; i < sizeof(hash); i++) {
         snprintf(out + 2 * i, 3, "%02x", hash[i]);
     }
@@ -120,56 +156,112 @@ static const char *cap_wasm_json_str(const cJSON *obj, const char *key)
     return cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, key));
 }
 
-bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
-                         const uint8_t *manifest, size_t manifest_len, const uint8_t *wasm, size_t wasm_len,
-                         const cap_wasm_key_t *keys, size_t key_count,
-                         char key_id[CAP_WASM_KEY_ID_LEN + 1], char *err, size_t err_size)
+/*
+ * Format 1: the "signed" object must repeat the manifest's name and version and the hex hashes of
+ * the entries; the signature is over its canonical JSON. Returns the signed bytes in `msg`.
+ */
+static bool cap_wasm_sig_v1_message(const cJSON *root, const cap_wasm_manifest_t *mf,
+                                    const uint8_t *manifest, size_t manifest_len, const uint8_t *wasm, size_t wasm_len,
+                                    uint8_t *msg, size_t msg_size, size_t *msg_len, char *err, size_t err_size)
 {
-    static const char *const keys_top[] = {"alg", "key_id", "sdk", "signed", "sig"};
     static const char *const keys_signed[] = {"name", "version", "manifest_sha256", "wasm_sha256"};
-    cJSON *root = cJSON_Parse(sig_json);
-    const cJSON *sdk = cJSON_GetObjectItemCaseSensitive(root, "sdk");
     const cJSON *sig_obj = cJSON_GetObjectItemCaseSensitive(root, "signed");
-    const char *alg = cap_wasm_json_str(root, "alg");
-    const char *kid = cap_wasm_json_str(root, "key_id");
-    const char *sig_b64 = cap_wasm_json_str(root, "sig");
     const char *s_name = cap_wasm_json_str(sig_obj, "name");
     const char *s_version = cap_wasm_json_str(sig_obj, "version");
     const char *s_manifest = cap_wasm_json_str(sig_obj, "manifest_sha256");
     const char *s_wasm = cap_wasm_json_str(sig_obj, "wasm_sha256");
     char manifest_hex[CAP_WASM_SHA_HEX_LEN + 1];
     char wasm_hex[CAP_WASM_SHA_HEX_LEN + 1];
-    char canonical[320];
-    uint8_t sig[64];
-    size_t canonical_len;
-    size_t k;
-    bool ok = false;
 
-    if (!cJSON_IsObject(root) || !cJSON_IsObject(sig_obj)) {
+    if (!cJSON_IsObject(sig_obj)) {
         snprintf(err, err_size, "signature.json is not a signature object");
-        goto done;
+        return false;
     }
-    if (!cap_wasm_keys_known(root, keys_top, 5, "signature key", err, err_size) ||
-            !cap_wasm_keys_known(sig_obj, keys_signed, 4, "signed key", err, err_size)) {
-        goto done;
+    if (!cap_wasm_keys_known(sig_obj, keys_signed, 4, "signed key", err, err_size)) {
+        return false;
     }
-    if (!alg || strcmp(alg, "ed25519") != 0 || !kid || !sig_b64 || !s_name || !s_version || !s_manifest || !s_wasm) {
+    if (!s_name || !s_version || !s_manifest || !s_wasm) {
         snprintf(err, err_size, "signature.json needs alg \"ed25519\", key_id, sig and all signed fields");
-        goto done;
-    }
-    if (!cJSON_IsNumber(sdk) || sdk->valuedouble != CAP_WASM_SDK_VERSION) {
-        snprintf(err, err_size, "unsupported sdk version (device supports %d)", CAP_WASM_SDK_VERSION);
-        goto done;
+        return false;
     }
     if (strcmp(s_name, mf->name) != 0 || strcmp(s_version, mf->version) != 0) {
         snprintf(err, err_size, "signed name/version do not match manifest.json");
-        goto done;
+        return false;
     }
     cap_wasm_sha256_hex(manifest, manifest_len, manifest_hex);
     cap_wasm_sha256_hex(wasm, wasm_len, wasm_hex);
     if (strcmp(s_manifest, manifest_hex) != 0 || strcmp(s_wasm, wasm_hex) != 0) {
         snprintf(err, err_size, "%s does not match its signed hash",
                  strcmp(s_manifest, manifest_hex) != 0 ? "manifest.json" : "app.wasm");
+        return false;
+    }
+    *msg_len = cap_wasm_sig_canonical(s_name, s_version, s_manifest, s_wasm, (char *)msg, msg_size);
+    return *msg_len != 0;
+}
+
+/* Format 2: the signed record is built from the manifest and the entry bytes; nothing is repeated. */
+static bool cap_wasm_sig_v2_message(const cap_wasm_manifest_t *mf, const uint8_t *manifest, size_t manifest_len,
+                                    const uint8_t *wasm, size_t wasm_len, uint8_t *msg, size_t msg_size,
+                                    size_t *msg_len, char *err, size_t err_size)
+{
+    uint8_t manifest_sha[CAP_WASM_SHA_LEN];
+    uint8_t wasm_sha[CAP_WASM_SHA_LEN];
+
+    if (!mf->has_api) {
+        snprintf(err, err_size, "a format 2 package needs \"api\" in manifest.json");
+        return false;
+    }
+    cap_wasm_sha256(manifest, manifest_len, manifest_sha);
+    cap_wasm_sha256(wasm, wasm_len, wasm_sha);
+    *msg_len = cap_wasm_sig_record(mf->api, mf->name, mf->version, manifest_sha, wasm_sha, msg, msg_size);
+    return *msg_len != 0;
+}
+
+bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
+                         const uint8_t *manifest, size_t manifest_len, const uint8_t *wasm, size_t wasm_len,
+                         const cap_wasm_key_t *keys, size_t key_count, int expect_format,
+                         char key_id[CAP_WASM_KEY_ID_LEN + 1], char *err, size_t err_size)
+{
+    static const char *const keys_v1[] = {"alg", "key_id", "sdk", "signed", "sig"};
+    static const char *const keys_v2[] = {"alg", "key_id", "sdk", "sig"};
+    cJSON *root = cJSON_Parse(sig_json);
+    const cJSON *sdk = cJSON_GetObjectItemCaseSensitive(root, "sdk");
+    const char *alg = cap_wasm_json_str(root, "alg");
+    const char *kid = cap_wasm_json_str(root, "key_id");
+    const char *sig_b64 = cap_wasm_json_str(root, "sig");
+    uint8_t msg[320]; /* a format 1 canonical object, or a format 2 record */
+    uint8_t sig[64];
+    size_t msg_len = 0;
+    size_t k;
+    int format;
+    bool ok = false;
+
+    if (!cJSON_IsObject(root)) {
+        snprintf(err, err_size, "signature.json is not a signature object");
+        goto done;
+    }
+    if (!cJSON_IsNumber(sdk) || sdk->valuedouble < 1 || sdk->valuedouble > CAP_WASM_PKG_FORMAT_MAX ||
+            sdk->valuedouble != (double)(int)sdk->valuedouble) {
+        snprintf(err, err_size, "unsupported sdk version (device supports 1-%d)", CAP_WASM_PKG_FORMAT_MAX);
+        goto done;
+    }
+    format = (int)sdk->valuedouble;
+    if (expect_format && format != expect_format) {
+        snprintf(err, err_size, "signature format %d in a format %d package", format, expect_format);
+        goto done;
+    }
+    if (!cap_wasm_keys_known(root, format == 1 ? keys_v1 : keys_v2, format == 1 ? 5 : 4, "signature key", err,
+                             err_size)) {
+        goto done;
+    }
+    if (!alg || strcmp(alg, "ed25519") != 0 || !kid || !sig_b64) {
+        snprintf(err, err_size, "signature.json needs alg \"ed25519\", key_id, sig and all signed fields");
+        goto done;
+    }
+    if (format == 1 ? !cap_wasm_sig_v1_message(root, mf, manifest, manifest_len, wasm, wasm_len, msg, sizeof(msg),
+                                                &msg_len, err, err_size) :
+            !cap_wasm_sig_v2_message(mf, manifest, manifest_len, wasm, wasm_len, msg, sizeof(msg), &msg_len, err,
+                                     err_size)) {
         goto done;
     }
     for (k = 0; k < key_count && strcmp(keys[k].key_id, kid) != 0; k++) {
@@ -178,9 +270,7 @@ bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
         snprintf(err, err_size, "signed by untrusted key %.8s", kid);
         goto done;
     }
-    canonical_len = cap_wasm_sig_canonical(s_name, s_version, s_manifest, s_wasm, canonical, sizeof(canonical));
-    if (!cap_wasm_b64_decode(sig_b64, sig, sizeof(sig)) || canonical_len == 0 ||
-            crypto_ed25519_check(sig, keys[k].pub, (const uint8_t *)canonical, canonical_len) != 0) {
+    if (!cap_wasm_b64_decode(sig_b64, sig, sizeof(sig)) || crypto_ed25519_check(sig, keys[k].pub, msg, msg_len) != 0) {
         snprintf(err, err_size, "invalid signature (key %s)", keys[k].key_id);
         goto done;
     }
@@ -190,6 +280,15 @@ bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
 done:
     cJSON_Delete(root);
     return ok;
+}
+
+bool cap_wasm_api_check(const cap_wasm_manifest_t *mf, char *err, size_t err_size)
+{
+    if (mf->api > CAP_WASM_API_VERSION) {
+        snprintf(err, err_size, "needs claw api %u, firmware has %u", (unsigned)mf->api, CAP_WASM_API_VERSION);
+        return false;
+    }
+    return true;
 }
 
 size_t cap_wasm_fw_sig_canonical(const char *project, const char *version, uint32_t size, const char *sha256,

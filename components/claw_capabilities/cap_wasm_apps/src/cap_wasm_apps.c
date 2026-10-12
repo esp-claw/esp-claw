@@ -589,12 +589,18 @@ static bool cap_wasm_check_imports(cap_wasm_app_t *app)
     for (int32_t i = 0; i < count; i++) {
         wasm_import_t imp;
         uint32_t perm = 0;
+        uint16_t api = 0;
 
         wasm_runtime_get_import_type(app->module, i, &imp);
         if (imp.kind != WASM_IMPORT_EXPORT_KIND_FUNC || strcmp(imp.module_name, "claw") != 0 ||
-                !cap_wasm_host_import_perm(imp.name, &perm)) {
+                !cap_wasm_host_import_perm(imp.name, &perm, &api)) {
             cap_wasm_set_error(app, "imports unknown symbol %s.%s (only claw.* host functions exist)",
                                imp.module_name, imp.name);
+            return false;
+        }
+        if (api > app->mf.api) {
+            cap_wasm_set_error(app, "imports claw.%s, which needs api %u, but the manifest declares api %u", imp.name,
+                               (unsigned)api, (unsigned)app->mf.api);
             return false;
         }
         if ((app->mf.perms & perm) != perm) {
@@ -630,7 +636,8 @@ static char *cap_wasm_read_verified(cap_wasm_app_t *app, size_t *wasm_size)
         cap_wasm_set_error(app, "manifest.json missing or larger than %d bytes", CAP_WASM_MANIFEST_MAX);
         return NULL;
     }
-    if (!cap_wasm_manifest_parse(manifest, app->name, &app->mf, err, sizeof(err))) {
+    if (!cap_wasm_manifest_parse(manifest, app->name, &app->mf, err, sizeof(err)) ||
+            !cap_wasm_api_check(&app->mf, err, sizeof(err))) {
         cap_wasm_set_error(app, "manifest.json: %s", err);
         goto done;
     }
@@ -647,7 +654,7 @@ static char *cap_wasm_read_verified(cap_wasm_app_t *app, size_t *wasm_size)
     snprintf(err, sizeof(err), "no signature.json");
     if (sig && cap_wasm_sig_verify(sig, &app->mf, (const uint8_t *)manifest, manifest_size,
                                    (const uint8_t *)wasm, *wasm_size, g_cap_wasm_trusted,
-                                   g_cap_wasm_trusted_count, app->key_id, err, sizeof(err))) {
+                                   g_cap_wasm_trusted_count, 0, app->key_id, err, sizeof(err))) {
         goto done;
     }
     app->key_id[0] = '\0';

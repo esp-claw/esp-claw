@@ -260,13 +260,16 @@ static bool cap_wasm_parse_settings(const cJSON *settings, cap_wasm_manifest_t *
 bool cap_wasm_manifest_parse(const char *json, const char *dir_name, cap_wasm_manifest_t *out,
                              char *err, size_t err_size)
 {
-    static const char *const keys[] = {"name", "version", "description", "permissions", "limits", "settings"};
+    static const char *const keys[] = {"name", "version", "api", "description", "permissions", "limits", "settings"};
     static const char *const limit_keys[] = {"memory_kb", "call_timeout_ms"};
     cJSON *root = cJSON_Parse(json);
+    const cJSON *api = cJSON_GetObjectItemCaseSensitive(root, "api");
     const cJSON *limits = NULL;
+    uint32_t api_value = 1;
     bool ok = false;
 
     memset(out, 0, sizeof(*out));
+    out->api = 1;
     out->memory_kb = CAP_WASM_MEMORY_KB_DEFAULT;
     out->call_timeout_ms = CAP_WASM_CALL_MS_DEFAULT;
 
@@ -298,6 +301,12 @@ bool cap_wasm_manifest_parse(const char *json, const char *dir_name, cap_wasm_ma
         snprintf(err, err_size, "version may only contain [A-Za-z0-9.+-]");
         goto done;
     }
+    /* Absent in manifests of format 1 packages, which were written for api 1. */
+    if (!cap_wasm_parse_int(api, "api", 1, CAP_WASM_API_MAX, &api_value, err, err_size)) {
+        goto done;
+    }
+    out->api = (uint16_t)api_value;
+    out->has_api = api != NULL;
     if (!cap_wasm_parse_permissions(cJSON_GetObjectItemCaseSensitive(root, "permissions"), out, err, err_size) ||
             !cap_wasm_parse_settings(cJSON_GetObjectItemCaseSensitive(root, "settings"), out, err, err_size)) {
         goto done;

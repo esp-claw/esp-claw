@@ -113,8 +113,8 @@ extern cap_wasm_call_t g_cap_wasm_call;
 extern NativeSymbol g_cap_wasm_natives[];
 extern const size_t g_cap_wasm_native_count;
 
-/* Permission a "claw" import needs (0 = always allowed); false for unknown imports. */
-bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm);
+/* Permission a "claw" import needs (0 = always allowed) and the api version that added it; false for unknown imports. */
+bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm, uint16_t *out_api);
 
 /* Registers a tool for the app being initialised; returns its local index or -errno. */
 int32_t cap_wasm_tool_add(cap_wasm_app_t *app, const char *name, uint32_t name_len,

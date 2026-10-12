@@ -34,6 +34,8 @@
 #define CAP_WASM_TIMER_MIN_S         60  /* firmware floor of permissions.timer.min_interval_s */
 #define CAP_WASM_TIMER_MAX_S         (7 * 24 * 3600)
 
+#define CAP_WASM_API_MAX             65535 /* manifest "api" is a u16 in the format 2 signature record */
+
 typedef enum {
     CAP_WASM_PERM_LOG = 1 << 0,
     CAP_WASM_PERM_KV = 1 << 1,
@@ -64,6 +66,8 @@ typedef struct {
     char name[CAP_WASM_APP_NAME_MAX + 1];
     char version[CAP_WASM_VERSION_MAX + 1];
     char description[CAP_WASM_DESC_MAX + 1];
+    uint16_t api;      /* "api": the claw import module version the app was built for; 1 when absent */
+    bool has_api;      /* "api" is present (required by format 2 packages) */
     uint32_t perms;
     char http_profiles[CAP_WASM_MAX_PROFILES][CAP_WASM_PROFILE_NAME_MAX + 1];
     uint32_t http_profile_count;

@@ -10,15 +10,36 @@
  * cJSON + mbedTLS (SHA-256, base64) + Monocypher (Ed25519) so it can be unit-tested on the host.
  * tools/ecapp.py of github.com/esp-claw/app-sdk is the host side.
  *
- * Package: "ECAP", u8 format (1), u8 entry count (3), u16 reserved (0), then per entry
+ * Package: "ECAP", u8 format (1 or 2), u8 entry count (3), u16 reserved (0), then per entry
  * u8 name length, name, u32 little-endian data length, data. The entries are exactly
  * manifest.json, app.wasm and signature.json, in any order, with nothing after the last one.
  *
- * signature.json: {"alg":"ed25519","key_id":"<8 hex>","sdk":1,"signed":{...},"sig":"<base64>"}.
+ * signature.json, format 1 (still accepted):
+ *   {"alg":"ed25519","key_id":"<8 hex>","sdk":1,"signed":{...},"sig":"<base64>"}
  * "sig" is the Ed25519 signature over the canonical bytes of "signed":
  *   {"name":"<name>","version":"<version>","manifest_sha256":"<hex>","wasm_sha256":"<hex>"}
  * in exactly this key order, no whitespace, lowercase hex (64 chars). Names and versions cannot
  * contain characters JSON would escape. key_id is the first 8 hex chars of sha256(public key).
+ *
+ * signature.json, format 2: {"alg":"ed25519","key_id":"<8 hex>","sdk":2,"sig":"<base64>"}.
+ * There is no "signed" object: "sig" is the Ed25519 signature over this binary record, built by
+ * the verifier from the manifest and the entry bytes (cap_wasm_sig_record()):
+ *
+ *   offset  size  value
+ *   0       13    "ecapp-sig-v2" followed by one NUL byte (domain separation)
+ *   13      1     u8 format = 2
+ *   14      2     u16 little-endian api (manifest "api", the claw import module version)
+ *   16      1     u8 name length N (1..24)
+ *   17      N     name, as in the manifest (no NUL)
+ *   17+N    1     u8 version length V (1..16)
+ *   18+N    V     version, as in the manifest (no NUL)
+ *   18+N+V  32    SHA-256 of the manifest.json bytes
+ *   50+N+V  32    SHA-256 of the app.wasm bytes
+ *
+ * At most 122 bytes. Format 2 packages must declare "api" in the manifest. The package format
+ * byte and the signature's "sdk" value are the same number (1 or 2) and must agree.
+ * test/host/ecapp_vectors.json holds a test key, a record and its signature; the SDK ships the
+ * same file.
  */
 
 #include <stdbool.h>
@@ -31,10 +52,15 @@
 #define CAP_WASM_WASM_MAX        (256 * 1024)
 #define CAP_WASM_MANIFEST_MAX    4096
 #define CAP_WASM_SIGNATURE_MAX   1024
-#define CAP_WASM_SDK_VERSION     1
+#define CAP_WASM_PKG_FORMAT_MAX  2    /* highest signature.json "sdk" / package format accepted */
+#define CAP_WASM_API_VERSION     1    /* claw import module version this firmware implements */
 #define CAP_WASM_KEY_ID_LEN      8
+#define CAP_WASM_SHA_LEN         32
 #define CAP_WASM_SHA_HEX_LEN     64
 #define CAP_WASM_MAX_TRUSTED     8
+#define CAP_WASM_SIG_V2_PREFIX   "ecapp-sig-v2"
+#define CAP_WASM_SIG_V2_MAX      (sizeof(CAP_WASM_SIG_V2_PREFIX) + 1 + 2 + 1 + CAP_WASM_APP_NAME_MAX + 1 + \
+                                  CAP_WASM_VERSION_MAX + 2 * CAP_WASM_SHA_LEN)
 
 typedef struct {
     const uint8_t *data;
@@ -45,6 +71,7 @@ typedef struct {
     cap_wasm_blob_t manifest;
     cap_wasm_blob_t wasm;
     cap_wasm_blob_t signature;
+    uint8_t format;
 } cap_wasm_pkg_t;
 
 typedef struct {
@@ -55,25 +82,35 @@ typedef struct {
 /* Splits a package into its entries (pointing into `buf`). */
 bool cap_wasm_pkg_parse(const uint8_t *buf, size_t len, cap_wasm_pkg_t *out, char *err, size_t err_size);
 
-/* Writes the canonical signed bytes; returns their length, or 0 when `size` is too small. */
+/* Writes the canonical signed bytes of a format 1 signature; returns their length, or 0 when `size` is too small. */
 size_t cap_wasm_sig_canonical(const char *name, const char *version, const char *manifest_sha256,
                               const char *wasm_sha256, char *out, size_t size);
 
-/* Lowercase hex SHA-256 of `data`. */
+/* Writes the format 2 signature record (see above); returns its length, or 0 when `size` is too small. */
+size_t cap_wasm_sig_record(uint16_t api, const char *name, const char *version,
+                           const uint8_t manifest_sha[CAP_WASM_SHA_LEN], const uint8_t wasm_sha[CAP_WASM_SHA_LEN],
+                           uint8_t *out, size_t size);
+
+/* SHA-256 of `data`, raw and as lowercase hex. */
+void cap_wasm_sha256(const uint8_t *data, size_t len, uint8_t out[CAP_WASM_SHA_LEN]);
 void cap_wasm_sha256_hex(const uint8_t *data, size_t len, char out[CAP_WASM_SHA_HEX_LEN + 1]);
 
 /* Decodes a base64 raw 32-byte Ed25519 public key and derives its key_id. */
 bool cap_wasm_key_parse(const char *b64, cap_wasm_key_t *out);
 
 /*
- * Checks signature.json for the app `mf` describes: the format, sdk version, name and version
+ * Checks signature.json for the app `mf` describes: the format, name, version and (format 2) api
  * against the manifest, both hashes against the bytes, key_id against `keys` and the Ed25519
- * signature. On success `key_id` is the signing key's id.
+ * signature. `expect_format` is the package format byte, or 0 when the files come from the app
+ * directory. On success `key_id` is the signing key's id.
  */
 bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
                          const uint8_t *manifest, size_t manifest_len, const uint8_t *wasm, size_t wasm_len,
-                         const cap_wasm_key_t *keys, size_t key_count,
+                         const cap_wasm_key_t *keys, size_t key_count, int expect_format,
                          char key_id[CAP_WASM_KEY_ID_LEN + 1], char *err, size_t err_size);
+
+/* False with `err` ("needs claw api N, firmware has M") when the manifest's api is above CAP_WASM_API_VERSION. */
+bool cap_wasm_api_check(const cap_wasm_manifest_t *mf, char *err, size_t err_size);
 
 /*
  * Firmware signature (<image>.sig.json, written by tools/fwsign.py):
