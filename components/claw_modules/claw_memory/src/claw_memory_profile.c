@@ -80,6 +80,9 @@ esp_err_t claw_memory_profile_init_defaults(void)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    if (claw_memory_recover_atomic_file(s_memory.user_path) != ESP_OK) {
+        return ESP_FAIL;
+    }
     if (ensure_file_with_default(s_memory.soul_path, default_soul) != ESP_OK ||
         ensure_file_with_default(s_memory.identity_path, default_identity) != ESP_OK ||
         ensure_file_with_default(s_memory.user_path, default_user) != ESP_OK) {

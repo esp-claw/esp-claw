@@ -815,6 +815,38 @@ esp_err_t write_file_atomic(const char *path, const char *text)
     return ESP_OK;
 }
 
+/* Boot-time recovery for write_file_atomic() targets that have no content
+ * validation (USER.md, MEMORY.md). Must run before ensure_file_with_default(). */
+esp_err_t claw_memory_recover_atomic_file(const char *path)
+{
+    char bak[CLAW_MEMORY_MAX_PATH + 8];
+    char old[CLAW_MEMORY_MAX_PATH + 8];
+    struct stat st = {0};
+
+    if (!path) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak) ||
+        snprintf(old, sizeof(old), "%s.old", path) >= (int)sizeof(old)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (stat(old, &st) != 0) {
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    }
+    if (stat(path, &st) != 0) {
+        /* Interrupted between rename(path, old) and rename(tmp, path): .old is
+         * the last committed version. */
+        if (errno != ENOENT || rename(old, path) != 0) {
+            return ESP_FAIL;
+        }
+        return ESP_OK;
+    }
+    /* Target is committed; finish the interrupted backup rotation. */
+    (void)unlink(bak);
+    (void)rename(old, bak);
+    return ESP_OK;
+}
+
 esp_err_t append_file_text(const char *path, const char *text)
 {
     FILE *file = NULL;

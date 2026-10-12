@@ -110,6 +110,7 @@ esp_err_t ensure_file_with_default(const char *path, const char *default_text);
 esp_err_t claw_memory_join_path(char *dst, size_t dst_size, const char *dir, const char *name);
 
 esp_err_t write_file_atomic(const char *path, const char *text);
+esp_err_t claw_memory_recover_atomic_file(const char *path);
 
 /* Recursive lock around all memory files (records, index, profile files,
  * session logs, vectors). Never held across network calls. */

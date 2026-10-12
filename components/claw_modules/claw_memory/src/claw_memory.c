@@ -419,6 +419,9 @@ esp_err_t claw_memory_init(const claw_memory_config_t *config)
         if (err == ESP_OK) {
             err = claw_memory_index_prepare_for_default();
         }
+        if (err == ESP_OK) {
+            err = claw_memory_recover_atomic_file(s_memory.markdown_path);
+        }
         if (err != ESP_OK) {
             return claw_memory_enter_storage_degraded(
                 "interrupted files could not be recovered", err == ESP_ERR_INVALID_STATE);

@@ -569,6 +569,45 @@ static void test_storage_check_reports_and_repairs_degraded_records(void)
     s_memory.initialized = 1;
 }
 
+/* Stale .old with a committed target must not block later atomic writes. */
+static void test_atomic_file_stale_old_does_not_block_write(void)
+{
+    char path[256];
+    char old_path[300];
+    char *actual;
+
+    snprintf(path, sizeof(path), "%s.user", s_memory.index_path);
+    snprintf(old_path, sizeof(old_path), "%s.old", path);
+    write_text(path, "new");
+    write_text(old_path, "prev");
+    CHECK(write_file_atomic(path, "next") == ESP_ERR_INVALID_STATE);
+    CHECK(claw_memory_recover_atomic_file(path) == ESP_OK);
+    CHECK(access(old_path, F_OK) != 0);
+    CHECK(write_file_atomic(path, "next") == ESP_OK);
+    actual = read_text(path);
+    CHECK(actual && strcmp(actual, "next") == 0);
+    free(actual);
+}
+
+/* Missing target with .old must restore the last committed content, not defaults. */
+static void test_atomic_file_missing_target_restores_old(void)
+{
+    char path[256];
+    char old_path[300];
+    char *actual;
+
+    snprintf(path, sizeof(path), "%s.memory", s_memory.index_path);
+    snprintf(old_path, sizeof(old_path), "%s.old", path);
+    unlink(path);
+    write_text(old_path, "committed");
+    CHECK(claw_memory_recover_atomic_file(path) == ESP_OK);
+    CHECK(ensure_file_with_default(path, "default") == ESP_OK);
+    actual = read_text(path);
+    CHECK(actual && strcmp(actual, "committed") == 0);
+    free(actual);
+    CHECK(access(old_path, F_OK) != 0);
+}
+
 int main(void)
 {
     char dir[] = "/tmp/claw-memory-index-XXXXXX";
@@ -597,6 +636,8 @@ int main(void)
     test_record_validation_rejects_embedded_nul_tail();
     test_record_validation_accepts_legacy_schema();
     test_storage_check_reports_and_repairs_degraded_records();
+    test_atomic_file_stale_old_does_not_block_write();
+    test_atomic_file_missing_target_restores_old();
 
     if (s_failures) {
         fprintf(stderr, "%d memory index recovery test(s) failed\n", s_failures);
