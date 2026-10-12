@@ -17,6 +17,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "claw_storage_guard.h"
 
 static const char *TAG = "http_server";
 
@@ -150,14 +151,26 @@ bool http_server_build_child_relative_path(const char *base_path,
  * value (ENOSPC when the volume is full); the partial file is removed on error. */
 int http_server_recv_to_file(httpd_req_t *req, const char *path)
 {
+    esp_err_t space_err = claw_storage_check_write(http_server_ctx()->storage_base_path,
+                                                   req->content_len);
+    if (space_err != ESP_OK) {
+        return space_err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+    }
     char *scratch = http_server_alloc_scratch_buffer();
     if (!scratch) {
         return ENOMEM;
     }
+    space_err = claw_storage_begin_write(http_server_ctx()->storage_base_path, req->content_len);
+    if (space_err != ESP_OK) {
+        free(scratch);
+        return space_err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+    }
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    int open_errno = errno;
+    claw_storage_end_write();
     if (fd < 0) {
         free(scratch);
-        return errno ? errno : EIO;
+        return open_errno ? open_errno : EIO;
     }
 
     int rc = 0;
@@ -172,10 +185,17 @@ int http_server_recv_to_file(httpd_req_t *req, const char *path)
             rc = EIO;
             break;
         }
+        space_err = claw_storage_begin_write(http_server_ctx()->storage_base_path, received);
+        if (space_err != ESP_OK) {
+            rc = space_err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+            break;
+        }
         ssize_t written = write(fd, scratch, received);
+        int write_errno = errno;
+        claw_storage_end_write();
         if (written != received) {
             /* FAT reports a full volume as a short write or ENOSPC. */
-            rc = (written >= 0 || errno == ENOSPC) ? ENOSPC : (errno ? errno : EIO);
+            rc = (written >= 0 || write_errno == ENOSPC) ? ENOSPC : (write_errno ? write_errno : EIO);
             break;
         }
         remaining -= received;

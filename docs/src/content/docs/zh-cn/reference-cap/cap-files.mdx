@@ -83,6 +83,12 @@ cap_files_ensure_parent_dirs(resolved_path);
 // 依次创建 /fatfs → /fatfs/notes → /fatfs/notes/2026 ...
 ```
 
+### 用户文件区配额
+
+DATA 根目录中除系统目录（`apps`、`inbox`、`memory`、`router_rules`、`scheduler`、`scripts`、`sessions`、`skills`、`static`）之外的区域为用户文件区。写入该区域的 `write_file`、`copy_file` 和从系统目录移入的 `move_file` 受单文件 32 KB、总量 128 KB 的限制（`cap_files_quota.h`）。错误提示会建议使用 `remote_write_file`（cap_ssh），将工作文件存放在远程主机。上述内容配额不适用于系统目录内部。
+
+文件写入还会在打开目标文件之前检查文件系统的真实剩余空间，保留 128 KiB 的恢复空间以及分配余量。通过文件工具写入系统目录也受此检查约束。可使用 Telegram `/storage` 查看空间并预览清理，无需调用 LLM。
+
 ### `copy_file` / `move_file`：路径约束与目录补齐
 
 `copy_file` 和 `move_file` 都要求源路径与目标路径位于受管根目录下，且两者不能相同。

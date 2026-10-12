@@ -10,11 +10,17 @@
 #include <stdbool.h>
 #include <string.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
 #include "ramfs.h"
 #include "wear_levelling.h"
+#include "diskio_wl.h"
+#include "ff.h"
+#if defined(CONFIG_ESP_BOARD_DEV_FS_FAT_SUPPORT)
+#include "diskio_sdmmc.h"
+#endif
 #include "esp_vfs_fat.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -36,6 +42,29 @@ static const char *const s_ramfs_base_path = "/ramfs";
 static const char *const s_recovery_dir_name = ".recovery";
 
 static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
+static size_t s_storage_allocation_unit;
+
+/* Read the mounted volume: the formatting hint is not necessarily the geometry
+ * of an existing flash image or an SD card formatted elsewhere. */
+static size_t storage_allocation_unit(BYTE drive_number)
+{
+    char drive[8];
+    FATFS *fs = NULL;
+    DWORD free_clusters;
+
+    if (drive_number >= FF_VOLUMES) {
+        return 0;
+    }
+    snprintf(drive, sizeof(drive), "%u:", (unsigned)drive_number);
+    if (f_getfree(drive, &free_clusters, &fs) != FR_OK || !fs) {
+        return 0;
+    }
+#if FF_MAX_SS != FF_MIN_SS
+    return (size_t)fs->csize * fs->ssize;
+#else
+    return (size_t)fs->csize * FF_MIN_SS;
+#endif
+}
 
 // Active mount point of the writable storage: the flash fatfs partition by
 // default, or the SD card's own mount point (taken from the device handle)
@@ -58,10 +87,10 @@ static void log_fatfs_info(const char *base_path)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to query FATFS info for %s: %s", base_path, esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "FATFS at %s total=%u used=%u",
+        ESP_LOGI(TAG, "FATFS at %s total=%" PRIu64 " used=%" PRIu64,
                  base_path,
-                 (unsigned int)total,
-                 (unsigned int)(total - free_bytes));
+                 total,
+                 total - free_bytes);
     }
 }
 
@@ -176,6 +205,7 @@ static const char *storage_sdcard_mount_point(void)
         return NULL;
     }
 
+    s_storage_allocation_unit = storage_allocation_unit(ff_diskio_get_pdrv_card(handle->card));
     return handle->mount_point;
 }
 #endif  /* CONFIG_ESP_BOARD_DEV_FS_FAT_SUPPORT */
@@ -247,6 +277,7 @@ static esp_err_t app_fs_init_storage(void)
         ESP_LOGE(TAG, "Flash fatfs mount failed: %s", esp_err_to_name(err));
         return err;
     }
+    s_storage_allocation_unit = storage_allocation_unit(ff_diskio_get_pdrv_wl(s_wl_handle));
 
     // 3. Restore any files present under /system/.recovery but missing from the
     //    fatfs partition (covers both a freshly formatted partition and partial
@@ -263,6 +294,11 @@ static esp_err_t app_fs_init_storage(void)
 const char *app_fs_storage_base_path(void)
 {
     return s_storage_base_path;
+}
+
+size_t app_fs_storage_allocation_unit(void)
+{
+    return s_storage_allocation_unit;
 }
 
 const char *app_fs_system_base_path(void)

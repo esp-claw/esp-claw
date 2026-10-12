@@ -19,6 +19,7 @@
 #include "cJSON.h"
 #include "claw_cap.h"
 #include "claw_paths.h"
+#include "claw_storage_guard.h"
 #include "esp_log.h"
 
 static const char *TAG = "cap_files";
@@ -208,15 +209,22 @@ static bool cap_files_quota_ok(const char *path, size_t size, char *output, size
 static esp_err_t cap_files_ensure_dir(const char *path)
 {
     struct stat st = {0};
+    esp_err_t err;
 
     if (stat(path, &st) == 0) {
         return S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
     }
 
+    err = claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA), 0);
+    if (err != ESP_OK) {
+        return err;
+    }
     if (mkdir(path, 0755) != 0 && errno != EEXIST) {
         ESP_LOGE(TAG, "mkdir %s: errno=%d", path, errno);
+        claw_storage_end_write();
         return ESP_FAIL;
     }
+    claw_storage_end_write();
 
     return ESP_OK;
 }
@@ -375,11 +383,11 @@ static esp_err_t cap_files_copy_file_internal(const char *src_path, const char *
         return ESP_FAIL;
     }
 
-    dst = fopen(dst_path, "wb");
-    if (!dst) {
+    err = claw_storage_open_write(claw_paths_get(CLAW_PATH_DATA), dst_path, (size_t)st.st_size, &dst);
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "fopen dst %s: errno=%d", dst_path, errno);
         fclose(src);
-        return ESP_FAIL;
+        return err;
     }
 
     while (!feof(src)) {
@@ -397,8 +405,15 @@ static esp_err_t cap_files_copy_file_internal(const char *src_path, const char *
         }
     }
 
-    fclose(dst);
-    fclose(src);
+    if (fclose(dst) != 0) {
+        ESP_LOGE(TAG, "fclose %s: errno=%d", dst_path, errno);
+        err = ESP_FAIL;
+    }
+    claw_storage_end_write();
+    if (fclose(src) != 0 && err == ESP_OK) {
+        ESP_LOGE(TAG, "fclose %s: errno=%d", src_path, errno);
+        err = ESP_FAIL;
+    }
 
     if (err != ESP_OK) {
         unlink(dst_path);
@@ -500,6 +515,8 @@ static esp_err_t cap_files_write_file_execute(const char *input_json,
     FILE *file = NULL;
     size_t content_len;
     size_t written;
+    esp_err_t guard_err;
+    bool close_failed = false;
 
     (void)ctx;
 
@@ -522,35 +539,41 @@ static esp_err_t cap_files_write_file_execute(const char *input_json,
         return ESP_ERR_INVALID_ARG;
     }
 
+    content_len = strlen(content);
+
     if (!cap_files_path_is_writable(resolved_path)) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: read-only path: %s", resolved_path);
         return ESP_ERR_INVALID_ARG;
     }
-    if (!cap_files_quota_ok(resolved_path, strlen(content), output, output_size)) {
+    if (!cap_files_quota_ok(resolved_path, content_len, output, output_size)) {
         cJSON_Delete(root);
         return ESP_ERR_INVALID_SIZE;
     }
-
     if (cap_files_ensure_parent_dirs(resolved_path) != ESP_OK) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: failed to create parent directories for %s", resolved_path);
         return ESP_FAIL;
     }
 
-    file = fopen(resolved_path, "wb");
-    if (!file) {
+    guard_err = claw_storage_open_write(claw_paths_get(CLAW_PATH_DATA), resolved_path, content_len, &file);
+    if (guard_err != ESP_OK) {
         cJSON_Delete(root);
-        snprintf(output, output_size, "Error: cannot open file for writing: %s", resolved_path);
-        return ESP_FAIL;
+        snprintf(output, output_size, "%s", guard_err == ESP_ERR_NO_MEM ?
+                 "Error: insufficient storage space; cleanup reserve is protected" :
+                 "Error: cannot open file for writing or query storage free space");
+        return guard_err;
     }
 
-    content_len = strlen(content);
     written = fwrite(content, 1, content_len, file);
-    fclose(file);
+    if (fclose(file) != 0) {
+        ESP_LOGE(TAG, "fclose %s: errno=%d", resolved_path, errno);
+        close_failed = true;
+    }
+    claw_storage_end_write();
     cJSON_Delete(root);
 
-    if (written != content_len) {
+    if (written != content_len || close_failed) {
         ESP_LOGE(TAG, "fwrite %s: %d/%d bytes, errno=%d", resolved_path, (int)written, (int)content_len, errno);
         snprintf(output, output_size, "Error: wrote %d of %d bytes to %s",
                  (int)written,

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "http_server_priv.h"
+#include "claw_storage_guard.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -12,6 +13,25 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static int files_mkdir(const char *path, mode_t mode)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        errno = EEXIST;
+        return -1;
+    }
+    esp_err_t err = claw_storage_begin_write(http_server_ctx()->storage_base_path, 0);
+    if (err != ESP_OK) {
+        errno = err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+        return -1;
+    }
+    int rc = mkdir(path, mode);
+    int saved_errno = errno;
+    claw_storage_end_write();
+    errno = saved_errno;
+    return rc;
+}
 
 static int mkdir_parents(char *path, mode_t mode)
 {
@@ -23,13 +43,13 @@ static int mkdir_parents(char *path, mode_t mode)
             continue;
         }
         *p = '\0';
-        if (mkdir(path, mode) != 0 && errno != EEXIST) {
+        if (files_mkdir(path, mode) != 0 && errno != EEXIST) {
             *p = '/';
             return -1;
         }
         *p = '/';
     }
-    if (mkdir(path, mode) != 0 && errno != EEXIST) {
+    if (files_mkdir(path, mode) != 0 && errno != EEXIST) {
         return -1;
     }
     return 0;
@@ -302,7 +322,7 @@ static esp_err_t files_mkdir_handler(httpd_req_t *req)
         if (mkdir_parents(mkdir_buf, 0775) != 0) {
             return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create directory");
         }
-    } else if (mkdir(full_path, 0775) != 0 && errno != EEXIST) {
+    } else if (files_mkdir(full_path, 0775) != 0 && errno != EEXIST) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to create directory");
     }
 

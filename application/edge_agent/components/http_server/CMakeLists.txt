@@ -35,6 +35,7 @@ set(http_server_requires
     app_claw
     cap_im_local
     claw_cap
+    claw_utils
     esp_app_format
     esp_http_server
     esp_https_server

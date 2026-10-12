@@ -1,11 +1,14 @@
 idf_component_register(
     SRCS
         "src/cap_system.c"
+        "src/cap_system_storage.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         claw_cap
         claw_core
+        claw_memory
+        claw_utils
         esp_netif
         esp_wifi
     PRIV_REQUIRES

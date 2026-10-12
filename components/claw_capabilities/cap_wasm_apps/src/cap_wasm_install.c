@@ -10,6 +10,7 @@
  * (cap_wasm_do_install() keeps <name>.old/ until the new version loaded). Runs on the caller's
  * task: the agent for apps_install/apps_remove, a short-lived task for /app commands.
  */
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,8 @@
 #include "cJSON.h"
 #include "cap_http_rules.h"
 #include "cap_wasm_internal.h"
+#include "claw_paths.h"
+#include "claw_storage_guard.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -243,6 +246,30 @@ esp_err_t cap_wasm_ask(const char *chat, char *html, size_t html_size, const cha
 #endif
 }
 
+static bool cap_wasm_stage_mkdir(const char *path)
+{
+    bool ok;
+
+    if (claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA), 0) != ESP_OK) {
+        return false;
+    }
+    ok = mkdir(path, 0775) == 0 || errno == EEXIST;
+    claw_storage_end_write();
+    return ok;
+}
+
+static bool cap_wasm_stage_write(const char *path, const cap_wasm_blob_t *blob)
+{
+    bool ok;
+
+    if (claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA), blob->len) != ESP_OK) {
+        return false;
+    }
+    ok = cap_wasm_write_file(path, (const char *)blob->data, blob->len);
+    claw_storage_end_write();
+    return ok;
+}
+
 /* Writes the package entries to <apps>/<name>.new/. */
 static bool cap_wasm_stage(const char *name, const cap_wasm_pkg_t *pkg)
 {
@@ -258,13 +285,17 @@ static bool cap_wasm_stage(const char *name, const cap_wasm_pkg_t *pkg)
     char path[128];
 
     snprintf(dir, sizeof(dir), "%s/%s.new", g_cap_wasm_apps_dir, name);
-    mkdir(g_cap_wasm_apps_dir, 0775);
-    if (!cap_wasm_rmdir(dir) || mkdir(dir, 0775) != 0) {
+    if (access(g_cap_wasm_apps_dir, F_OK) != 0) {
+        if (!cap_wasm_stage_mkdir(g_cap_wasm_apps_dir)) {
+            return false;
+        }
+    }
+    if (!cap_wasm_rmdir(dir) || !cap_wasm_stage_mkdir(dir)) {
         return false;
     }
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         snprintf(path, sizeof(path), "%s/%s", dir, files[i].file);
-        if (!cap_wasm_write_file(path, (const char *)files[i].blob->data, files[i].blob->len)) {
+        if (!cap_wasm_stage_write(path, files[i].blob)) {
             cap_wasm_rmdir(dir);
             return false;
         }

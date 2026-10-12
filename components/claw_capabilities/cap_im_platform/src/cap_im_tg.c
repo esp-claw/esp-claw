@@ -938,7 +938,8 @@ static const char *cap_im_tg_download_error_reason(esp_err_t err)
 {
     switch (err) {
     case ESP_ERR_NO_MEM:
-        return "Flash-Datenspeicher (DATA-Partition) voll, auch nach Aufräumen des Anhang-Eingangs";
+        return "Zu wenig freier DATA-Speicher; die Wiederherstellungsreserve bleibt geschützt. "
+               "Mit /storage prüfen und Aufräumen vorab ansehen";
     case ESP_ERR_INVALID_SIZE:
         return "Datei zu groß";
     default:
@@ -1268,6 +1269,7 @@ static const struct {
 } s_tg_commands[] = {
     {"help", "List these commands", NULL, cap_im_tg_cmd_help},
     {"session", "Manage chat sessions (new, list, switch, delete)", "session_command", NULL},
+    {"storage", "Storage usage, cleanup preview and recovery", "storage_command", NULL},
     {"llm", "Configure the LLM model and endpoint", "llm_config_command", NULL},
     {"skills", "List the registered skills", NULL, cap_im_tg_cmd_skills},
     {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},

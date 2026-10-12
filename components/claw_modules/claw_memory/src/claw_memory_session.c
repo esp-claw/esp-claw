@@ -1925,6 +1925,16 @@ esp_err_t claw_memory_request_gate_callback(const claw_core_request_t *request,
 {
     (void)user_ctx;
 
+    if (s_memory.storage_degraded) {
+        if (!reject_message || reject_message_size == 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        strlcpy(reject_message,
+                "Memory storage needs recovery. Use /storage check, /storage clean safe, "
+                "or /storage repair; restart after recovery.",
+                reject_message_size);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!request || !request->session_id || !request->session_id[0]) {
         return ESP_OK;
     }
@@ -1945,7 +1955,7 @@ esp_err_t claw_memory_request_start_callback(const claw_core_request_t *request,
                                              void *user_ctx)
 {
     (void)user_ctx;
-    if (request && request->session_id && request->session_id[0]) {
+    if (s_memory.initialized && request && request->session_id && request->session_id[0]) {
         claw_memory_lock();
         claw_memory_pipeline_note_request(request->session_id);
         claw_memory_unlock();

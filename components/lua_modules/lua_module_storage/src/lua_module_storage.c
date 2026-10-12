@@ -16,6 +16,7 @@
 #include "lauxlib.h"
 #include "cap_lua.h"
 #include "claw_paths.h"
+#include "claw_storage_guard.h"
 #include "esp_vfs_fat.h"
 
 /* The writable data root is owned by claw_paths; resolve it on each call so the
@@ -23,6 +24,24 @@
 static const char *lua_module_storage_base_path(void)
 {
     return claw_paths_get(CLAW_PATH_DATA);
+}
+
+static bool lua_module_storage_path_in_data(const char *path)
+{
+    const char *base_path = lua_module_storage_base_path();
+    size_t base_len;
+
+    if (!path || !base_path || !base_path[0]) {
+        return false;
+    }
+    base_len = strlen(base_path);
+    while (base_len > 1 && base_path[base_len - 1] == '/') {
+        base_len--;
+    }
+    if (base_len == 1 && base_path[0] == '/') {
+        return path[0] == '/';
+    }
+    return strncmp(path, base_path, base_len) == 0 && (path[base_len] == '\0' || path[base_len] == '/');
 }
 
 static int lua_module_storage_get_root_dir(lua_State *L)
@@ -135,9 +154,31 @@ static int lua_module_storage_stat(lua_State *L)
 static int lua_module_storage_mkdir(lua_State *L)
 {
     const char *path = luaL_checkstring(L, 1);
+    struct stat st;
+    esp_err_t err;
+    bool guarded = lua_module_storage_path_in_data(path);
+
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    if (guarded) {
+        err = claw_storage_begin_write(lua_module_storage_base_path(), 0);
+        if (err != ESP_OK) {
+            return luaL_error(L, "%s", err == ESP_ERR_NO_MEM ?
+                              "insufficient storage space; cleanup reserve is protected" :
+                              "failed to query storage free space");
+        }
+    }
 
     if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        if (guarded) {
+            claw_storage_end_write();
+        }
         return luaL_error(L, "mkdir failed for %s", path);
+    }
+    if (guarded) {
+        claw_storage_end_write();
     }
 
     lua_pushboolean(L, 1);
@@ -149,19 +190,44 @@ static int lua_module_storage_write_file(lua_State *L)
     const char *path = luaL_checkstring(L, 1);
     size_t content_len = 0;
     const char *content = luaL_checklstring(L, 2, &content_len);
+    const char *base_path = lua_module_storage_base_path();
     FILE *file = NULL;
+    esp_err_t err;
+    bool guarded = false;
 
-    file = fopen(path, "w");
-    if (!file) {
-        return luaL_error(L, "cannot open file for writing: %s", path);
+    if (lua_module_storage_path_in_data(path)) {
+        err = claw_storage_open_write(base_path, path, content_len, &file);
+        if (err != ESP_OK) {
+            if (err == ESP_ERR_NO_MEM) {
+                return luaL_error(L, "insufficient storage space; cleanup reserve is protected");
+            }
+            return luaL_error(L, "cannot open file for writing: %s", path);
+        }
+        guarded = true;
+    } else {
+        file = fopen(path, "wb");
+        if (!file) {
+            return luaL_error(L, "cannot open file for writing: %s", path);
+        }
     }
 
     if (fwrite(content, 1, content_len, file) != content_len) {
         fclose(file);
+        if (guarded) {
+            claw_storage_end_write();
+        }
         return luaL_error(L, "short write to %s", path);
     }
 
-    fclose(file);
+    if (fclose(file) != 0) {
+        if (guarded) {
+            claw_storage_end_write();
+        }
+        return luaL_error(L, "failed to close written file: %s", path);
+    }
+    if (guarded) {
+        claw_storage_end_write();
+    }
     lua_pushboolean(L, 1);
     return 1;
 }

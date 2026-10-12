@@ -7,6 +7,7 @@
 #include "app_fs.h"
 #include "claw_version.h"
 #include "claw_paths.h"
+#include "claw_storage_guard.h"
 #include "edge_agent_version.h"
 #include <string.h>
 #include <stdlib.h>
@@ -29,6 +30,9 @@
 #include "cap_im_wechat.h"
 #endif
 #include "app_config.h"
+#if CONFIG_APP_CLAW_CAP_SYSTEM
+#include "cap_system_storage.h"
+#endif
 
 #define APP_ENABLE_MEM_LOG        (0)
 
@@ -339,6 +343,10 @@ void app_main(void)
      * without knowing whether data lives on flash or an SD card. */
     ESP_ERROR_CHECK(claw_paths_set(CLAW_PATH_DATA, app_fs_storage_base_path()));
     ESP_ERROR_CHECK(claw_paths_set(CLAW_PATH_SYSTEM, app_fs_system_base_path()));
+    claw_storage_set_allocation_unit(app_fs_storage_allocation_unit());
+#if CONFIG_APP_CLAW_CAP_SYSTEM
+    cap_system_storage_set_allocation_unit(app_fs_storage_allocation_unit());
+#endif
 
     ESP_ERROR_CHECK(wifi_manager_init());
 

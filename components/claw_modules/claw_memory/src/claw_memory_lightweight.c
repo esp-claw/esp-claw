@@ -22,6 +22,9 @@ static esp_err_t claw_memory_long_term_lightweight_collect(const claw_core_reque
     if (!out_context) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!s_memory.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     memset(out_context, 0, sizeof(*out_context));
     claw_memory_lock();

@@ -664,9 +664,10 @@ esp_err_t read_file_dup(const char *path, char **out_buf)
     }
     *out_buf = NULL;
 
+    errno = 0;
     file = fopen(path, "rb");
     if (!file) {
-        return ESP_ERR_NOT_FOUND;
+        return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
     }
     if (fseek(file, 0, SEEK_END) != 0) {
         fclose(file);
@@ -685,7 +686,21 @@ esp_err_t read_file_dup(const char *path, char **out_buf)
     }
 
     read_bytes = fread(buf, 1, (size_t)size, file);
-    fclose(file);
+    if (read_bytes != (size_t)size || ferror(file)) {
+        int saved_errno = errno ? errno : EIO;
+
+        fclose(file);
+        free(buf);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
+    if (fclose(file) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        free(buf);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
     buf[read_bytes] = '\0';
     *out_buf = buf;
     return ESP_OK;
@@ -694,63 +709,108 @@ esp_err_t read_file_dup(const char *path, char **out_buf)
 esp_err_t write_file_text(const char *path, const char *text)
 {
     FILE *file = NULL;
+    size_t text_len;
+    size_t written;
+    int saved_errno = 0;
 
     if (!path || !text) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (ensure_parent_dir(path) != ESP_OK) {
-        return ESP_FAIL;
+    {
+        esp_err_t err = ensure_parent_dir(path);
+
+        if (err != ESP_OK) {
+            return err;
+        }
     }
 
+    errno = 0;
     file = fopen(path, "wb");
     if (!file) {
         return ESP_FAIL;
     }
-    if (fputs(text, file) < 0) {
-        fclose(file);
+    text_len = strlen(text);
+    written = text_len > 0 ? fwrite(text, 1, text_len, file) : 0;
+    if (written != text_len) {
+        /* ESP VFS/FAT may report a full volume only as a short write. */
+        saved_errno = errno ? errno : ENOSPC;
+    } else if (ferror(file)) {
+        saved_errno = errno ? errno : EIO;
+    } else if (fflush(file) != 0) {
+        saved_errno = errno ? errno : EIO;
+    }
+    if (fclose(file) != 0 && saved_errno == 0) {
+        saved_errno = errno ? errno : EIO;
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
         return ESP_FAIL;
     }
-    fclose(file);
     return ESP_OK;
 }
 
-/* Write via a temp file. FAT cannot rename over an existing file, so the old
- * file is moved to a backup first and restored if the final rename fails. */
+/* FAT cannot rename over an existing file. Keep the current target and any
+ * previous backup until the complete temp file has become the new target. */
 esp_err_t write_file_atomic(const char *path, const char *text)
 {
     char tmp[CLAW_MEMORY_MAX_PATH + 8];
     char bak[CLAW_MEMORY_MAX_PATH + 8];
+    char old[CLAW_MEMORY_MAX_PATH + 8];
     struct stat st = {0};
     bool had_old;
     esp_err_t err;
+    int saved_errno;
 
-    if (!path || !text ||
-        snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
-        snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak)) {
+    if (!path || !text) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp) ||
+        snprintf(bak, sizeof(bak), "%s.bak", path) >= (int)sizeof(bak) ||
+        snprintf(old, sizeof(old), "%s.old", path) >= (int)sizeof(old)) {
+        return ESP_ERR_INVALID_SIZE;
     }
     err = write_file_text(tmp, text);
     if (err != ESP_OK) {
+        saved_errno = errno;
         unlink(tmp);
+        errno = saved_errno;
         return err;
     }
+    errno = 0;
     had_old = stat(path, &st) == 0;
+    if (!had_old && errno != ENOENT) {
+        saved_errno = errno ? errno : EIO;
+        unlink(tmp);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
     if (had_old) {
-        unlink(bak);
-        if (rename(path, bak) != 0) {
+        if (stat(old, &st) == 0) {
             unlink(tmp);
+            errno = EEXIST;
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (errno != ENOENT || rename(path, old) != 0) {
+            saved_errno = errno ? errno : EIO;
+            unlink(tmp);
+            errno = saved_errno;
             return ESP_FAIL;
         }
     }
     if (rename(tmp, path) != 0) {
+        saved_errno = errno ? errno : EIO;
         if (had_old) {
-            rename(bak, path);
+            (void)rename(old, path);
         }
         unlink(tmp);
+        errno = saved_errno;
         return ESP_FAIL;
     }
     if (had_old) {
-        unlink(bak);
+        /* The new target is durable enough to become authoritative. Backup
+         * rotation is best-effort and never endangers that target. */
+        (void)unlink(bak);
+        (void)rename(old, bak);
     }
     return ESP_OK;
 }

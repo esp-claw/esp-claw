@@ -19,6 +19,8 @@
 #include <time.h>
 
 #include "cJSON.h"
+#include "claw_paths.h"
+#include "claw_storage_guard.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -32,7 +34,7 @@
 /* Free-space floor when the download size is unknown. */
 #define CAP_IM_ATTACHMENT_MIN_FREE_BYTES (256 * 1024)
 /* Headroom kept free on top of a known download size, for sessions, memory and FAT metadata. */
-#define CAP_IM_ATTACHMENT_FREE_RESERVE_BYTES (64 * 1024)
+#define CAP_IM_ATTACHMENT_FREE_RESERVE_BYTES CLAW_STORAGE_RESERVE_BYTES
 /* 2020-01-01 UTC. Earlier wall-clock time means the clock was never set, so mtimes are not ordered. */
 #define CAP_IM_ATTACHMENT_MIN_VALID_EPOCH 1577836800
 /* Inbox layout is <root>/<platform>/<chat>/<file>: two directory levels above the files. */
@@ -52,7 +54,11 @@ typedef struct {
     size_t max_bytes;
     bool limit_hit;
     bool write_failed;
+    bool writes_data;
+    esp_err_t write_error;
 } cap_im_attachment_download_t;
+
+static bool cap_im_attachment_is_data_path(const char *path);
 
 typedef struct {
     uint8_t *data;
@@ -256,11 +262,19 @@ static esp_err_t cap_im_attachment_ensure_dir(const char *path)
         return S_ISDIR(st.st_mode) ? ESP_OK : ESP_FAIL;
     }
 
-    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
-        return ESP_FAIL;
+    bool writes_data = cap_im_attachment_is_data_path(path);
+    if (writes_data) {
+        esp_err_t err = claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA), 0);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
-
-    return ESP_OK;
+    int result = mkdir(path, 0755);
+    int saved_errno = errno;
+    if (writes_data) {
+        claw_storage_end_write();
+    }
+    return result == 0 || saved_errno == EEXIST ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t cap_im_attachment_ensure_parent_dirs(const char *path)
@@ -305,8 +319,9 @@ static esp_err_t cap_im_attachment_ensure_parent_dirs(const char *path)
     for (cursor = create_from; *cursor; cursor++) {
         if (*cursor == '/') {
             *cursor = '\0';
-            if (cap_im_attachment_ensure_dir(dir) != ESP_OK) {
-                return ESP_FAIL;
+            esp_err_t err = cap_im_attachment_ensure_dir(dir);
+            if (err != ESP_OK) {
+                return err;
             }
             *cursor = '/';
         }
@@ -363,6 +378,14 @@ esp_err_t cap_im_attachment_build_saved_paths(const char *root_dir,
     return ESP_OK;
 }
 
+static bool cap_im_attachment_is_data_path(const char *path)
+{
+    const char *root = claw_paths_get(CLAW_PATH_DATA);
+    size_t len = root ? strlen(root) : 0;
+    return len && path && strncmp(root, path, len) == 0 &&
+           (path[len] == '/' || path[len] == '\0');
+}
+
 static esp_err_t cap_im_attachment_download_event_handler(esp_http_client_event_t *event)
 {
     cap_im_attachment_download_t *dl = (cap_im_attachment_download_t *)event->user_data;
@@ -376,9 +399,33 @@ static esp_err_t cap_im_attachment_download_event_handler(esp_http_client_event_
         return ESP_FAIL;
     }
 
-    if (fwrite(event->data, 1, (size_t)event->data_len, dl->file) != (size_t)event->data_len) {
+    if (dl->write_failed) {
+        return dl->write_error;
+    }
+    if (dl->writes_data) {
+        dl->write_error = claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA),
+                                                   (size_t)event->data_len);
+        if (dl->write_error != ESP_OK) {
+            dl->write_failed = true;
+            return dl->write_error;
+        }
+    }
+    errno = 0;
+    bool written = fwrite(event->data, 1, (size_t)event->data_len, dl->file) == (size_t)event->data_len;
+    int write_errno = errno;
+    /* Commit stdio buffers before another guarded writer queries FAT space. */
+    bool flushed = fflush(dl->file) == 0;
+    if (!written || !flushed) {
+        dl->write_error = write_errno == ENOSPC || errno == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
         dl->write_failed = true;
-        return ESP_FAIL;
+        fclose(dl->file);
+        dl->file = NULL;
+    }
+    if (dl->writes_data) {
+        claw_storage_end_write();
+    }
+    if (dl->write_failed) {
+        return dl->write_error;
     }
 
     dl->bytes_written += (size_t)event->data_len;
@@ -420,12 +467,12 @@ static esp_err_t cap_im_attachment_ensure_free_space(const char *log_tag,
     if (free_bytes >= min_free) {
         return ESP_OK;
     }
-    ESP_LOGW(log_tag, "attachment storage low, running GC: free=%u min=%u expected=%u",
-             (unsigned int)free_bytes, (unsigned int)min_free, (unsigned int)expected_bytes);
+    ESP_LOGW(log_tag, "attachment storage low, running GC: free=%" PRIu64 " min=%" PRIu64 " expected=%zu",
+             free_bytes, min_free, expected_bytes);
     free_bytes = cap_im_attachment_gc(log_tag, root_dir, NULL, min_free);
     if (free_bytes < min_free) {
-        ESP_LOGW(log_tag, "attachment skipped, storage low after GC: free=%u min=%u",
-                 (unsigned int)free_bytes, (unsigned int)min_free);
+        ESP_LOGW(log_tag, "attachment skipped, storage low after GC: free=%" PRIu64 " min=%" PRIu64,
+                 free_bytes, min_free);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -454,13 +501,30 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
     if (err != ESP_OK) {
         return err;
     }
-
-    if (cap_im_attachment_ensure_parent_dirs(dest_path) != ESP_OK) {
-        ESP_LOGW(log_tag, "attachment mkdir failed: path=%s errno=%d", dest_path, errno);
-        return ESP_FAIL;
+    if (cap_im_attachment_is_data_path(dest_path)) {
+        err = claw_storage_check_write(claw_paths_get(CLAW_PATH_DATA), expected_bytes);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
 
+    err = cap_im_attachment_ensure_parent_dirs(dest_path);
+    if (err != ESP_OK) {
+        ESP_LOGW(log_tag, "attachment mkdir failed: path=%s errno=%d", dest_path, errno);
+        return err;
+    }
+
+    dl.writes_data = cap_im_attachment_is_data_path(dest_path);
+    if (dl.writes_data) {
+        err = claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA), expected_bytes);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
     file = fopen(dest_path, "wb");
+    if (dl.writes_data) {
+        claw_storage_end_write();
+    }
     if (!file) {
         ESP_LOGW(log_tag, "attachment fopen failed: path=%s errno=%d", dest_path, errno);
         return ESP_FAIL;
@@ -487,7 +551,10 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
     err = esp_http_client_perform(client);
     status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
-    if (fclose(file) != 0) {
+    if (dl.file && fclose(dl.file) != 0) {
+        if (!dl.write_failed) {
+            dl.write_error = errno == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
+        }
         dl.write_failed = true;
     }
 
@@ -495,17 +562,16 @@ esp_err_t cap_im_attachment_download_url_to_file(const char *log_tag,
         ESP_LOGW(log_tag, "attachment write failed, storage full? path=%s bytes=%u",
                  dest_path, (unsigned int)dl.bytes_written);
         remove(dest_path);
-        return ESP_ERR_NO_MEM;
+        return dl.write_error;
     }
 
     if (err != ESP_OK || status < 200 || status >= 300 || dl.limit_hit || dl.bytes_written == 0) {
         ESP_LOGW(log_tag,
-                 "attachment download failed: err=%s http=%d bytes=%u limit_hit=%d url=%s",
+                 "attachment download failed: err=%s http=%d bytes=%u limit_hit=%d",
                  esp_err_to_name(err),
                  status,
                  (unsigned int)dl.bytes_written,
-                 dl.limit_hit ? 1 : 0,
-                 url);
+                 dl.limit_hit ? 1 : 0);
         remove(dest_path);
         if (dl.limit_hit) {
             return ESP_ERR_INVALID_SIZE;
@@ -639,30 +705,54 @@ esp_err_t cap_im_attachment_save_buffer_to_file(const char *log_tag,
                                                 size_t buf_len)
 {
     FILE *file = NULL;
+    esp_err_t err;
+    bool writes_data;
 
     if (!log_tag || !dest_path || !dest_path[0] || (!buf && buf_len > 0)) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    if (cap_im_attachment_ensure_parent_dirs(dest_path) != ESP_OK) {
+    err = cap_im_attachment_ensure_parent_dirs(dest_path);
+    if (err != ESP_OK) {
         ESP_LOGW(log_tag, "attachment mkdir failed: path=%s errno=%d", dest_path, errno);
-        return ESP_FAIL;
+        return err;
+    }
+    writes_data = cap_im_attachment_is_data_path(dest_path);
+    if (writes_data) {
+        err = claw_storage_begin_write(claw_paths_get(CLAW_PATH_DATA), buf_len);
+        if (err != ESP_OK) {
+            return err;
+        }
     }
 
     file = fopen(dest_path, "wb");
     if (!file) {
+        if (writes_data) {
+            claw_storage_end_write();
+        }
         ESP_LOGW(log_tag, "attachment fopen failed: path=%s errno=%d", dest_path, errno);
         return ESP_FAIL;
     }
 
     if (buf_len > 0 && fwrite(buf, 1, buf_len, file) != buf_len) {
+        err = errno == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
         fclose(file);
+        if (writes_data) {
+            claw_storage_end_write();
+        }
         remove(dest_path);
         ESP_LOGW(log_tag, "attachment fwrite failed: path=%s errno=%d", dest_path, errno);
-        return ESP_FAIL;
+        return err;
     }
 
-    fclose(file);
+    int close_result = fclose(file);
+    err = close_result == 0 ? ESP_OK : errno == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
+    if (writes_data) {
+        claw_storage_end_write();
+    }
+    if (err != ESP_OK) {
+        remove(dest_path);
+        return err;
+    }
     return ESP_OK;
 }
 

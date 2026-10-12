@@ -103,6 +103,27 @@ Create a new session:
 
 Use this to isolate different projects, devices, or scenarios.
 
+### Storage Maintenance
+
+Telegram's `/storage` command works without an LLM, including when DATA storage is full.
+
+```text
+/storage
+/storage preview safe
+/storage clean safe
+/storage confirm <token>
+/storage check
+/storage repair
+```
+
+The status reports filesystem free space and file allocation by category. Small files can occupy a whole FAT cluster. `preview safe` lists eligible orphan session sidecars and temporary inbox files older than 24 hours; `clean safe` creates a short-lived confirmation token for the displayed batch. Send the displayed confirmation in the same chat within five minutes. Files changed since the preview are skipped, and incomplete scans cannot be confirmed. Repeat cleanup for additional batches.
+
+Use `attachments` instead of `safe` to explicitly select inbox attachments older than seven days. Cleanup does not delete chat histories, apps, skills, credentials or long-term memories. Remove a particular chat session with `/session delete <alias>` when you intend to discard its history.
+
+`check` inspects the memory index. `repair` requests confirmation before rebuilding a damaged index from valid stored records, retaining the damaged index for recovery. It does not use an LLM or rewrite the memory records. If startup entered memory recovery mode, restart the device after cleanup and repair to resume normal conversations.
+
+Nonessential writes keep a recovery reserve of 128 KiB, plus allocation headroom. If an upload or file operation reports insufficient space, use `/storage` to inspect it before retrying. Under low-space pressure, a background check can remove aged orphan session sidecars automatically. Internal memory updates use checked replacement writes so a failed write can retain the previous index and records.
+
 ## Scheduled Tasks
 
 ESP-Claw supports recurring and one-shot task scheduling.

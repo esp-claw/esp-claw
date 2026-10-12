@@ -45,6 +45,8 @@ typedef enum {
 
 typedef struct {
     int initialized;
+    bool storage_degraded;
+    bool storage_repair_required;
     char session_root_dir[CLAW_MEMORY_MAX_PATH];
     char memory_root_dir[CLAW_MEMORY_MAX_PATH];
     char markdown_path[CLAW_MEMORY_MAX_PATH];
@@ -163,6 +165,7 @@ bool claw_memory_items_equivalent_for_update(const claw_memory_item_t *existing,
 cJSON *claw_memory_parse_llm_json_document(const char *text);
 
 esp_err_t claw_memory_load_index(cJSON **out_root);
+esp_err_t claw_memory_index_prepare_for_default(void);
 esp_err_t claw_memory_save_index(cJSON *root);
 cJSON *claw_memory_find_summary_by_label(cJSON *index_root, const char *label);
 cJSON *claw_memory_find_summary_by_id(cJSON *index_root, int summary_id);
@@ -181,6 +184,14 @@ int claw_memory_find_item_index(const claw_memory_item_list_t *list, const char 
 cJSON *claw_memory_item_to_json(const claw_memory_item_t *item, cJSON *index_root);
 esp_err_t claw_memory_append_record(const claw_memory_item_t *item);
 esp_err_t claw_memory_load_current_items(claw_memory_item_list_t *out_list);
+esp_err_t claw_memory_records_prepare_for_read(void);
+esp_err_t claw_memory_records_prepare_for_default(void);
+esp_err_t claw_memory_records_check(bool repair,
+                                    bool *out_healthy,
+                                    char *output,
+                                    size_t output_size);
+esp_err_t claw_memory_records_write_snapshot(const claw_memory_item_list_t *items);
+esp_err_t claw_memory_record_validate_json(const cJSON *json, char *reason, size_t reason_size);
 int claw_memory_sort_by_priority_desc(const void *a, const void *b);
 void claw_memory_append_digest_line(const char *action,
                                     const claw_memory_item_t *item,

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,6 +22,9 @@ extern "C" {
  * @return Mount-point string owned by this module (never NULL).
  */
 const char *app_fs_storage_base_path(void);
+
+/** Actual DATA FAT cluster size after mounting, or zero if unavailable. */
+size_t app_fs_storage_allocation_unit(void);
 
 /**
  * @brief  Base path of the read-only system filesystem.

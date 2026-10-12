@@ -21,6 +21,16 @@ static const char *TAG = "claw_memory";
 claw_memory_state_t s_memory = {0};
 static SemaphoreHandle_t s_memory_lock = NULL;
 
+static esp_err_t claw_memory_enter_storage_degraded(const char *reason, bool repair_required)
+{
+    s_memory.initialized = 0;
+    s_memory.storage_degraded = true;
+    s_memory.storage_repair_required = repair_required;
+    ESP_LOGE(TAG, "Memory storage degraded (%s); memory disabled until restart after recovery",
+             reason ? reason : "storage error");
+    return ESP_OK;
+}
+
 void claw_memory_lock(void)
 {
     if (s_memory_lock) {
@@ -398,22 +408,41 @@ esp_err_t claw_memory_init(const claw_memory_config_t *config)
 
     if (ensure_dir_recursive(s_memory.session_root_dir) != ESP_OK ||
         ensure_dir_recursive(s_memory.memory_root_dir) != ESP_OK) {
-        return ESP_FAIL;
+        return claw_memory_enter_storage_degraded("directory setup failed", false);
     }
 
+    /* Recover interrupted atomic replacements before defaults can create an
+     * empty primary that would hide a valid transaction sidecar. */
+    {
+        esp_err_t err = claw_memory_records_prepare_for_default();
+
+        if (err == ESP_OK) {
+            err = claw_memory_index_prepare_for_default();
+        }
+        if (err != ESP_OK) {
+            return claw_memory_enter_storage_degraded(
+                "interrupted files could not be recovered", err == ESP_ERR_INVALID_STATE);
+        }
+    }
     if (claw_memory_profile_init_defaults() != ESP_OK) {
-        return ESP_FAIL;
+        return claw_memory_enter_storage_degraded("profile defaults unavailable", false);
     }
-
     if (ensure_file_with_default(s_memory.records_path, "") != ESP_OK ||
         ensure_file_with_default(s_memory.index_path, default_index) != ESP_OK ||
         ensure_file_with_default(s_memory.digest_path, "") != ESP_OK ||
         ensure_file_with_default(s_memory.markdown_path, default_markdown) != ESP_OK) {
-        return ESP_FAIL;
+        return claw_memory_enter_storage_degraded("memory defaults unavailable", false);
     }
 
+    {
+        esp_err_t err = claw_memory_compact_internal(false);
+
+        if (err != ESP_OK) {
+            return claw_memory_enter_storage_degraded("memory files failed validation",
+                                                       err == ESP_ERR_INVALID_STATE);
+        }
+    }
     s_memory.initialized = 1;
-    claw_memory_compact_internal(false);
     {
         esp_err_t err = claw_memory_embed_init(&config->embed);
 
@@ -866,6 +895,9 @@ static esp_err_t claw_memory_long_term_collect(const claw_core_request_t *reques
 
     if (!out_context) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_memory.initialized) {
+        return ESP_ERR_INVALID_STATE;
     }
     memset(out_context, 0, sizeof(*out_context));
 

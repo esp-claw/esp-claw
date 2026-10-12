@@ -85,7 +85,9 @@ cap_files_ensure_parent_dirs(resolved_path);
 
 ### User file area quota
 
-The data root outside its system directories (`apps`, `inbox`, `memory`, `router_rules`, `scheduler`, `scripts`, `sessions`, `skills`, `static`) is the user file area. `write_file`, `copy_file`, and `move_file` (from a system directory) into it are limited to 32 KB per file and 128 KB in total (`cap_files_quota.h`); the error points to `remote_write_file` (cap_ssh), since work files belong on a remote host. Writes into the system directories are not limited.
+The data root outside its system directories (`apps`, `inbox`, `memory`, `router_rules`, `scheduler`, `scripts`, `sessions`, `skills`, `static`) is the user file area. `write_file`, `copy_file`, and `move_file` (from a system directory) into it are limited to 32 KB per file and 128 KB in total (`cap_files_quota.h`); the error points to `remote_write_file` (cap_ssh), since work files belong on a remote host. These content quotas do not apply inside the system directories.
+
+File writes also check real filesystem free space before opening the destination and preserve a 128 KiB recovery reserve plus allocation headroom. This check includes writes into system directories made through file tools. Use Telegram `/storage` to inspect space and preview cleanup without calling the LLM.
 
 ### `copy_file` / `move_file`: sandboxed paths and destination preparation
 

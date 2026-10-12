@@ -112,8 +112,11 @@ static esp_err_t claw_memory_profile_collect(const claw_core_request_t *request,
     (void)request;
     (void)user_ctx;
 
-    if (!out_context || !s_memory.initialized) {
+    if (!out_context) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_memory.initialized) {
+        return ESP_ERR_INVALID_STATE;
     }
     memset(out_context, 0, sizeof(*out_context));
     claw_memory_lock();

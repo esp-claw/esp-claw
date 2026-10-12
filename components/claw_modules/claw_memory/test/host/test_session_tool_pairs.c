@@ -408,6 +408,20 @@ static void test_trimming_keeps_whole_rounds(void)
     }
 }
 
+static void test_degraded_storage_rejects_requests_without_session(void)
+{
+    claw_core_request_t request = {0};
+    char message[192];
+
+    s_memory.initialized = 0;
+    s_memory.storage_degraded = true;
+    CHECK(claw_memory_request_gate_callback(&request, message, sizeof(message), NULL) ==
+          ESP_ERR_INVALID_STATE);
+    CHECK(strstr(message, "/storage check") != NULL);
+    s_memory.storage_degraded = false;
+    s_memory.initialized = 1;
+}
+
 int main(void)
 {
     char dir[] = "/tmp/claw_session_test_XXXXXX";
@@ -423,6 +437,7 @@ int main(void)
 
     test_failed_tool_result_write();
     test_trimming_keeps_whole_rounds();
+    test_degraded_storage_rejects_requests_without_session();
 
     reset_session();
     rmdir(dir);

@@ -33,6 +33,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_vfs_fat.h"
+#include "claw_storage_guard.h"
 #include "mbedtls/base64.h"
 
 #define DAV_PREFIX       "/dav"
@@ -684,7 +685,13 @@ static esp_err_t dav_mkcol(httpd_req_t *req, const char *rel, const char *full)
     if (!dav_parent_is_dir(full)) {
         return dav_status(req, "409 Conflict");
     }
-    return dav_status(req, mkdir(full, 0775) == 0 ? "201 Created" : "500 Internal Server Error");
+    esp_err_t err = claw_storage_begin_write(http_server_ctx()->storage_base_path, 0);
+    if (err != ESP_OK) {
+        return dav_status(req, err == ESP_ERR_NO_MEM ? "507 Insufficient Storage" : "500 Internal Server Error");
+    }
+    int rc = mkdir(full, 0775);
+    claw_storage_end_write();
+    return dav_status(req, rc == 0 ? "201 Created" : "500 Internal Server Error");
 }
 
 /* ── COPY / MOVE ────────────────────────────────────────────────────── */
@@ -692,13 +699,30 @@ static esp_err_t dav_mkcol(httpd_req_t *req, const char *rel, const char *full)
 /* Copies src into a temp file next to dst and swaps it in. Returns 0 or errno. */
 static int copy_file(const char *src, const char *dst)
 {
+    struct stat source_stat;
+    if (stat(src, &source_stat) != 0 || source_stat.st_size < 0) {
+        return EIO;
+    }
+    esp_err_t space_err = claw_storage_check_write(http_server_ctx()->storage_base_path,
+                                                   (size_t)source_stat.st_size);
+    if (space_err != ESP_OK) {
+        return space_err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+    }
     char tmp[HTTP_SERVER_PATH_MAX];
     if (snprintf(tmp, sizeof(tmp), "%s" HTTP_SERVER_TMP_SUFFIX, dst) >= (int)sizeof(tmp)) {
         return ENAMETOOLONG;
     }
     char *buf = http_server_alloc_scratch_buffer();
     int in = open(src, O_RDONLY);
+    space_err = claw_storage_begin_write(http_server_ctx()->storage_base_path,
+                                         (size_t)source_stat.st_size);
+    if (space_err != ESP_OK) {
+        if (in >= 0) close(in);
+        free(buf);
+        return space_err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+    }
     int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    claw_storage_end_write();
     int rc = (!buf || in < 0 || out < 0) ? EIO : 0;
     while (rc == 0) {
         ssize_t got = read(in, buf, HTTP_SERVER_SCRATCH_SIZE);
@@ -706,9 +730,16 @@ static int copy_file(const char *src, const char *dst)
             rc = got < 0 ? EIO : 0;
             break;
         }
+        space_err = claw_storage_begin_write(http_server_ctx()->storage_base_path, got);
+        if (space_err != ESP_OK) {
+            rc = space_err == ESP_ERR_NO_MEM ? ENOSPC : EIO;
+            break;
+        }
         ssize_t written = write(out, buf, got);
+        int write_errno = errno;
+        claw_storage_end_write();
         if (written != got) {
-            rc = (written >= 0 || errno == ENOSPC) ? ENOSPC : EIO;
+            rc = (written >= 0 || write_errno == ENOSPC) ? ENOSPC : EIO;
         }
     }
     if (out >= 0 && close(out) != 0 && rc == 0) {
@@ -789,11 +820,19 @@ static esp_err_t dav_lock(httpd_req_t *req, const char *rel, const char *full)
     bool created = false;
     if (stat(full, &st) != 0) {
         /* RFC 4918 9.10.4: locking an unmapped URL creates an empty file. */
+        esp_err_t err = claw_storage_begin_write(http_server_ctx()->storage_base_path, 0);
+        if (err != ESP_OK) {
+            return dav_status(req, err == ESP_ERR_NO_MEM ? "507 Insufficient Storage" : "500 Internal Server Error");
+        }
         int fd = dav_parent_is_dir(full) ? open(full, O_WRONLY | O_CREAT, 0664) : -1;
+        int close_result = fd >= 0 ? close(fd) : -1;
+        claw_storage_end_write();
         if (fd < 0) {
             return dav_status(req, "409 Conflict");
         }
-        close(fd);
+        if (close_result != 0) {
+            return dav_status(req, "500 Internal Server Error");
+        }
         st.st_mode = S_IFREG;
         created = true;
     }

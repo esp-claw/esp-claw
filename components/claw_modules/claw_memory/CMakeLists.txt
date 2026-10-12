@@ -8,6 +8,7 @@ idf_component_register(
         "src/claw_memory_lightweight.c"
         "src/claw_memory_pipeline.c"
         "src/claw_memory_profile.c"
+        "src/claw_memory_records.c"
         "src/claw_memory_session.c"
         "src/claw_memory_storage.c"
         "src/claw_memory_utils.c"

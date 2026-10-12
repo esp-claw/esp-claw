@@ -99,6 +99,9 @@ esp_err_t claw_memory_request_gate_callback(const claw_core_request_t *request,
                                             void *user_ctx);
 esp_err_t claw_memory_request_start_callback(const claw_core_request_t *request,
                                              void *user_ctx);
+/* Inspect the memory index without an LLM. A false repair flag is read-only;
+ * repair rebuilds only when every memory record can be validated. */
+esp_err_t claw_memory_storage_check(bool repair, char *output, size_t output_size);
 /* Queue session extraction (and optionally consolidation) on the memory worker. */
 esp_err_t claw_memory_request_sync(const char *session_id, bool consolidate);
 esp_err_t claw_memory_stage_note_callback(const claw_core_request_t *request,

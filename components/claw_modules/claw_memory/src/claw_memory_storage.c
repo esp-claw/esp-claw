@@ -10,10 +10,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "esp_log.h"
 
 static const char *TAG = "claw_memory";
+
+typedef enum {
+    CLAW_MEMORY_INDEX_SOURCE_NONE = 0,
+    CLAW_MEMORY_INDEX_SOURCE_TARGET,
+    CLAW_MEMORY_INDEX_SOURCE_TMP,
+    CLAW_MEMORY_INDEX_SOURCE_OLD,
+    CLAW_MEMORY_INDEX_SOURCE_BAK,
+} claw_memory_index_source_t;
+
+static void claw_memory_item_from_json(cJSON *json, claw_memory_item_t *item);
+static esp_err_t claw_memory_archive_corrupt_index(char *archive_path,
+                                                   size_t archive_path_size,
+                                                   bool *out_archived);
 
 static cJSON *claw_memory_new_index_root(void)
 {
@@ -35,19 +50,160 @@ static cJSON *claw_memory_new_index_root(void)
     return root;
 }
 
-esp_err_t claw_memory_load_index(cJSON **out_root)
+static esp_err_t claw_memory_index_sidecar_path(char *buf,
+                                                size_t size,
+                                                const char *suffix)
+{
+    int written;
+    if (!buf || size == 0 || !suffix) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    written = snprintf(buf, size, "%s%s", s_memory.index_path, suffix);
+    return written >= 0 && (size_t)written < size ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+static esp_err_t claw_memory_parse_index_path(const char *path, cJSON **out_root)
 {
     char *raw = NULL;
-    cJSON *root = NULL;
+    cJSON *root;
+    cJSON *next_summary_id;
+    cJSON *last_compact_size;
+    esp_err_t err;
+    if (!path || !out_root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_root = NULL;
+    err = read_file_dup(path, &raw);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (strlen(raw) != file_size_bytes(path)) {
+        free(raw);
+        return ESP_ERR_INVALID_STATE;
+    }
+    root = cJSON_ParseWithOpts(raw, NULL, true);
+    free(raw);
+    next_summary_id = root ? cJSON_GetObjectItem(root, "next_summary_id") : NULL;
+    last_compact_size = root ? cJSON_GetObjectItem(root, "last_compact_digest_size") : NULL;
+    if (!root || !cJSON_IsObject(root) ||
+        !cJSON_IsNumber(cJSON_GetObjectItem(root, "version")) ||
+        cJSON_GetNumberValue(cJSON_GetObjectItem(root, "version")) != 3 ||
+        !cJSON_IsNumber(next_summary_id) || next_summary_id->valuedouble < 1 ||
+        next_summary_id->valuedouble > UINT16_MAX + 1.0 ||
+        next_summary_id->valuedouble != (double)(uint32_t)next_summary_id->valuedouble ||
+        !cJSON_IsNumber(last_compact_size) || last_compact_size->valuedouble < 0 ||
+        last_compact_size->valuedouble > UINT32_MAX ||
+        last_compact_size->valuedouble != (double)(uint32_t)last_compact_size->valuedouble ||
+        !cJSON_IsArray(cJSON_GetObjectItem(root, "summaries")) ||
+        !cJSON_IsObject(cJSON_GetObjectItem(root, "keyword_index")) ||
+        (cJSON_GetObjectItem(root, CLAW_MEMORY_PIPELINE_KEY) &&
+         !cJSON_IsObject(cJSON_GetObjectItem(root, CLAW_MEMORY_PIPELINE_KEY)))) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_root = root;
+    return ESP_OK;
+}
+
+static esp_err_t claw_memory_promote_recovered_index(const char *source_path)
+{
+    char archive_path[CLAW_MEMORY_MAX_PATH + 20];
+    bool archived = false;
     esp_err_t err;
 
+    err = claw_memory_archive_corrupt_index(archive_path, sizeof(archive_path), &archived);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (rename(source_path, s_memory.index_path) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (archived) {
+            (void)rename(archive_path, s_memory.index_path);
+        }
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static void claw_memory_finish_index_backup_rotation(void)
+{
+    char old_path[CLAW_MEMORY_MAX_PATH + 8];
+    char bak_path[CLAW_MEMORY_MAX_PATH + 8];
+    struct stat st = {0};
+    if (claw_memory_index_sidecar_path(old_path, sizeof(old_path), ".old") != ESP_OK ||
+        claw_memory_index_sidecar_path(bak_path, sizeof(bak_path), ".bak") != ESP_OK ||
+        stat(old_path, &st) != 0) {
+        return;
+    }
+    (void)unlink(bak_path);
+    (void)rename(old_path, bak_path);
+}
+
+static esp_err_t claw_memory_find_valid_index(cJSON **out_root,
+                                              claw_memory_index_source_t *out_source,
+                                              char *out_source_path,
+                                              size_t source_path_size,
+                                              bool *out_any_present)
+{
+    static const struct {
+        claw_memory_index_source_t source;
+        const char *suffix;
+    } candidates[] = {
+        {CLAW_MEMORY_INDEX_SOURCE_TARGET, ""},
+        {CLAW_MEMORY_INDEX_SOURCE_TMP, ".tmp"},
+        {CLAW_MEMORY_INDEX_SOURCE_OLD, ".old"},
+        {CLAW_MEMORY_INDEX_SOURCE_BAK, ".bak"},
+    };
+    size_t i;
+    if (!out_root || !out_source || !out_source_path || source_path_size == 0 ||
+        !out_any_present) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_root = NULL;
+    *out_source = CLAW_MEMORY_INDEX_SOURCE_NONE;
+    *out_any_present = false;
+    out_source_path[0] = '\0';
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        char path[CLAW_MEMORY_MAX_PATH + 8];
+        cJSON *root = NULL;
+        esp_err_t err;
+        if (claw_memory_index_sidecar_path(path, sizeof(path), candidates[i].suffix) != ESP_OK) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        err = claw_memory_parse_index_path(path, &root);
+        if (err == ESP_OK) {
+            *out_root = root;
+            *out_source = candidates[i].source;
+            safe_copy(out_source_path, source_path_size, path);
+            return ESP_OK;
+        }
+        if (err != ESP_ERR_NOT_FOUND) {
+            *out_any_present = true;
+            if (err != ESP_ERR_INVALID_STATE) {
+                return err;
+            }
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t claw_memory_load_index(cJSON **out_root)
+{
+    cJSON *root = NULL;
+    claw_memory_index_source_t source = CLAW_MEMORY_INDEX_SOURCE_NONE;
+    char source_path[CLAW_MEMORY_MAX_PATH + 8];
+    bool any_present = false;
+    esp_err_t err;
     if (!out_root) {
         return ESP_ERR_INVALID_ARG;
     }
     *out_root = NULL;
 
-    err = read_file_dup(s_memory.index_path, &raw);
-    if (err == ESP_ERR_NOT_FOUND) {
+    err = claw_memory_find_valid_index(&root, &source, source_path,
+                                       sizeof(source_path), &any_present);
+    if (err == ESP_ERR_NOT_FOUND && !any_present) {
         root = claw_memory_new_index_root();
         if (!root) {
             return ESP_ERR_NO_MEM;
@@ -56,16 +212,24 @@ esp_err_t claw_memory_load_index(cJSON **out_root)
         return ESP_OK;
     }
     if (err != ESP_OK) {
-        return err;
+        ESP_LOGE(TAG, "Memory index is damaged and no valid recovery file exists: %s",
+                 s_memory.index_path);
+        return err == ESP_ERR_NOT_FOUND ? ESP_ERR_INVALID_STATE : err;
     }
+    if (source != CLAW_MEMORY_INDEX_SOURCE_TARGET) {
+        err = claw_memory_promote_recovered_index(source_path);
+        if (err != ESP_OK) {
+            int saved_errno = errno;
 
-    root = cJSON_Parse(raw);
-    free(raw);
-    if (!root || !cJSON_IsObject(root)) {
-        cJSON_Delete(root);
-        ESP_LOGE(TAG, "Failed to parse memory index: %s", s_memory.index_path);
-        return ESP_FAIL;
+            cJSON_Delete(root);
+            ESP_LOGE(TAG, "Valid memory index recovery found at %s but promotion failed: %s",
+                     source_path, strerror(saved_errno ? saved_errno : EIO));
+            errno = saved_errno;
+            return err;
+        }
+        ESP_LOGW(TAG, "Recovered interrupted memory index update from %s", source_path);
     }
+    claw_memory_finish_index_backup_rotation();
 
     /* cJSON_ReplaceItemInObject only takes ownership of the new node when the
      * key already exists; on a malformed/legacy index that is MISSING the key
@@ -119,6 +283,23 @@ esp_err_t claw_memory_load_index(cJSON **out_root)
     return ESP_OK;
 }
 
+esp_err_t claw_memory_index_prepare_for_default(void)
+{
+    struct stat st = {0};
+    cJSON *root = NULL;
+    esp_err_t err;
+
+    if (stat(s_memory.index_path, &st) == 0) {
+        return ESP_OK;
+    }
+    if (errno != ENOENT) {
+        return ESP_FAIL;
+    }
+    err = claw_memory_load_index(&root);
+    cJSON_Delete(root);
+    return err;
+}
+
 esp_err_t claw_memory_save_index(cJSON *root)
 {
     char *text;
@@ -131,8 +312,341 @@ esp_err_t claw_memory_save_index(cJSON *root)
     if (!text) {
         return ESP_ERR_NO_MEM;
     }
-    err = write_file_text(s_memory.index_path, text);
+    errno = 0;
+    err = write_file_atomic(s_memory.index_path, text);
+    if (err != ESP_OK) {
+        int saved_errno = errno;
+
+        if (saved_errno == ENOSPC) {
+            ESP_LOGE(TAG, "Cannot save memory index: DATA storage is full");
+        } else {
+            ESP_LOGE(TAG, "Cannot safely replace memory index: %s",
+                     strerror(saved_errno ? saved_errno : EIO));
+        }
+        errno = saved_errno;
+    }
     free(text);
+    return err;
+}
+
+static esp_err_t claw_memory_load_records_strict(claw_memory_item_list_t *out_items,
+                                                 char *reason,
+                                                 size_t reason_size)
+{
+    const size_t line_size = 4096;
+    claw_memory_item_list_t items = {0};
+    claw_memory_item_t *item = NULL;
+    char *line = NULL;
+    FILE *file = NULL;
+    esp_err_t err = ESP_OK;
+    if (!out_items || !reason || reason_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_items, 0, sizeof(*out_items));
+    reason[0] = '\0';
+    line = calloc(1, line_size);
+    item = calloc(1, sizeof(*item));
+    if (!line || !item) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    errno = 0;
+    file = fopen(s_memory.records_path, "rb");
+    if (!file) {
+        snprintf(reason, reason_size, "records unavailable: %s",
+                 strerror(errno ? errno : EIO));
+        err = errno == ENOENT ? ESP_ERR_INVALID_STATE : ESP_FAIL;
+        goto cleanup;
+    }
+
+    while (fgets(line, (int)line_size, file)) {
+        size_t len = strlen(line);
+        cJSON *json = NULL;
+        int idx;
+
+        if (len == 0 || line[len - 1] != '\n') {
+            snprintf(reason, reason_size, "records are incomplete or contain an oversized line");
+            err = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        json = cJSON_ParseWithOpts(line, NULL, true);
+        if (claw_memory_record_validate_json(json, reason, reason_size) != ESP_OK) {
+            cJSON_Delete(json);
+            err = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+        claw_memory_item_from_json(json, item);
+        cJSON_Delete(json);
+        idx = claw_memory_find_item_index(&items, item->id);
+        if (idx >= 0) {
+            items.items[idx] = *item;
+        } else {
+            err = claw_memory_item_list_push(&items, item);
+            if (err != ESP_OK) {
+                goto cleanup;
+            }
+        }
+    }
+    if (ferror(file)) {
+        snprintf(reason, reason_size, "records could not be read completely");
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+cleanup:
+    if (file && fclose(file) != 0 && err == ESP_OK) {
+        snprintf(reason, reason_size, "records could not be closed after reading");
+        err = ESP_FAIL;
+    }
+    free(line);
+    free(item);
+    if (err == ESP_OK) {
+        *out_items = items;
+    } else {
+        claw_memory_item_list_free(&items);
+    }
+    return err;
+}
+
+static esp_err_t claw_memory_rebuild_index_from_records(cJSON **out_root,
+                                                        char *reason,
+                                                        size_t reason_size)
+{
+    claw_memory_item_list_t items = {0};
+    cJSON *root = NULL;
+    esp_err_t err;
+    size_t i;
+    if (!out_root) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_root = NULL;
+    err = claw_memory_load_records_strict(&items, reason, reason_size);
+    if (err != ESP_OK) {
+        return err;
+    }
+    root = claw_memory_new_index_root();
+    if (!root) {
+        claw_memory_item_list_free(&items);
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (i = 0; i < items.count; i++) {
+        claw_memory_item_t *item = &items.items[i];
+        char labels[CLAW_MEMORY_MAX_SUMMARIES][CLAW_MEMORY_MAX_LABEL_TEXT];
+        size_t label_count = 0;
+        size_t j;
+        if (item->deleted) {
+            continue;
+        }
+        claw_memory_collect_summary_labels(item, labels, &label_count);
+        if (label_count != item->summary_id_count) {
+            snprintf(reason, reason_size, "records cannot preserve summary labels and IDs");
+            err = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+        for (j = 0; j < label_count; j++) {
+            int summary_id = 0;
+            err = claw_memory_ensure_summary_label(root, labels[j], item->summary_ids[j],
+                                                   &summary_id);
+            if (err != ESP_OK) {
+                goto cleanup;
+            }
+            if (summary_id != item->summary_ids[j]) {
+                snprintf(reason, reason_size, "records contain conflicting summary labels and IDs");
+                err = ESP_ERR_INVALID_STATE;
+                goto cleanup;
+            }
+        }
+        claw_memory_adjust_summary_stats(root, item, 1);
+    }
+    claw_memory_rebuild_keyword_index(root, &items);
+    *out_root = root;
+    root = NULL;
+    err = ESP_OK;
+
+cleanup:
+    cJSON_Delete(root);
+    claw_memory_item_list_free(&items);
+    return err;
+}
+
+static esp_err_t claw_memory_archive_corrupt_index(char *archive_path,
+                                                   size_t archive_path_size,
+                                                   bool *out_archived)
+{
+    struct stat st = {0};
+    unsigned int attempt;
+    if (!archive_path || archive_path_size == 0 || !out_archived) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_archived = false;
+    archive_path[0] = '\0';
+    if (stat(s_memory.index_path, &st) != 0) {
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    }
+    for (attempt = 0; attempt < 100; attempt++) {
+        int written = attempt == 0 ?
+            snprintf(archive_path, archive_path_size, "%s.corrupt", s_memory.index_path) :
+            snprintf(archive_path, archive_path_size, "%s.corrupt.%u", s_memory.index_path, attempt);
+        if (written < 0 || (size_t)written >= archive_path_size) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (stat(archive_path, &st) != 0) {
+            if (errno != ENOENT) {
+                return ESP_FAIL;
+            }
+            if (rename(s_memory.index_path, archive_path) != 0) {
+                return ESP_FAIL;
+            }
+            *out_archived = true;
+            return ESP_OK;
+        }
+    }
+    errno = EEXIST;
+    return ESP_ERR_INVALID_STATE;
+}
+
+static void claw_memory_append_degraded_guidance(char *output,
+                                                 size_t output_size,
+                                                 bool repaired)
+{
+    size_t length;
+
+    if (!s_memory.storage_degraded || !output || output_size == 0) {
+        return;
+    }
+    length = strlen(output);
+    if (length >= output_size - 1) {
+        return;
+    }
+    snprintf(output + length, output_size - length,
+             repaired ? " Restart the device to resume memory." :
+             " Memory is disabled; recover or free storage, then restart the device.");
+}
+
+static void claw_memory_append_storage_status(char *output,
+                                              size_t output_size,
+                                              const char *status)
+{
+    size_t length;
+
+    if (!output || !status || !status[0] || output_size == 0 || strstr(output, status)) {
+        return;
+    }
+    length = strlen(output);
+    if (length >= output_size - 1) {
+        return;
+    }
+    snprintf(output + length, output_size - length, "%s%s", length ? "\n" : "", status);
+}
+
+esp_err_t claw_memory_storage_check(bool repair, char *output, size_t output_size)
+{
+    cJSON *root = NULL;
+    claw_memory_index_source_t source = CLAW_MEMORY_INDEX_SOURCE_NONE;
+    char source_path[CLAW_MEMORY_MAX_PATH + 8];
+    char archive_path[CLAW_MEMORY_MAX_PATH + 20];
+    char records_status[160];
+    char reason[96];
+    bool any_present = false;
+    bool archived = false;
+    bool records_healthy = false;
+    esp_err_t err;
+    if (!output || output_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    output[0] = '\0';
+    if (!s_memory.initialized && !s_memory.storage_degraded) {
+        snprintf(output, output_size, "Memory storage is not initialized.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    claw_memory_lock();
+    err = claw_memory_records_check(repair, &records_healthy,
+                                    records_status, sizeof(records_status));
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "%s", records_status);
+        goto cleanup;
+    }
+    err = claw_memory_find_valid_index(&root, &source, source_path,
+                                       sizeof(source_path), &any_present);
+    if (err == ESP_OK && source == CLAW_MEMORY_INDEX_SOURCE_TARGET) {
+        snprintf(output, output_size, "Memory index: OK.");
+        err = ESP_OK;
+        goto cleanup;
+    }
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        snprintf(output, output_size, "Memory index inspection failed: %s.",
+                 strerror(errno ? errno : EIO));
+        goto cleanup;
+    }
+    if (!repair) {
+        if (err == ESP_OK) {
+            snprintf(output, output_size,
+                     "Memory index: damaged; recoverable from an interrupted update.");
+        } else if (!any_present) {
+            snprintf(output, output_size, "Memory index: missing.");
+        } else {
+            snprintf(output, output_size,
+                     "Memory index: damaged; no valid recovery copy found.");
+        }
+        err = ESP_OK;
+        goto cleanup;
+    }
+
+    cJSON_Delete(root);
+    root = NULL;
+    err = claw_memory_archive_corrupt_index(archive_path, sizeof(archive_path), &archived);
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "Memory index repair failed while preserving the corrupt index.");
+        goto cleanup;
+    }
+    if (source != CLAW_MEMORY_INDEX_SOURCE_NONE) {
+        err = claw_memory_promote_recovered_index(source_path);
+        if (err == ESP_OK) {
+            snprintf(output, output_size,
+                     "Memory index recovered from an interrupted update; corrupt copy preserved.");
+            goto cleanup;
+        }
+        snprintf(output, output_size, "Memory index recovery copy could not be promoted.");
+        goto restore_archive;
+    }
+
+    reason[0] = '\0';
+    err = claw_memory_rebuild_index_from_records(&root, reason, sizeof(reason));
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "Memory index repair unsafe: %s.",
+                 reason[0] ? reason : "records could not be validated");
+        goto restore_archive;
+    }
+    err = claw_memory_save_index(root);
+    if (err == ESP_OK) {
+        snprintf(output, output_size,
+                 "Memory index repaired from complete records; corrupt copy preserved.");
+        goto cleanup;
+    }
+    snprintf(output, output_size, "Memory index repair failed while writing the replacement.");
+
+restore_archive:
+    if (archived && access(s_memory.index_path, F_OK) != 0) {
+        (void)rename(archive_path, s_memory.index_path);
+    }
+
+cleanup:
+    cJSON_Delete(root);
+    claw_memory_append_storage_status(output, output_size, records_status);
+    if (err == ESP_OK) {
+        claw_memory_append_degraded_guidance(output, output_size,
+                                             repair && records_healthy &&
+                                             s_memory.storage_repair_required);
+    }
+    claw_memory_unlock();
     return err;
 }
 
@@ -491,12 +1005,21 @@ esp_err_t claw_memory_load_current_items(claw_memory_item_list_t *out_list)
     char *line = NULL;
     claw_memory_item_t *item = NULL;
     claw_memory_item_list_t list = {0};
-    const size_t line_size = 1024;
+    const size_t line_size = 4096;
 
     if (!out_list) {
         return ESP_ERR_INVALID_ARG;
     }
     memset(out_list, 0, sizeof(*out_list));
+
+    {
+        esp_err_t err = claw_memory_records_prepare_for_read();
+
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Memory records are damaged and no valid recovery file exists");
+            return err;
+        }
+    }
 
     line = calloc(1, line_size);
     item = calloc(1, sizeof(*item));
@@ -865,7 +1388,6 @@ esp_err_t claw_memory_compact_internal(bool append_digest)
     claw_memory_item_list_t compacted = {0};
     cJSON *old_index = NULL;
     cJSON *new_index = NULL;
-    char *records_text = NULL;
     claw_memory_item_t *scratch_item = NULL;
     size_t digest_size = 0;
     size_t i;
@@ -991,36 +1513,7 @@ esp_err_t claw_memory_compact_internal(bool append_digest)
                               cJSON_DetachItemFromObject(old_index, CLAW_MEMORY_PIPELINE_KEY));
     }
 
-    {
-        size_t est_size = (compacted.count * 512) + 16;
-        size_t off = 0;
-
-        records_text = calloc(1, est_size);
-        if (!records_text) {
-            free(scratch_item);
-            cJSON_Delete(old_index);
-            cJSON_Delete(new_index);
-            claw_memory_item_list_free(&items);
-            claw_memory_item_list_free(&compacted);
-            return ESP_ERR_NO_MEM;
-        }
-        for (i = 0; i < compacted.count; i++) {
-            cJSON *json = claw_memory_item_to_json(&compacted.items[i], NULL);
-            char *text = json ? cJSON_PrintUnformatted(json) : NULL;
-
-            cJSON_Delete(json);
-            if (!text) {
-                continue;
-            }
-            off += snprintf(records_text + off, est_size - off, "%s\n", text);
-            free(text);
-            if (off >= est_size) {
-                break;
-            }
-        }
-    }
-
-    err = write_file_text(s_memory.records_path, records_text ? records_text : "");
+    err = claw_memory_records_write_snapshot(&compacted);
     if (err == ESP_OK) {
         err = claw_memory_save_index(new_index);
     }
@@ -1028,13 +1521,14 @@ esp_err_t claw_memory_compact_internal(bool append_digest)
         claw_memory_append_digest_line("compact", NULL, "rebuild=index+markdown");
     }
 
-    free(records_text);
     free(scratch_item);
     cJSON_Delete(old_index);
     cJSON_Delete(new_index);
     claw_memory_item_list_free(&items);
     claw_memory_item_list_free(&compacted);
-    s_memory.write_changes_since_compact = 0;
+    if (err == ESP_OK) {
+        s_memory.write_changes_since_compact = 0;
+    }
     return err;
 }
 

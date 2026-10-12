@@ -17,6 +17,7 @@ idf_component_register(
         "third_party/monocypher"
     REQUIRES
         claw_cap
+        claw_utils
     PRIV_REQUIRES
         app_update
         cap_http_request

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "cap_system.h"
+#include "cap_system_storage.h"
 
 #include <dirent.h>
 #include <stdbool.h>
@@ -1515,6 +1516,16 @@ static const claw_cap_descriptor_t s_system_descriptors[] = {
         .input_schema_json = "{\"type\":\"object\",\"properties\":{\"delay_ms\":{\"type\":\"integer\",\"minimum\":0}}}",
         .execute = cap_system_execute_restart,
     },
+    {
+        .id = "storage_command",
+        .name = "storage_command",
+        .family = "system",
+        .description = "Handle restricted /storage status, preview, cleanup and memory-index checks.",
+        .kind = CLAW_CAP_KIND_CALLABLE,
+        .cap_flags = CLAW_CAP_FLAG_RESTRICTED,
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        .execute = cap_system_storage_execute,
+    },
 };
 
 static const claw_cap_group_t s_system_group = {
@@ -1556,8 +1567,16 @@ static void cap_system_record_boot(void)
 
 esp_err_t cap_system_register_group(void)
 {
+    esp_err_t err;
+
     if (claw_cap_group_exists(s_system_group.group_id)) {
         return ESP_OK;
+    }
+
+    err = cap_system_storage_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "storage command init failed: %s", esp_err_to_name(err));
+        return err;
     }
 
     // Registration runs once per boot, after NVS and the default event loop are up.
@@ -1571,9 +1590,11 @@ esp_err_t cap_system_register_group(void)
         ESP_LOGW(TAG, "wifi disconnect counter unavailable");
     }
 
-    esp_err_t err = claw_cap_register_group(&s_system_group);
+    err = claw_cap_register_group(&s_system_group);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register group failed: %s", esp_err_to_name(err));
+    } else if (cap_system_storage_start_monitor() != ESP_OK) {
+        ESP_LOGW(TAG, "storage low-space monitor unavailable");
     }
 
     return err;
