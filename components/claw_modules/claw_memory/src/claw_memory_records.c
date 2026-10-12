@@ -617,10 +617,18 @@ static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_s
     if (err != ESP_OK && (!archived || rolled_back)) {
         /* A stale reduced .tmp could be promoted by records_find_valid() later.
          * Keep it when the primary was archived and not restored: then it is
-         * the only complete current copy. */
+         * the only complete copy of the repaired records (the full original
+         * is in the archive). */
         int saved_errno = errno;
 
         unlink(tmp_path);
+        errno = saved_errno;
+    } else if (err != ESP_OK) {
+        /* Without a primary, the next append would create a fresh one and
+         * hide .tmp; block writes until /storage repair promotes it. */
+        int saved_errno = errno;
+
+        (void)claw_memory_enter_storage_degraded("records repair left no primary", true);
         errno = saved_errno;
     }
     return err;

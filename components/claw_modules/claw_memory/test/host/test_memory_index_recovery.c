@@ -44,6 +44,14 @@ claw_memory_state_t s_memory;
 
 void claw_memory_lock(void) {}
 void claw_memory_unlock(void) {}
+esp_err_t claw_memory_enter_storage_degraded(const char *reason, bool repair_required)
+{
+    (void)reason;
+    s_memory.initialized = 0;
+    s_memory.storage_degraded = true;
+    s_memory.storage_repair_required = repair_required;
+    return ESP_OK;
+}
 
 FILE *__real_fopen(const char *path, const char *mode);
 int __real_fclose(FILE *file);
@@ -593,6 +601,9 @@ static void test_record_repair_double_rename_failure_keeps_tmp(void)
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s_memory.records_path);
     text = dup_printf("%s{\"id\":\"bad\"}\n%s", LEGACY_RECORD_KEPT, LEGACY_RECORD_PROJECT);
     write_text(s_memory.records_path, text);
+    s_memory.initialized = 1;
+    s_memory.storage_degraded = false;
+    s_memory.storage_repair_required = false;
     s_fail_records_tmp_promote = true;
     s_fail_records_rollback = true;
     CHECK(claw_memory_records_check(true, &healthy, output, sizeof(output)) != ESP_OK);
@@ -601,7 +612,22 @@ static void test_record_repair_double_rename_failure_keeps_tmp(void)
     CHECK(actual && strstr(actual, LEGACY_RECORD_KEPT) && strstr(actual, LEGACY_RECORD_PROJECT) &&
           !strstr(actual, "\"bad\""));
     free(actual);
+    /* Memory is disabled, so no append can create a fresh primary over .tmp. */
+    CHECK(!s_memory.initialized && s_memory.storage_degraded && s_memory.storage_repair_required);
+    CHECK(access(s_memory.records_path, F_OK) != 0);
+    /* A later repair finds the primary missing and promotes .tmp. */
+    s_fail_records_tmp_promote = false;
+    s_fail_records_rollback = false;
+    CHECK(claw_memory_records_check(true, &healthy, output, sizeof(output)) == ESP_OK);
+    CHECK(healthy);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strstr(actual, LEGACY_RECORD_KEPT) && strstr(actual, LEGACY_RECORD_PROJECT) &&
+          !strstr(actual, "\"bad\""));
+    free(actual);
     free(text);
+    s_memory.storage_degraded = false;
+    s_memory.storage_repair_required = false;
+    s_memory.initialized = 1;
     remove_record_sidecars();
 }
 

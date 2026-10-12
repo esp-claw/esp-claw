@@ -21,7 +21,7 @@ static const char *TAG = "claw_memory";
 claw_memory_state_t s_memory = {0};
 static SemaphoreHandle_t s_memory_lock = NULL;
 
-static esp_err_t claw_memory_enter_storage_degraded(const char *reason, bool repair_required)
+esp_err_t claw_memory_enter_storage_degraded(const char *reason, bool repair_required)
 {
     s_memory.initialized = 0;
     s_memory.storage_degraded = true;

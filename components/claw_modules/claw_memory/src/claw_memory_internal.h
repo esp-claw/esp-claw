@@ -119,6 +119,9 @@ esp_err_t claw_memory_recover_atomic_file(const char *path);
 void claw_memory_lock(void);
 void claw_memory_unlock(void);
 
+/* Disables memory writes for this boot; callers hold the lock. */
+esp_err_t claw_memory_enter_storage_degraded(const char *reason, bool repair_required);
+
 /* Background pipeline (claw_memory_pipeline.c). The note_* hooks expect the lock held. */
 esp_err_t claw_memory_pipeline_init(const claw_memory_config_t *config);
 void claw_memory_pipeline_note_persist(const char *session_id, const char *data_path);
