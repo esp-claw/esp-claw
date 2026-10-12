@@ -18,16 +18,29 @@ static bool cap_im_tg_is_subagent(const claw_cap_call_context_t *ctx)
     return ctx->caller == CLAW_CAP_CALLER_SUB_AGENT && ctx->agent_id && ctx->agent_id[0];
 }
 
+/* Work a scheduler job started: the root agent, or a subagent of one (claw_agent_mgr prefixes its source). */
+static bool cap_im_tg_is_scheduler_origin(const claw_cap_call_context_t *ctx)
+{
+    if (ctx->caller == CLAW_CAP_CALLER_ROOT_AGENT || ctx->caller == CLAW_CAP_CALLER_SYSTEM) {
+        return cap_im_tg_str_is(ctx->source_cap, CLAW_CAP_SOURCE_SCHEDULER);
+    }
+    return cap_im_tg_is_subagent(ctx) &&
+           cap_im_tg_str_is(ctx->source_cap, CLAW_CAP_SOURCE_SUBAGENT_PREFIX CLAW_CAP_SOURCE_SCHEDULER);
+}
+
 const char *cap_im_tg_confirm_chat(const claw_cap_call_context_t *ctx)
 {
+    if (ctx && cap_im_tg_is_scheduler_origin(ctx)) {
+        return cap_im_tg_cron_chat(cap_im_tg_str_is(ctx->channel, "telegram") ? ctx->chat_id : NULL);
+    }
     if (!ctx || !cap_im_tg_str_is(ctx->channel, "telegram") || !ctx->chat_id || !ctx->chat_id[0]) {
         return NULL;
     }
     if ((ctx->caller == CLAW_CAP_CALLER_ROOT_AGENT || ctx->caller == CLAW_CAP_CALLER_SYSTEM) &&
-            cap_im_tg_str_is(ctx->source_cap, "tg_gateway")) {
+            cap_im_tg_str_is(ctx->source_cap, CLAW_CAP_SOURCE_TG_GATEWAY)) {
         return ctx->chat_id;
     }
-    if (cap_im_tg_is_subagent(ctx) && cap_im_tg_str_is(ctx->source_cap, "cap_agent_mgr/tg_gateway")) {
+    if (cap_im_tg_is_subagent(ctx) && cap_im_tg_str_is(ctx->source_cap, CLAW_CAP_SOURCE_SUBAGENT_PREFIX CLAW_CAP_SOURCE_TG_GATEWAY)) {
         return ctx->chat_id;
     }
     return NULL;

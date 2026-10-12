@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 /* Host tests for cap_im_tg_origin.c; run with test/host/run.sh. */
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +32,58 @@ static claw_cap_call_context_t ctx(claw_cap_caller_t caller, const char *channel
         .chat_id = chat_id,
         .agent_id = caller == CLAW_CAP_CALLER_SUB_AGENT ? SUB_ID : NULL,
     };
+}
+
+/* Stand-in for cap_im_tg.c: "/yolo cron" on or off; the request's chat when given, else chat "1". */
+static bool s_cron;
+const char *cap_im_tg_cron_chat(const char *request_chat)
+{
+    return s_cron ? (request_chat ? request_chat : "1") : NULL;
+}
+
+static void test_confirm_chat_cron(void)
+{
+    claw_cap_call_context_t c;
+
+    s_cron = true;
+    c = ctx(CLAW_CAP_CALLER_ROOT_AGENT, "telegram", "cap_scheduler", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == c.chat_id);
+    c = ctx(CLAW_CAP_CALLER_ROOT_AGENT, "local_im", "cap_scheduler", "42");
+    CHECK(strcmp(cap_im_tg_confirm_chat(&c), "1") == 0);
+    c = ctx(CLAW_CAP_CALLER_SYSTEM, NULL, "cap_scheduler", NULL);
+    CHECK(strcmp(cap_im_tg_confirm_chat(&c), "1") == 0);
+    c = ctx(CLAW_CAP_CALLER_SUB_AGENT, "telegram", "cap_agent_mgr/cap_scheduler", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == c.chat_id);
+    c.agent_id = "";
+    CHECK(cap_im_tg_confirm_chat(&c) == NULL);
+    /* Neither the plain root form for a subagent nor the prefixed form for a root agent. */
+    c = ctx(CLAW_CAP_CALLER_SUB_AGENT, "telegram", "cap_scheduler", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == NULL);
+    c = ctx(CLAW_CAP_CALLER_ROOT_AGENT, "telegram", "cap_agent_mgr/cap_scheduler", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == NULL);
+    c = ctx(CLAW_CAP_CALLER_CONSOLE, "telegram", "cap_scheduler", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == NULL);
+    c = ctx(CLAW_CAP_CALLER_ROOT_AGENT, "telegram", "cap_scheduler_x", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == NULL);
+    /* Other origins stay refused, and the gateway form is unaffected. */
+    c = ctx(CLAW_CAP_CALLER_ROOT_AGENT, "telegram", "claw_event_router", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == NULL);
+    c = ctx(CLAW_CAP_CALLER_ROOT_AGENT, "telegram", "tg_gateway", "42");
+    CHECK(cap_im_tg_confirm_chat(&c) == c.chat_id);
+    s_cron = false;
+}
+
+static void test_reserved_sources(void)
+{
+    CHECK(claw_cap_source_is_reserved("tg_gateway"));
+    CHECK(claw_cap_source_is_reserved("cap_scheduler"));
+    CHECK(claw_cap_source_is_reserved("cap_agent_mgr/anything"));
+    CHECK(claw_cap_source_is_reserved("cap_agent_mgr/"));
+    CHECK(!claw_cap_source_is_reserved("cap_agent_mgr"));
+    CHECK(!claw_cap_source_is_reserved("cap_scheduler_x"));
+    CHECK(!claw_cap_source_is_reserved("claw_event_router"));
+    CHECK(!claw_cap_source_is_reserved(""));
+    CHECK(!claw_cap_source_is_reserved(NULL));
 }
 
 static void test_confirm_chat(void)
@@ -128,6 +181,8 @@ static void test_confirm_note(void)
 int main(void)
 {
     test_confirm_chat();
+    test_confirm_chat_cron();
+    test_reserved_sources();
     test_confirm_note();
     if (s_failed) {
         printf("%d check(s) failed\n", s_failed);

@@ -374,7 +374,9 @@ static int32_t cap_wasm_confirm(wasm_exec_env_t env, const char *text, uint32_t 
         return -CAP_WASM_E2BIG;
     }
     /* Same rule as http_request mutations: only for work from an allowed Telegram chat. */
-    if (!cap_im_tg_confirm_chat(ctx)) {
+    const char *chat = cap_im_tg_confirm_chat(ctx);
+
+    if (!chat) {
         return -CAP_WASM_ENOTSUP;
     }
 #if CONFIG_APP_CLAW_CAP_IM_TG
@@ -403,11 +405,11 @@ static int32_t cap_wasm_confirm(wasm_exec_env_t env, const char *text, uint32_t 
     len = cap_im_tg_confirm_note(ctx, html, html_size);
 
     cap_wasm_budget_pause(true);
-    err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_WASM_CONFIRM_TIMEOUT_MS, &choice, &message_id);
+    err = cap_im_tg_confirm(chat, html, labels, 2, CAP_WASM_CONFIRM_TIMEOUT_MS, &choice, &message_id);
     if (err == ESP_OK) {
         snprintf(html + len, html_size - len, "\n\n<b>%s</b>",
                  choice == 0 ? "✅ bestätigt" : choice < 0 ? "⌛ Zeitüberschreitung" : "❌ abgelehnt");
-        cap_im_tg_edit_message(ctx->chat_id, message_id, html);
+        cap_im_tg_edit_message(chat, message_id, html);
     }
     cap_wasm_budget_pause(false);
     heap_caps_free(html);

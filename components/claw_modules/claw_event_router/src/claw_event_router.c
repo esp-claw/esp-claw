@@ -18,6 +18,7 @@
 
 #include "cJSON.h"
 #include "claw_agent_mgr.h"
+#include "claw_cap.h"
 #include "claw_core.h"
 #include "claw_event_publisher.h"
 #include "claw_session_mgr.h"
@@ -2001,8 +2002,8 @@ static esp_err_t claw_event_router_execute_emit_event_action(
     }
 
     value = cJSON_GetStringValue(cJSON_GetObjectItem(rendered_input, "source_cap"));
-    /* Rules (which the agent can write) must not pose as the Telegram gateway. */
-    if (value && strcmp(value, "tg_gateway") == 0) {
+    /* Rules (which the agent can write) must not pose as the Telegram gateway, the scheduler or a subagent. */
+    if (claw_cap_source_is_reserved(value)) {
         cJSON_Delete(rendered_input);
         return ESP_ERR_INVALID_ARG;
     }

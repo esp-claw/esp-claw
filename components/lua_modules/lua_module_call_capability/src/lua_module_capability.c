@@ -303,9 +303,9 @@ static void lua_module_capability_fill_context(lua_State *L, int opts_index, cla
             ctx->source_cap = value;
         }
     }
-    /* Tools trust tg_gateway as "an allowed Telegram user asked for this" (cap_im_tg_confirm_chat()). */
-    if (ctx->source_cap && strcmp(ctx->source_cap, "tg_gateway") == 0) {
-        luaL_error(L, "source_cap tg_gateway is reserved");
+    /* Tools trust these as "an allowed Telegram user or the scheduler asked for this" (cap_im_tg_confirm_chat()). */
+    if (claw_cap_source_is_reserved(ctx->source_cap)) {
+        luaL_error(L, "source_cap %s is reserved", ctx->source_cap);
     }
 }
 

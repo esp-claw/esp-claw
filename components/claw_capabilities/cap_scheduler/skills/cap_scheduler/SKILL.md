@@ -98,6 +98,7 @@ Use this skill when the user needs to inspect or control timer-based schedule ru
 - Scheduler rules only define when an event is published.
 - Any post-trigger behavior such as sending a message, running the agent, or calling another capability must be configured elsewhere.
 - Router rule are introduced in `cap_router_mgr` skill, not in this skill.
+- Agents started by a schedule cannot use tools that need a Telegram confirmation (`ssh_exec`, `http_request` mutations, WASM installs, ...) unless the owner turned on `/yolo cron` in Telegram; then they run without asking. The agent cannot switch it on.
 
 ## Recommended workflow
 1. Use `scheduler_list` or `scheduler_get` to inspect current state and avoid id conflicts.

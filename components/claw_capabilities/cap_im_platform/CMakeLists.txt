@@ -50,6 +50,7 @@ idf_component_register(
         fatfs
         freertos
         mbedtls
+        nvs_flash
         console
 )
 

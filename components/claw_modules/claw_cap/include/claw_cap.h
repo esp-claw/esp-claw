@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "claw_core.h"
 #include "esp_err.h"
@@ -61,6 +62,22 @@ typedef struct {
     claw_core_handle_t core;
     claw_cap_caller_t caller;
 } claw_cap_call_context_t;
+
+/*
+ * Origins that tools trust (cap_im_tg_confirm_chat()): only their gateway or the scheduler may
+ * publish events or build call contexts with them, never router rules or Lua.
+ */
+#define CLAW_CAP_SOURCE_TG_GATEWAY "tg_gateway"
+#define CLAW_CAP_SOURCE_SCHEDULER "cap_scheduler"
+#define CLAW_CAP_SOURCE_SUBAGENT_PREFIX "cap_agent_mgr/"
+
+static inline bool claw_cap_source_is_reserved(const char *source_cap)
+{
+    return source_cap &&
+           (strcmp(source_cap, CLAW_CAP_SOURCE_TG_GATEWAY) == 0 ||
+            strcmp(source_cap, CLAW_CAP_SOURCE_SCHEDULER) == 0 ||
+            strncmp(source_cap, CLAW_CAP_SOURCE_SUBAGENT_PREFIX, sizeof(CLAW_CAP_SOURCE_SUBAGENT_PREFIX) - 1) == 0);
+}
 
 typedef struct {
     uint32_t magic;

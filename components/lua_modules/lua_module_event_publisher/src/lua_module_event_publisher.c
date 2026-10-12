@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "claw_cap.h"
 #include "claw_event_publisher.h"
 #include "esp_err.h"
 #include "esp_timer.h"
@@ -270,13 +271,13 @@ static void lua_module_event_publisher_raise_publish_error(lua_State *L, esp_err
     luaL_error(L, "event publish failed: %s", esp_err_to_name(err));
 }
 
-/* Only the Telegram gateway may publish as tg_gateway: tools trust it as "an allowed user wrote this". */
+/* Only the gateway or scheduler may publish as tg_gateway, cap_scheduler or a subagent: tools trust them. */
 static const char *lua_event_publisher_source_cap(lua_State *L)
 {
     const char *source_cap = lua_table_get_string_field(L, 1, "source_cap", true);
 
-    if (strcmp(source_cap, "tg_gateway") == 0) {
-        luaL_error(L, "source_cap tg_gateway is reserved");
+    if (claw_cap_source_is_reserved(source_cap)) {
+        luaL_error(L, "source_cap %s is reserved", source_cap);
     }
     return source_cap;
 }

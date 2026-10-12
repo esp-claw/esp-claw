@@ -45,10 +45,11 @@ Use this skill when the user asks to run a command on, inspect, or administer on
 - Hardline except for some subcommands: `docker`/`podman` unless the first argument is ps, logs, inspect, images or stats; `systemctl` unless it is status, is-active, is-enabled or list-units; `service` unless the second argument is status. Rules for them name the subcommand, for example `systemctl status *`. `journalctl` is allowed.
 
 ## Yolo mode
-- The owner toggles it in Telegram with `/yolo`. It is RAM only and ends on reboot.
+- The owner toggles it in Telegram with `/yolo`; the state is kept in NVS and survives reboots.
 - It is global: while active, every confirmation is approved automatically, not only SSH. That covers `ssh_exec` (hardline programs and commands that cannot be parsed included), `remote_delete`, `http_request`, and WASM app installs and updates including firmware.
+- `/yolo cron` is a second, independent toggle for work started by the scheduler. While it is on, scheduler-started agents (and their subagents) may use these tools too and are approved automatically, even with `/yolo` off. The notice goes to the request's Telegram chat if it has one, else to the first allowed chat. Without it, scheduler jobs get the "only available for requests from an allowed Telegram chat" error as before.
 - Telegram still shows each prompt as a "⚡ Yolo" notice, without buttons and without rule buttons.
-- It cannot be switched on by the agent, Lua or router rules; only the `/yolo` command from an allowed Telegram chat toggles it.
+- Only the `/yolo` command from an allowed Telegram chat toggles them; the agent, Lua and router rules cannot, and cannot publish events as `cap_scheduler`.
 
 ## Remote files
 - Only hosts with a `workdir` support them; the `remote_write_file` description lists them as `name (workdir)`. Other hosts get an error.

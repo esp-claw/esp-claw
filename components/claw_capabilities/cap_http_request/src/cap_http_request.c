@@ -684,6 +684,7 @@ static esp_err_t cap_http_request_run(const cJSON *input,
     char *profile_url = NULL;
 #if CONFIG_APP_CLAW_CAP_IM_TG
     char *html = NULL;
+    const char *chat = NULL;
     size_t prompt_len = 0;
     int64_t message_id = 0;
     bool prompt_settled = false;
@@ -926,7 +927,8 @@ static esp_err_t cap_http_request_run(const cJSON *input,
             cap_http_request_html_put(html, &prompt_len, "</pre>", SIZE_MAX, false);
         }
         prompt_len = cap_im_tg_confirm_note(ctx, html, CAP_HTTP_REQUEST_PROMPT_MAX);
-        err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_HTTP_REQUEST_CONFIRM_TIMEOUT_MS,
+        chat = cap_im_tg_confirm_chat(ctx);
+        err = cap_im_tg_confirm(chat, html, labels, 2, CAP_HTTP_REQUEST_CONFIRM_TIMEOUT_MS,
                                 &choice, &message_id);
         if (err != ESP_OK) {
             snprintf(output, output_size, "Error: could not ask for confirmation in Telegram (%s)",
@@ -934,7 +936,7 @@ static esp_err_t cap_http_request_run(const cJSON *input,
             goto cleanup;
         }
         if (choice != 0) {
-            cap_http_request_finish_prompt(ctx->chat_id, message_id, html, prompt_len,
+            cap_http_request_finish_prompt(chat, message_id, html, prompt_len,
                                            choice < 0 ? "⌛ Zeitüberschreitung" : "❌ abgelehnt");
             snprintf(output, output_size, "Error: %s",
                      choice < 0 ? "Zeitüberschreitung: keine Bestätigung innerhalb von 60 s" : "abgelehnt vom Benutzer");
@@ -1088,7 +1090,7 @@ cleanup:
         } else {
             snprintf(done, sizeof(done), "%s HTTP %d", status >= 200 && status < 400 ? "✅" : "⚠️", status);
         }
-        cap_http_request_finish_prompt(ctx->chat_id, message_id, html, prompt_len, done);
+        cap_http_request_finish_prompt(chat, message_id, html, prompt_len, done);
     }
     free(html);
 #endif

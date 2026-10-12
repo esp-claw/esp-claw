@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
@@ -69,6 +70,11 @@ static const char *TAG = "cap_im_tg";
 #define CAP_IM_TG_VOICE_PREFIX           "[Sprachnachricht]"
 #define CAP_IM_TG_CONFIRM_PREFIX         "cf:"
 #define CAP_IM_TG_CONFIRM_NONCE_LEN      16
+#define CAP_IM_TG_NVS_NAMESPACE          "cap_im_tg"
+#define CAP_IM_TG_NVS_KEY_YOLO           "yolo"
+#define CAP_IM_TG_NVS_KEY_YOLO_CRON      "yolo_cron"
+#define CAP_IM_TG_YOLO_CRON_ARG          "cron"
+#define CAP_IM_TG_CHAT_ID_LEN            24
 #define CAP_IM_TG_BUSY_LABEL_LEN         128
 #define CAP_IM_TG_BUSY_LABEL_MAX         120
 #define CAP_IM_TG_DRAFT_INTERVAL_MS      20000
@@ -131,8 +137,10 @@ typedef struct {
     TaskHandle_t busy_task;
     QueueHandle_t attachment_queue;
     volatile bool stop_requested;
-    /* /yolo: cap_im_tg_confirm() approves without asking. RAM only, off after a reboot. */
+    /* /yolo: cap_im_tg_confirm() approves without asking. /yolo cron: the same for scheduler-started
+     * work, even with /yolo off. Both are kept in NVS. */
     volatile bool yolo;
+    volatile bool yolo_cron;
     int64_t next_update_id;
     uint64_t seen_update_keys[CAP_IM_TG_DEDUP_CACHE_SIZE];
     size_t seen_update_idx;
@@ -156,6 +164,8 @@ static volatile bool s_tg_online; /* a getUpdates poll succeeded since boot */
 static bool s_tg_initialized;
 static bool s_tg_rich_unsupported;
 static cap_im_tg_confirm_t s_confirm;
+/* Chat of the last scheduler-origin lookup; cap_im_tg_confirm() treats this pointer as "from the scheduler". */
+static char s_cron_chat[CAP_IM_TG_CHAT_ID_LEN];
 static portMUX_TYPE s_confirm_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* What the agent is doing for chat_id (empty when idle), shown as a draft bubble or typing dots.
@@ -174,6 +184,42 @@ static cap_im_tg_busy_t s_busy;
 static portMUX_TYPE s_busy_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_tg_draft_unsupported;
 
+static bool cap_im_tg_yolo_read(nvs_handle_t nvs, const char *key)
+{
+    uint8_t value = 0;
+
+    return nvs_get_u8(nvs, key, &value) == ESP_OK && value;
+}
+
+/* Restores the /yolo toggles; both stay off when NVS has nothing. */
+static void cap_im_tg_yolo_load(void)
+{
+    nvs_handle_t nvs;
+
+    if (nvs_open(CAP_IM_TG_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    s_tg.yolo = cap_im_tg_yolo_read(nvs, CAP_IM_TG_NVS_KEY_YOLO);
+    s_tg.yolo_cron = cap_im_tg_yolo_read(nvs, CAP_IM_TG_NVS_KEY_YOLO_CRON);
+    nvs_close(nvs);
+}
+
+static esp_err_t cap_im_tg_yolo_save(const char *key, bool on)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(CAP_IM_TG_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(nvs, key, on);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
 static void cap_im_tg_init_defaults(void)
 {
     if (s_tg_initialized) {
@@ -185,6 +231,7 @@ static void cap_im_tg_init_defaults(void)
     s_tg.next_update_id = 0;
     s_confirm.lock = xSemaphoreCreateMutex();
     s_confirm.answered = xSemaphoreCreateBinary();
+    cap_im_tg_yolo_load();
     s_tg_initialized = true;
 }
 
@@ -1277,7 +1324,7 @@ static const struct {
     {"skills", "List the registered skills", NULL, cap_im_tg_cmd_skills},
     {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},
     {"ssh", "SSH client (pubkey, allowed, allow, revoke)", "ssh_command", NULL},
-    {"yolo", "Toggle automatic approval of all confirmations", NULL, cap_im_tg_cmd_yolo},
+    {"yolo", "Auto-approve all confirmations (yolo cron: for scheduler jobs)", NULL, cap_im_tg_cmd_yolo},
     {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
     {"app", "Install, update (update all, updates), remove or configure (config) a WASM app", "apps_command", NULL},
     {"updates", "Check for app and firmware updates", "apps_check_updates", NULL},
@@ -1335,11 +1382,41 @@ static esp_err_t cap_im_tg_add_skill(const claw_skill_catalog_entry_t *entry, vo
 }
 #endif
 
+/* "/yolo" toggles automatic approval of all confirmations, "/yolo cron" the same for scheduler jobs. */
 static void cap_im_tg_cmd_yolo(const char *chat_id, const char *args)
 {
-    (void)args;
-    s_tg.yolo = !s_tg.yolo;
-    cap_im_tg_send_text(chat_id, s_tg.yolo ? "⚡ Yolo an: alle Bestätigungen werden automatisch erteilt" : "Yolo aus");
+    char reply[96];
+    bool cron = strcmp(args, CAP_IM_TG_YOLO_CRON_ARG) == 0;
+    volatile bool *flag = cron ? &s_tg.yolo_cron : &s_tg.yolo;
+    bool saved;
+
+    if (args[0] && !cron) {
+        cap_im_tg_send_text(chat_id, "Usage: /yolo [cron]");
+        return;
+    }
+    *flag = !*flag;
+    saved = cap_im_tg_yolo_save(cron ? CAP_IM_TG_NVS_KEY_YOLO_CRON : CAP_IM_TG_NVS_KEY_YOLO, *flag) == ESP_OK;
+    snprintf(reply, sizeof(reply), "⚡ Yolo: %s · Cron: %s%s", s_tg.yolo ? "an" : "aus",
+             s_tg.yolo_cron ? "an" : "aus", saved ? "" : " (nicht gespeichert)");
+    cap_im_tg_send_text(chat_id, reply);
+}
+
+const char *cap_im_tg_cron_chat(const char *request_chat)
+{
+    char *end = NULL;
+    long long id = request_chat ? strtoll(request_chat, &end, 10) : 0;
+
+    if (!s_tg.yolo_cron) {
+        return NULL;
+    }
+    if (request_chat && request_chat[0] && !*end && cap_im_tg_user_allowed(id)) {
+        strlcpy(s_cron_chat, request_chat, sizeof(s_cron_chat));
+    } else if (s_tg.allowed_user_count > 0) {
+        snprintf(s_cron_chat, sizeof(s_cron_chat), "%" PRId64, s_tg.allowed_user_ids[0]);
+    } else {
+        return NULL;
+    }
+    return s_cron_chat;
 }
 
 static void cap_im_tg_cmd_skills(const char *chat_id, const char *args)
@@ -3301,6 +3378,7 @@ esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *c
     char nonce[CAP_IM_TG_CONFIRM_NONCE_LEN + 1];
     char data[32];
     cJSON *rows = NULL;
+    bool cron;
     esp_err_t err;
 
     if (!chat_id || !chat_id[0] || !html || !labels || label_count < 1 || label_count > 10 || !out_choice ||
@@ -3314,9 +3392,10 @@ esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *c
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_tg.yolo) {
-        static const char yolo_prefix[] = "⚡ Yolo, automatisch bestätigt:\n";
-        size_t notice_len = sizeof(yolo_prefix) + strlen(html);
+    cron = chat_id == s_cron_chat;
+    if (s_tg.yolo || (cron && s_tg.yolo_cron)) {
+        const char *yolo_prefix = cron ? "⚡ Yolo (Cron), automatisch bestätigt:\n" : "⚡ Yolo, automatisch bestätigt:\n";
+        size_t notice_len = strlen(yolo_prefix) + strlen(html) + 1;
         char *notice = malloc(notice_len);
 
         /* The notice is informational: a failed send must not block the approval. */

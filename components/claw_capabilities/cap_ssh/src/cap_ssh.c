@@ -1027,9 +1027,10 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     bool auto_allowed = false;
     int64_t message_id = 0;
     int choice = -1;
+    const char *chat = cap_im_tg_confirm_chat(ctx);
     esp_err_t err;
 
-    if (!cap_im_tg_confirm_chat(ctx)) {
+    if (!chat) {
         snprintf(output, output_size,
                  "Error: ssh_exec is only available for requests from an allowed Telegram chat");
         return ESP_ERR_NOT_SUPPORTED;
@@ -1109,9 +1110,9 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     prompt_len = cap_im_tg_confirm_note(ctx, html, CAP_SSH_PROMPT_MAX);
     if (auto_allowed) {
         choice = 0;
-        err = cap_im_tg_send_html(ctx->chat_id, html, &message_id);
+        err = cap_im_tg_send_html(chat, html, &message_id);
     } else {
-        err = cap_im_tg_confirm(ctx->chat_id, html, offer_rules ? labels : short_labels,
+        err = cap_im_tg_confirm(chat, html, offer_rules ? labels : short_labels,
                                 offer_rules ? 4 : 2, CAP_SSH_CONFIRM_TIMEOUT_MS, &choice, &message_id);
     }
     if (err != ESP_OK) {
@@ -1131,7 +1132,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     } else if (choice != 0) {
         bool timeout = choice < 0;
 
-        cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len,
+        cap_ssh_finish_prompt(chat, message_id, html, prompt_len,
                               timeout ? "⌛ Zeitüberschreitung" : "❌ abgelehnt", note);
         snprintf(output, output_size, "Error: %s",
                  timeout ? "Zeitüberschreitung: keine Bestätigung innerhalb von 60 s" : "abgelehnt vom Benutzer");
@@ -1143,7 +1144,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     job->err = heap_caps_calloc(1, CAP_SSH_OUTPUT_MAX + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     job->done = xSemaphoreCreateBinary();
     if (!job->out || !job->err || !job->done || xQueueSend(s_ssh.queue, &job, 0) != pdTRUE) {
-        cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len, "⚠️ fehlgeschlagen", note);
+        cap_ssh_finish_prompt(chat, message_id, html, prompt_len, "⚠️ fehlgeschlagen", note);
         err = ESP_ERR_NO_MEM;
         snprintf(output, output_size, "Error: could not start the SSH session");
         goto cleanup;
@@ -1152,7 +1153,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     xSemaphoreTake(job->done, portMAX_DELAY);
 
     if (job->error[0]) {
-        cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len, "⚠️ fehlgeschlagen", note);
+        cap_ssh_finish_prompt(chat, message_id, html, prompt_len, "⚠️ fehlgeschlagen", note);
         snprintf(output, output_size, "Error: ssh %s: %s", name, job->error);
         err = ESP_FAIL;
         goto cleanup;
@@ -1162,7 +1163,7 @@ static esp_err_t cap_ssh_exec_execute(const char *input_json,
     } else {
         snprintf(status, sizeof(status), "✅ ausgeführt (exit %d)", job->exit_code);
     }
-    cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len, status, note);
+    cap_ssh_finish_prompt(chat, message_id, html, prompt_len, status, note);
     cap_ssh_write_result(name, job, output, output_size);
     err = ESP_OK;
 
@@ -1236,9 +1237,10 @@ static esp_err_t cap_ssh_remote_execute(cap_ssh_op_t op, const char *input_json,
     size_t prompt_len = 0;
     int64_t message_id = 0;
     int choice = -1;
+    const char *chat = cap_im_tg_confirm_chat(ctx);
     esp_err_t err = ESP_ERR_INVALID_ARG;
 
-    if (!cap_im_tg_confirm_chat(ctx)) {
+    if (!chat) {
         snprintf(output, output_size, "Error: %s is only available for requests from an allowed Telegram chat",
                  s_op_names[op]);
         return ESP_ERR_NOT_SUPPORTED;
@@ -1312,13 +1314,13 @@ static esp_err_t cap_ssh_remote_execute(cap_ssh_op_t op, const char *input_json,
             cap_ssh_html_put(html, &prompt_len, parts[i], i % 2 == 1);
         }
         prompt_len = cap_im_tg_confirm_note(ctx, html, CAP_SSH_PROMPT_MAX);
-        err = cap_im_tg_confirm(ctx->chat_id, html, labels, 2, CAP_SSH_CONFIRM_TIMEOUT_MS, &choice, &message_id);
+        err = cap_im_tg_confirm(chat, html, labels, 2, CAP_SSH_CONFIRM_TIMEOUT_MS, &choice, &message_id);
         if (err != ESP_OK) {
             snprintf(output, output_size, "Error: could not ask for confirmation in Telegram (%s)", esp_err_to_name(err));
             goto cleanup;
         }
         if (choice != 0) {
-            cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len,
+            cap_ssh_finish_prompt(chat, message_id, html, prompt_len,
                                   choice < 0 ? "⌛ Zeitüberschreitung" : "❌ abgelehnt", "");
             snprintf(output, output_size, "Error: %s",
                      choice < 0 ? "Zeitüberschreitung: keine Bestätigung innerhalb von 60 s" : "abgelehnt vom Benutzer");
@@ -1352,7 +1354,7 @@ static esp_err_t cap_ssh_remote_execute(cap_ssh_op_t op, const char *input_json,
         }
     }
     if (html) {
-        cap_ssh_finish_prompt(ctx->chat_id, message_id, html, prompt_len, err == ESP_OK ? "✅ gelöscht" : "⚠️ fehlgeschlagen", "");
+        cap_ssh_finish_prompt(chat, message_id, html, prompt_len, err == ESP_OK ? "✅ gelöscht" : "⚠️ fehlgeschlagen", "");
     }
 
 cleanup:
