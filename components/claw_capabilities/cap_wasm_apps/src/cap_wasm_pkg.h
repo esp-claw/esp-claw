@@ -53,7 +53,7 @@
 #define CAP_WASM_MANIFEST_MAX    4096
 #define CAP_WASM_SIGNATURE_MAX   1024
 #define CAP_WASM_PKG_FORMAT_MAX  2    /* highest signature.json "sdk" / package format accepted */
-#define CAP_WASM_API_VERSION     1    /* claw import module version this firmware implements */
+#define CAP_WASM_API_VERSION     2    /* claw import module version this firmware implements (2: time_utc) */
 #define CAP_WASM_KEY_ID_LEN      8
 #define CAP_WASM_SHA_LEN         32
 #define CAP_WASM_SHA_HEX_LEN     64
@@ -224,6 +224,21 @@ bool cap_wasm_index_check(const char *index, size_t index_len, const char *sig_j
 
 /* The index.json URL of an app's source URL (see above); false when the source is not an https URL with a path. */
 bool cap_wasm_index_url(const char *source_url, char *out, size_t size);
+
+/*
+ * claw.time_utc (api 2) writes this record into the app's buffer: u64 little-endian unix
+ * milliseconds, then u8 quality. Quality 0 (none): the wall clock was never set; 1 (synced): set
+ * by SNTP or restored from the RTC; 2 (authenticated): signed time, which this firmware never
+ * produces (rust-claw does, with Roughtime).
+ */
+#define CAP_WASM_TIME_UTC_LEN       9
+#define CAP_WASM_TIME_NONE          0
+#define CAP_WASM_TIME_SYNCED        1
+#define CAP_WASM_TIME_AUTHENTICATED 2
+
+/* CAP_WASM_TIME_SYNCED when `unix_s` is at or after CAP_WASM_CLOCK_VALID_S, else CAP_WASM_TIME_NONE. */
+uint8_t cap_wasm_time_quality(int64_t unix_s);
+void cap_wasm_time_utc_pack(int64_t unix_ms, uint8_t quality, uint8_t out[CAP_WASM_TIME_UTC_LEN]);
 
 #define CAP_WASM_DOWNGRADE_FLAG "--allow-downgrade"
 

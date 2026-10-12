@@ -572,6 +572,23 @@ static void test_key_scope(void)
     CHECK_ERR(s_err, "scoped to apps and cannot sign firmware");
 }
 
+static void test_time_utc(void)
+{
+    uint8_t out[CAP_WASM_TIME_UTC_LEN];
+
+    CHECK(cap_wasm_time_quality(0) == CAP_WASM_TIME_NONE);
+    CHECK(cap_wasm_time_quality(CAP_WASM_CLOCK_VALID_S - 1) == CAP_WASM_TIME_NONE);
+    CHECK(cap_wasm_time_quality(CAP_WASM_CLOCK_VALID_S) == CAP_WASM_TIME_SYNCED);
+    CHECK(cap_wasm_time_quality(1790000000) == CAP_WASM_TIME_SYNCED);
+    /* 1790000000123 ms = 0x000001A0_C450_6C7B little-endian, then the quality byte. */
+    cap_wasm_time_utc_pack(1790000000123LL, CAP_WASM_TIME_SYNCED, out);
+    CHECK(memcmp(out, "\x7b\x6c\x50\xc4\xa0\x01\x00\x00\x01", 9) == 0);
+    cap_wasm_time_utc_pack(0, CAP_WASM_TIME_NONE, out);
+    CHECK(memcmp(out, "\0\0\0\0\0\0\0\0\0", 9) == 0);
+    cap_wasm_time_utc_pack(-1, CAP_WASM_TIME_AUTHENTICATED, out);
+    CHECK(memcmp(out, "\xff\xff\xff\xff\xff\xff\xff\xff\x02", 9) == 0);
+}
+
 int main(void)
 {
     FILE *f = fopen("ecapp_vectors.json", "rb");
@@ -619,6 +636,7 @@ int main(void)
     test_index();
     test_index_url();
     test_key_scope();
+    test_time_utc();
     cJSON_Delete(s_vectors);
     if (s_failed) {
         printf("%d check(s) failed\n", s_failed);

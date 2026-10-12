@@ -5,7 +5,7 @@
  */
 
 /*
- * Host API v1 (import module "claw"). Every app buffer is declared as "*~" (pointer + length) in
+ * Host API v2 (import module "claw"; CAP_WASM_API_VERSION). Every app buffer is declared as "*~" (pointer + length) in
  * the native signature, so WAMR bounds-checks it against the app's linear memory before the
  * native runs and traps the call otherwise. Natives run on the WASM thread only.
  */
@@ -635,6 +635,22 @@ static int32_t cap_wasm_random(wasm_exec_env_t env, uint8_t *buf, uint32_t len)
     return 0;
 }
 
+/* api 2: wall time with its quality (cap_wasm_time_utc_pack layout); -1 when the clock was never set. */
+static int32_t cap_wasm_time_utc(wasm_exec_env_t env, uint8_t *out, uint32_t len)
+{
+    struct timeval tv;
+    uint8_t quality;
+
+    (void)env;
+    if (len < CAP_WASM_TIME_UTC_LEN) {
+        return -CAP_WASM_EINVAL;
+    }
+    gettimeofday(&tv, NULL);
+    quality = cap_wasm_time_quality(tv.tv_sec);
+    cap_wasm_time_utc_pack((int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000, quality, out);
+    return quality == CAP_WASM_TIME_NONE ? -1 : 0;
+}
+
 /* github.com/esp-claw/app-sdk (include/claw.h, tools/manifest_check.py, tools/wasm_check.py) mirrors
  * this host API and its permissions; update it together with this table. */
 NativeSymbol g_cap_wasm_natives[] = {
@@ -653,6 +669,7 @@ NativeSymbol g_cap_wasm_natives[] = {
     { "notify", cap_wasm_notify, "(*~)i", NULL },
     { "now_ms", cap_wasm_now_ms, "()I", NULL },
     { "random", cap_wasm_random, "(*~)i", NULL },
+    { "time_utc", cap_wasm_time_utc, "(*~)i", NULL },
 };
 const size_t g_cap_wasm_native_count = sizeof(g_cap_wasm_natives) / sizeof(g_cap_wasm_natives[0]);
 
@@ -674,6 +691,7 @@ bool cap_wasm_host_import_perm(const char *name, uint32_t *out_perm, uint16_t *o
         { "ping", CAP_WASM_PERM_PING, 1 },
         { "timer_set", CAP_WASM_PERM_TIMER, 1 },
         { "notify", CAP_WASM_PERM_NOTIFY, 1 },
+        { "time_utc", 0, 2 },
     };
 
     for (size_t i = 0; i < g_cap_wasm_native_count; i++) {

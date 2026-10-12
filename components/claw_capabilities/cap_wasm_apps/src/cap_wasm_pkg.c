@@ -727,6 +727,19 @@ bool cap_wasm_index_url(const char *source_url, char *out, size_t size)
     return n > 0 && (size_t)n < size;
 }
 
+uint8_t cap_wasm_time_quality(int64_t unix_s)
+{
+    return unix_s >= CAP_WASM_CLOCK_VALID_S ? CAP_WASM_TIME_SYNCED : CAP_WASM_TIME_NONE;
+}
+
+void cap_wasm_time_utc_pack(int64_t unix_ms, uint8_t quality, uint8_t out[CAP_WASM_TIME_UTC_LEN])
+{
+    for (int i = 0; i < 8; i++) {
+        out[i] = (uint8_t)((uint64_t)unix_ms >> (8 * i));
+    }
+    out[8] = quality;
+}
+
 bool cap_wasm_rollback_check(const char *name, const char *version, const char *floor, bool allow_downgrade,
                              char *err, size_t err_size)
 {
