@@ -131,6 +131,8 @@ typedef struct {
     TaskHandle_t busy_task;
     QueueHandle_t attachment_queue;
     volatile bool stop_requested;
+    /* /yolo: cap_im_tg_confirm() approves without asking. RAM only, off after a reboot. */
+    volatile bool yolo;
     int64_t next_update_id;
     uint64_t seen_update_keys[CAP_IM_TG_DEDUP_CACHE_SIZE];
     size_t seen_update_idx;
@@ -1255,6 +1257,7 @@ static bool cap_im_tg_list_init(cap_im_tg_list_t *list)
 static void cap_im_tg_cmd_help(const char *chat_id, const char *args);
 static void cap_im_tg_cmd_skills(const char *chat_id, const char *args);
 static void cap_im_tg_cmd_tools(const char *chat_id, const char *args);
+static void cap_im_tg_cmd_yolo(const char *chat_id, const char *args);
 
 /*
  * Every slash command handled here: the source of truth for dispatch, /help and setMyCommands.
@@ -1274,6 +1277,7 @@ static const struct {
     {"skills", "List the registered skills", NULL, cap_im_tg_cmd_skills},
     {"tools", "List the tools the LLM can call, by capability", NULL, cap_im_tg_cmd_tools},
     {"ssh", "SSH client (pubkey, allowed, allow, revoke)", "ssh_command", NULL},
+    {"yolo", "Toggle automatic approval of all confirmations", NULL, cap_im_tg_cmd_yolo},
     {"apps", "WASM apps (list, enable, disable, load, unload, reload)", "apps_command", NULL},
     {"app", "Install, update (update all, updates), remove or configure (config) a WASM app", "apps_command", NULL},
     {"updates", "Check for app and firmware updates", "apps_check_updates", NULL},
@@ -1330,6 +1334,13 @@ static esp_err_t cap_im_tg_add_skill(const claw_skill_catalog_entry_t *entry, vo
     return ESP_OK;
 }
 #endif
+
+static void cap_im_tg_cmd_yolo(const char *chat_id, const char *args)
+{
+    (void)args;
+    s_tg.yolo = !s_tg.yolo;
+    cap_im_tg_send_text(chat_id, s_tg.yolo ? "⚡ Yolo an: alle Bestätigungen werden automatisch erteilt" : "Yolo aus");
+}
 
 static void cap_im_tg_cmd_skills(const char *chat_id, const char *args)
 {
@@ -3301,6 +3312,22 @@ esp_err_t cap_im_tg_confirm(const char *chat_id, const char *html, const char *c
     }
     if (xTaskGetCurrentTaskHandle() == s_tg.poll_task) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_tg.yolo) {
+        static const char yolo_prefix[] = "⚡ Yolo, automatisch bestätigt:\n";
+        size_t notice_len = sizeof(yolo_prefix) + strlen(html);
+        char *notice = malloc(notice_len);
+
+        /* The notice is informational: a failed send must not block the approval. */
+        *out_message_id = 0;
+        if (notice) {
+            snprintf(notice, notice_len, "%s%s", yolo_prefix, html);
+            (void)cap_im_tg_send_html_markup(chat_id, notice, NULL, out_message_id);
+            free(notice);
+        }
+        *out_choice = 0;
+        return ESP_OK;
     }
 
     snprintf(nonce, sizeof(nonce), "%08" PRIx32 "%08" PRIx32, esp_random(), esp_random());
