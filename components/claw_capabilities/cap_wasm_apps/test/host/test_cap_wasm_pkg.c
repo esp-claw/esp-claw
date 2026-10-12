@@ -494,6 +494,84 @@ static void test_index_url(void)
     CHECK(!cap_wasm_index_url("https://example.com/apps/h.ecapp", url, 24));
 }
 
+static bool parse_key_entry(const char *json, cap_wasm_key_t *out)
+{
+    cJSON *item = cJSON_Parse(json);
+    bool ok = cap_wasm_key_parse_entry(item, out, s_err, sizeof(s_err));
+
+    cJSON_Delete(item);
+    return ok;
+}
+
+static void test_key_scope(void)
+{
+    static const char manifest[] = "{\"name\":\"cf_dns\",\"version\":\"1.0.0\",\"api\":1}";
+    static const uint8_t wasm[] = "\0asm\1\0\0\0";
+    const char *index = vec("index_v1", "index_json");
+    const char *index_sig = vec("index_v1", "index_sig");
+    cap_wasm_key_t scoped;
+    cap_wasm_key_t key;
+    cap_wasm_index_t info;
+    cap_wasm_index_entry_t entry;
+    cap_wasm_fw_sig_t fw;
+    char json[256];
+    char sig[CAP_WASM_SIGNATURE_MAX];
+    char canonical[192];
+    char sig_b64[96];
+    uint8_t raw[64];
+    uint8_t pkg[1024];
+    size_t len;
+
+    /* Entries: a plain string is unscoped, an object may carry 1-4 name prefixes. */
+    snprintf(json, sizeof(json), "\"%s\"", vec("key", "pub_b64"));
+    CHECK(parse_key_entry(json, &key) && key.prefix_count == 0 && strcmp(key.key_id, s_key.key_id) == 0);
+    CHECK(cap_wasm_key_allows(&key, "anything"));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\"}", vec("key", "pub_b64"));
+    CHECK(parse_key_entry(json, &key) && key.prefix_count == 0);
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"apps\":[\"cf\",\"hello\"]}", vec("key", "pub_b64"));
+    CHECK(parse_key_entry(json, &scoped) && scoped.prefix_count == 2 && memcmp(scoped.pub, s_key.pub, 32) == 0);
+    CHECK(cap_wasm_key_allows(&scoped, "cf") && cap_wasm_key_allows(&scoped, "cf_dns") && cap_wasm_key_allows(&scoped, "hello"));
+    CHECK(!cap_wasm_key_allows(&scoped, "c") && !cap_wasm_key_allows(&scoped, "xcf") && !cap_wasm_key_allows(&scoped, "other"));
+    CHECK(!parse_key_entry("\"not base64!\"", &key));
+    CHECK(!parse_key_entry("5", &key));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"apps\":[]}", vec("key", "pub_b64"));
+    CHECK(!parse_key_entry(json, &key));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"apps\":[\"a\",\"b\",\"c\",\"d\",\"e\"]}", vec("key", "pub_b64"));
+    CHECK(!parse_key_entry(json, &key));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"apps\":[\"Cf\"]}", vec("key", "pub_b64"));
+    CHECK(!parse_key_entry(json, &key));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"apps\":\"cf\"}", vec("key", "pub_b64"));
+    CHECK(!parse_key_entry(json, &key));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"scope\":[\"cf\"]}", vec("key", "pub_b64"));
+    CHECK(!parse_key_entry(json, &key));
+    CHECK_ERR(s_err, "unknown trusted key field 'scope'");
+
+    /* A package signed by a scoped key: accepted inside the scope, refused outside. */
+    sig_v2(1, "cf_dns", "1.0.0", manifest, wasm, sizeof(wasm), sig, sizeof(sig));
+    len = pack(2, manifest, wasm, sizeof(wasm), sig, pkg, sizeof(pkg));
+    CHECK(accept(pkg, len, &scoped, 1));
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"apps\":[\"hello\"]}", vec("key", "pub_b64"));
+    CHECK(parse_key_entry(json, &scoped));
+    CHECK(!accept(pkg, len, &scoped, 1));
+    CHECK_ERR(s_err, "not trusted for app cf_dns");
+
+    /* The same for the entries of a signed index, and never firmware. */
+    CHECK(cap_wasm_index_check(index, strlen(index), index_sig, &scoped, 1, 1790000000, true, 0, "hello", &info, &entry,
+                               s_err, sizeof(s_err)));
+    CHECK(!cap_wasm_index_check(index, strlen(index), index_sig, &scoped, 1, 1790000000, true, 0, "other", &info, &entry,
+                                s_err, sizeof(s_err)));
+    CHECK_ERR(s_err, "not trusted for app other");
+    len = cap_wasm_fw_sig_canonical("edge_agent", "1.0.0", 1000, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", canonical, sizeof(canonical));
+    crypto_ed25519_sign(raw, s_secret, (const uint8_t *)canonical, len);
+    b64(raw, sizeof(raw), sig_b64, sizeof(sig_b64));
+    snprintf(sig, sizeof(sig), "{\"alg\":\"ed25519\",\"key_id\":\"%s\",\"version\":\"1.0.0\",\"project\":\"edge_agent\","
+             "\"size\":1000,\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"sig\":\"%s\"}",
+             s_key.key_id, sig_b64);
+    CHECK(cap_wasm_fw_sig_verify(sig, &s_key, 1, &fw, s_err, sizeof(s_err)) && fw.size == 1000);
+    CHECK(!cap_wasm_fw_sig_verify(sig, &scoped, 1, &fw, s_err, sizeof(s_err)));
+    CHECK_ERR(s_err, "scoped to apps and cannot sign firmware");
+}
+
 int main(void)
 {
     FILE *f = fopen("ecapp_vectors.json", "rb");
@@ -540,6 +618,7 @@ int main(void)
     test_rollback();
     test_index();
     test_index_url();
+    test_key_scope();
     cJSON_Delete(s_vectors);
     if (s_failed) {
         printf("%d check(s) failed\n", s_failed);

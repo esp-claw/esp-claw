@@ -74,10 +74,28 @@ typedef struct {
     uint8_t format;
 } cap_wasm_pkg_t;
 
+#define CAP_WASM_KEY_MAX_PREFIXES 4
+
+/*
+ * A trusted key. app_trusted_keys lists either "<base64 key>" (trusted for every app and for
+ * firmware) or {"key":"<base64>","apps":["<prefix>",...]}: a scoped key, trusted only for apps
+ * whose name starts with one of the 1-4 prefixes ([a-z0-9_], starting with a letter), and never
+ * for firmware images or the update index entries of other apps.
+ */
 typedef struct {
     uint8_t pub[32];
     char key_id[CAP_WASM_KEY_ID_LEN + 1];
+    char prefixes[CAP_WASM_KEY_MAX_PREFIXES][CAP_WASM_APP_NAME_MAX + 1];
+    uint8_t prefix_count; /* 0: unscoped */
 } cap_wasm_key_t;
+
+struct cJSON;
+
+/* Parses one app_trusted_keys entry (a string or a scoped object); `err` says why not. */
+bool cap_wasm_key_parse_entry(const struct cJSON *item, cap_wasm_key_t *out, char *err, size_t err_size);
+
+/* True when `key` may sign app `name`: unscoped, or `name` starts with one of its prefixes. */
+bool cap_wasm_key_allows(const cap_wasm_key_t *key, const char *name);
 
 /* Splits a package into its entries (pointing into `buf`). */
 bool cap_wasm_pkg_parse(const uint8_t *buf, size_t len, cap_wasm_pkg_t *out, char *err, size_t err_size);

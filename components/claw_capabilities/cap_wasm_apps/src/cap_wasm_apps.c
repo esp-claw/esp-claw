@@ -2167,6 +2167,7 @@ void cap_wasm_apps_set_trust(const char *trusted_keys_json, bool allow_unsigned)
 {
     cJSON *keys = cJSON_Parse(trusted_keys_json ? trusted_keys_json : "");
     const cJSON *item = NULL;
+    char err[96];
 
     s_allow_unsigned = allow_unsigned;
     g_cap_wasm_trusted_count = 0;
@@ -2174,13 +2175,20 @@ void cap_wasm_apps_set_trust(const char *trusted_keys_json, bool allow_unsigned)
         ESP_LOGW(TAG, "app_trusted_keys is not a JSON array; no keys trusted");
     }
     cJSON_ArrayForEach(item, (cJSON_IsArray(keys) ? keys : NULL)) {
-        if (g_cap_wasm_trusted_count >= CAP_WASM_MAX_TRUSTED ||
-                !cap_wasm_key_parse(cJSON_GetStringValue(item), &g_cap_wasm_trusted[g_cap_wasm_trusted_count])) {
-            ESP_LOGW(TAG, "app_trusted_keys: skipping an entry (not a base64 32-byte key, or more than %d keys)",
-                     CAP_WASM_MAX_TRUSTED);
+        cap_wasm_key_t *key = &g_cap_wasm_trusted[g_cap_wasm_trusted_count];
+
+        if (g_cap_wasm_trusted_count >= CAP_WASM_MAX_TRUSTED) {
+            ESP_LOGW(TAG, "app_trusted_keys: skipping an entry (more than %d keys)", CAP_WASM_MAX_TRUSTED);
             continue;
         }
-        ESP_LOGI(TAG, "trusting app signing key %s", g_cap_wasm_trusted[g_cap_wasm_trusted_count++].key_id);
+        if (!cap_wasm_key_parse_entry(item, key, err, sizeof(err))) {
+            ESP_LOGW(TAG, "app_trusted_keys: skipping an entry: %s", err);
+            continue;
+        }
+        ESP_LOGI(TAG, "trusting app signing key %s%s%s%s%s", key->key_id, key->prefix_count ? " for apps " : "",
+                 key->prefix_count ? key->prefixes[0] : "", key->prefix_count ? "*" : "",
+                 key->prefix_count > 1 ? ", ..." : "");
+        g_cap_wasm_trusted_count++;
     }
     cJSON_Delete(keys);
 }

@@ -156,6 +156,58 @@ static const char *cap_wasm_json_str(const cJSON *obj, const char *key)
     return cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj, key));
 }
 
+bool cap_wasm_key_parse_entry(const cJSON *item, cap_wasm_key_t *out, char *err, size_t err_size)
+{
+    static const char *const keys[] = {"key", "apps"};
+    const cJSON *apps = cJSON_GetObjectItemCaseSensitive(item, "apps");
+    const cJSON *prefix = NULL;
+    const char *b64 = cJSON_IsString(item) ? cJSON_GetStringValue(item) : cap_wasm_json_str(item, "key");
+
+    memset(out, 0, sizeof(*out));
+    if (!cJSON_IsString(item) && !cJSON_IsObject(item)) {
+        snprintf(err, err_size, "an entry must be a base64 key or {\"key\":...,\"apps\":[...]}");
+        return false;
+    }
+    if (cJSON_IsObject(item) && !cap_wasm_keys_known(item, keys, 2, "trusted key field", err, err_size)) {
+        return false;
+    }
+    if (!cap_wasm_key_parse(b64, out)) {
+        snprintf(err, err_size, "not a base64 32-byte Ed25519 key");
+        return false;
+    }
+    if (!apps) {
+        return true;
+    }
+    if (!cJSON_IsArray(apps) || cJSON_GetArraySize(apps) < 1 || cJSON_GetArraySize(apps) > CAP_WASM_KEY_MAX_PREFIXES) {
+        snprintf(err, err_size, "apps must be an array of 1-%d app name prefixes", CAP_WASM_KEY_MAX_PREFIXES);
+        return false;
+    }
+    cJSON_ArrayForEach(prefix, apps) {
+        const char *s = cJSON_GetStringValue(prefix);
+
+        if (!s || !cap_wasm_name_valid(s, strlen(s), CAP_WASM_APP_NAME_MAX)) {
+            snprintf(err, err_size, "apps entries must be 1-%d chars of [a-z0-9_] starting with a letter",
+                     CAP_WASM_APP_NAME_MAX);
+            return false;
+        }
+        strcpy(out->prefixes[out->prefix_count++], s);
+    }
+    return true;
+}
+
+bool cap_wasm_key_allows(const cap_wasm_key_t *key, const char *name)
+{
+    if (key->prefix_count == 0) {
+        return true;
+    }
+    for (uint8_t i = 0; i < key->prefix_count; i++) {
+        if (strncmp(name, key->prefixes[i], strlen(key->prefixes[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * Format 1: the "signed" object must repeat the manifest's name and version and the hex hashes of
  * the entries; the signature is over its canonical JSON. Returns the signed bytes in `msg`.
@@ -270,6 +322,10 @@ bool cap_wasm_sig_verify(const char *sig_json, const cap_wasm_manifest_t *mf,
         snprintf(err, err_size, "signed by untrusted key %.8s", kid);
         goto done;
     }
+    if (!cap_wasm_key_allows(&keys[k], mf->name)) {
+        snprintf(err, err_size, "signed by key %s, which is not trusted for app %s", keys[k].key_id, mf->name);
+        goto done;
+    }
     if (!cap_wasm_b64_decode(sig_b64, sig, sizeof(sig)) || crypto_ed25519_check(sig, keys[k].pub, msg, msg_len) != 0) {
         snprintf(err, err_size, "invalid signature (key %s)", keys[k].key_id);
         goto done;
@@ -353,6 +409,10 @@ bool cap_wasm_fw_sig_verify(const char *sig_json, const cap_wasm_key_t *keys, si
     }
     if (k == key_count) {
         snprintf(err, err_size, "signed by untrusted key %.8s", kid);
+        goto done;
+    }
+    if (keys[k].prefix_count) {
+        snprintf(err, err_size, "signed by key %s, which is scoped to apps and cannot sign firmware", keys[k].key_id);
         goto done;
     }
     out->size = (uint32_t)size->valuedouble;
@@ -615,6 +675,10 @@ bool cap_wasm_index_check(const char *index, size_t index_len, const char *sig_j
     }
     if (!name) {
         ok = true;
+        goto done;
+    }
+    if (!cap_wasm_key_allows(&keys[k], name)) {
+        snprintf(err, err_size, "index signed by key %s, which is not trusted for app %s", keys[k].key_id, name);
         goto done;
     }
     cJSON_ArrayForEach(item, apps) {

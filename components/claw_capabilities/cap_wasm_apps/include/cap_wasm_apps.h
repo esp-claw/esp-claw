@@ -18,8 +18,10 @@ extern "C" {
  * @brief  Set the Ed25519 keys apps must be signed with and whether apps without a valid
  *         signature may load anyway. Call before cap_wasm_apps_register_group().
  *
- * @param trusted_keys_json  JSON array of base64 raw 32-byte public keys (app_trusted_keys);
- *                           invalid entries are skipped with a warning
+ * @param trusted_keys_json  JSON array (app_trusted_keys) of base64 raw 32-byte public keys, or
+ *                           {"key":"<base64>","apps":["<name prefix>",...]} for a key trusted only
+ *                           for apps with those name prefixes (not for firmware); invalid entries
+ *                           are skipped with a warning
  * @param allow_unsigned     app_allow_unsigned
  */
 void cap_wasm_apps_set_trust(const char *trusted_keys_json, bool allow_unsigned);

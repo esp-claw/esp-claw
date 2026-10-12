@@ -30,11 +30,16 @@ type TrustForm = {
   update_check_time: string;
 };
 
-/** app_trusted_keys is a JSON array; the form edits one key per line. */
+/**
+ * app_trusted_keys is a JSON array; the form edits one entry per line: a base64 key, or a scoped
+ * key {"key":"...","apps":["prefix",...]} kept as its JSON text.
+ */
 function keysToLines(raw: string | undefined): string {
   try {
     const parsed = JSON.parse(raw ?? '');
-    if (Array.isArray(parsed)) return parsed.filter((k) => typeof k === 'string').join('\n');
+    if (Array.isArray(parsed)) {
+      return parsed.map((k) => (typeof k === 'string' ? k : JSON.stringify(k))).join('\n');
+    }
   } catch {
     /* empty or not JSON: show as is */
   }
@@ -45,7 +50,15 @@ function linesToKeys(lines: string): string {
   const keys = lines
     .split('\n')
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((line) => {
+      if (!line.startsWith('{')) return line;
+      try {
+        return JSON.parse(line) as unknown;
+      } catch {
+        return line; /* the device rejects it with a message */
+      }
+    });
   return keys.length ? JSON.stringify(keys) : '';
 }
 

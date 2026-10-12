@@ -349,7 +349,7 @@ export const en = {
   wasmSectionTrust: 'Signing and Updates',
   wasmTrustedKeys: 'Trusted signing keys',
   wasmTrustedKeysHint:
-    'One base64-encoded Ed25519 public key (32 bytes) per line. Apps and firmware updates must be signed by one of them.',
+    'One base64-encoded Ed25519 public key (32 bytes) per line. Apps and firmware updates must be signed by one of them. {"key":"<base64>","apps":["prefix"]} trusts a key only for apps whose name starts with a prefix (never for firmware).',
   wasmAllowUnsigned: 'Allow unsigned apps',
   wasmAllowUnsignedHint:
     'Load apps without a valid signature by a trusted key. Only for development.',

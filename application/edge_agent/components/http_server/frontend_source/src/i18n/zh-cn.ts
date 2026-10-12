@@ -333,7 +333,7 @@ export const zhCn: Dict = {
   wasmSectionTrust: '签名与更新',
   wasmTrustedKeys: '受信任的签名公钥',
   wasmTrustedKeysHint:
-    '每行一个 base64 编码的 Ed25519 公钥（32 字节）。应用和固件更新必须由其中之一签名。',
+    '每行一个 base64 编码的 Ed25519 公钥（32 字节）。应用和固件更新必须由其中之一签名。{"key":"<base64>","apps":["前缀"]} 表示该密钥仅信任名称以某前缀开头的应用（不用于固件）。',
   wasmAllowUnsigned: '允许未签名应用',
   wasmAllowUnsignedHint: '加载没有受信任签名的应用。仅用于开发。',
   wasmUpdateCheckTime: '每日更新检查（HH:MM）',

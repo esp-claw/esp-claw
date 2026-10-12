@@ -209,7 +209,20 @@ static bool is_time_of_day_string(const char *value)
            atoi(value) < 24 && atoi(value + 3) < 60;
 }
 
-/* app_trusted_keys: "" or a JSON array of base64 raw 32-byte Ed25519 public keys. */
+/* A 1-24 char app name prefix of [a-z0-9_] starting with a letter (cap_wasm_name_valid). */
+static bool is_app_name_prefix(const cJSON *item)
+{
+    const char *s = cJSON_GetStringValue(item);
+    size_t len = s ? strlen(s) : 0;
+
+    return len >= 1 && len <= 24 && s[0] >= 'a' && s[0] <= 'z' &&
+           strspn(s, "abcdefghijklmnopqrstuvwxyz0123456789_") == len;
+}
+
+/*
+ * app_trusted_keys: "" or a JSON array of base64 raw 32-byte Ed25519 public keys, each either a
+ * string or {"key":"<base64>","apps":["<name prefix>",...]} (1-4 prefixes; cap_wasm_key_parse_entry).
+ */
 static bool is_trusted_keys_json(const char *value, size_t field_size)
 {
     cJSON *keys = cJSON_Parse(value);
@@ -217,13 +230,23 @@ static bool is_trusted_keys_json(const char *value, size_t field_size)
     bool valid = cJSON_IsArray(keys) && strlen(value) < field_size;
 
     cJSON_ArrayForEach(key, (valid ? keys : NULL)) {
-        const char *b64 = cJSON_GetStringValue(key);
+        const cJSON *apps = cJSON_GetObjectItemCaseSensitive(key, "apps");
+        const cJSON *prefix = NULL;
+        const char *b64 = cJSON_IsString(key) ? cJSON_GetStringValue(key) :
+                          cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(key, "key"));
         unsigned char raw[33];
         size_t len = 0;
 
         valid = valid && b64 &&
                 mbedtls_base64_decode(raw, sizeof(raw), &len, (const unsigned char *)b64, strlen(b64)) == 0 &&
                 len == 32;
+        if (cJSON_IsObject(key)) {
+            valid = valid && cJSON_GetArraySize(key) == (apps ? 2 : 1) &&
+                    (!apps || (cJSON_IsArray(apps) && cJSON_GetArraySize(apps) >= 1 && cJSON_GetArraySize(apps) <= 4));
+            cJSON_ArrayForEach(prefix, (valid && apps ? apps : NULL)) {
+                valid = valid && is_app_name_prefix(prefix);
+            }
+        }
     }
     cJSON_Delete(keys);
     return valid;
@@ -427,7 +450,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
             free(config);
             return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                                        "app_trusted_keys must be a JSON array of base64 32-byte Ed25519 "
-                                       "public keys, at most 319 bytes");
+                                       "public keys (or {\"key\":...,\"apps\":[prefixes]}), at most 319 bytes");
         }
         if ((strcmp(field->name, "ssh_hosts") == 0 || strcmp(field->name, "wol_targets") == 0 ||
                 strcmp(field->name, "api_profiles") == 0) &&
