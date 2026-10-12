@@ -566,6 +566,42 @@ static void test_record_invalid_middle_line_is_skipped(void)
     claw_memory_item_list_free(&list);
 }
 
+/* A failed repair (archive slots exhausted) must not leave a stale .tmp that find_valid could promote. */
+static void test_record_repair_failure_removes_tmp(void)
+{
+    char path[256];
+    char tmp_path[256];
+    char output[256];
+    bool healthy = false;
+    char *text;
+    char *actual;
+    unsigned int i;
+
+    remove_record_sidecars();
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s_memory.records_path);
+    text = dup_printf("%s{\"id\":\"bad\"}\n%s", LEGACY_RECORD_KEPT, LEGACY_RECORD_PROJECT);
+    write_text(s_memory.records_path, text);
+    for (i = 0; i < 100; i++) {
+        if (i == 0) {
+            snprintf(path, sizeof(path), "%s.corrupt", s_memory.records_path);
+        } else {
+            snprintf(path, sizeof(path), "%s.corrupt.%u", s_memory.records_path, i);
+        }
+        write_text(path, "x");
+    }
+    CHECK(claw_memory_records_check(true, &healthy, output, sizeof(output)) != ESP_OK);
+    CHECK(!healthy);
+    CHECK(access(tmp_path, F_OK) != 0);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strcmp(actual, text) == 0);
+    free(actual);
+    free(text);
+    for (i = 1; i < 100; i++) {
+        snprintf(path, sizeof(path), "%s.corrupt.%u", s_memory.records_path, i);
+        unlink(path);
+    }
+}
+
 /* A damaged index plus an unreadable record line: repair keeps valid lines, archives the rest, rebuilds. */
 static void check_repair_with_bad_line(const char *bad_line)
 {
@@ -831,6 +867,7 @@ int main(void)
     test_record_recovery_failure_preserves_all_copies();
     test_record_torn_tail_is_truncated();
     test_record_invalid_middle_line_is_skipped();
+    test_record_repair_failure_removes_tmp();
     test_repair_archives_invalid_record_line();
     test_repair_archives_oversized_record_line();
     test_records_check_without_repair_is_read_only();

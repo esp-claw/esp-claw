@@ -601,10 +601,9 @@ static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_s
         err = write_file_text(tmp_path, out ? out : "");
     }
     free(out);
-    if (err != ESP_OK) {
-        return err;
+    if (err == ESP_OK) {
+        err = records_archive_corrupt(archive_path, archive_path_size, &archived);
     }
-    err = records_archive_corrupt(archive_path, archive_path_size, &archived);
     if (err == ESP_OK && rename(tmp_path, s_memory.records_path) != 0) {
         int saved_errno = errno ? errno : EIO;
 
@@ -613,6 +612,13 @@ static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_s
         }
         errno = saved_errno;
         err = ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        /* A stale reduced .tmp could be promoted by records_find_valid() later. */
+        int saved_errno = errno;
+
+        unlink(tmp_path);
+        errno = saved_errno;
     }
     return err;
 }
