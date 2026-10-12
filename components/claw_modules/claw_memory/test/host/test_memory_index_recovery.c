@@ -370,7 +370,7 @@ static void test_repair_rebuilds_index_from_complete_records(void)
     cJSON_Delete(root);
 }
 
-/* A torn final record makes reconstruction unsafe and leaves the corrupt index untouched. */
+/* An unusable records file makes reconstruction unsafe and leaves the corrupt index untouched. */
 static void test_repair_rejects_incomplete_records(void)
 {
     const char *corrupt = "{\"version\":3";
@@ -379,7 +379,7 @@ static void test_repair_rejects_incomplete_records(void)
 
     remove_index_sidecars();
     write_text(s_memory.index_path, corrupt);
-    write_text(s_memory.records_path, "{\"id\":\"m1\"");
+    write_text(s_memory.records_path, "{\"id\":\"m1\"}\n");
 
     CHECK(claw_memory_storage_check(true, output, sizeof(output)) == ESP_ERR_INVALID_STATE);
     CHECK(strstr(output, "incomplete") != NULL || strstr(output, "malformed") != NULL ||
@@ -471,13 +471,15 @@ static void test_record_snapshot_recovers_interrupted_replace(void)
     free(actual);
 }
 
-/* Malformed primary records are archived when a complete backup is promoted. */
+/* An unusable primary is never replaced by .bak on load; only explicit repair promotes it. */
 static void test_record_recovery_archives_malformed_primary(void)
 {
     const char *corrupt = "{\"id\":\"x\"}\n";
     const char *backup = LEGACY_RECORD_KEPT;
     char bak_path[256];
     char corrupt_path[256];
+    char output[256];
+    bool healthy = false;
     char *actual;
 
     remove_record_sidecars();
@@ -485,7 +487,14 @@ static void test_record_recovery_archives_malformed_primary(void)
     snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", s_memory.records_path);
     write_text(s_memory.records_path, corrupt);
     write_text(bak_path, backup);
-    CHECK(claw_memory_records_prepare_for_read() == ESP_OK);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_ERR_INVALID_STATE);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strcmp(actual, corrupt) == 0);
+    free(actual);
+    CHECK(access(bak_path, F_OK) == 0);
+
+    CHECK(claw_memory_records_check(true, &healthy, output, sizeof(output)) == ESP_OK);
+    CHECK(healthy);
     actual = read_text(s_memory.records_path);
     CHECK(actual && strcmp(actual, backup) == 0);
     free(actual);
@@ -494,11 +503,13 @@ static void test_record_recovery_archives_malformed_primary(void)
     free(actual);
 }
 
-/* Failed promotion restores malformed primary records and retains the valid backup. */
+/* Failed promotion restores the unusable primary and retains the valid backup. */
 static void test_record_recovery_failure_preserves_all_copies(void)
 {
-    const char *corrupt = "{\"id\":\"latest\"";
+    const char *corrupt = "{\"id\":\"latest\"}\n";
     char bak_path[256];
+    char output[256];
+    bool healthy = false;
     char *actual;
 
     remove_record_sidecars();
@@ -506,11 +517,89 @@ static void test_record_recovery_failure_preserves_all_copies(void)
     write_text(s_memory.records_path, corrupt);
     write_text(bak_path, LEGACY_RECORD_KEPT);
     s_fail_records_backup_promote = true;
-    CHECK(claw_memory_records_prepare_for_read() != ESP_OK);
+    CHECK(claw_memory_records_check(true, &healthy, output, sizeof(output)) != ESP_OK);
+    CHECK(!healthy);
     actual = read_text(s_memory.records_path);
     CHECK(actual && strcmp(actual, corrupt) == 0);
     free(actual);
     CHECK(access(bak_path, F_OK) == 0);
+}
+
+/* A torn last line is truncated; earlier records stay and .bak is not used. */
+static void test_record_torn_tail_is_truncated(void)
+{
+    char bak_path[256];
+    char *actual;
+    char *expected;
+
+    remove_record_sidecars();
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", s_memory.records_path);
+    expected = dup_printf("%s%s", LEGACY_RECORD_KEPT, LEGACY_RECORD_PROJECT);
+    actual = dup_printf("%s%s", expected, "{\"id\":\"torn\",\"sou");
+    write_text(s_memory.records_path, actual);
+    free(actual);
+    write_text(bak_path, LEGACY_RECORD_KEPT);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_OK);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strcmp(actual, expected) == 0);
+    free(actual);
+    free(expected);
+    actual = read_text(bak_path);
+    CHECK(actual && strcmp(actual, LEGACY_RECORD_KEPT) == 0);
+    free(actual);
+}
+
+/* An invalid complete line is skipped by the loader without degrading memory. */
+static void test_record_invalid_middle_line_is_skipped(void)
+{
+    claw_memory_item_list_t list = {0};
+    char *text;
+
+    remove_record_sidecars();
+    text = dup_printf("%s{\"id\":\"bad\"}\nnot json\n%s", LEGACY_RECORD_KEPT, LEGACY_RECORD_PROJECT);
+    write_text(s_memory.records_path, text);
+    free(text);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_OK);
+    CHECK(claw_memory_load_current_items(&list) == ESP_OK);
+    CHECK(claw_memory_find_item_index(&list, "kept") >= 0);
+    CHECK(claw_memory_find_item_index(&list, "m1") >= 0);
+    claw_memory_item_list_free(&list);
+}
+
+/* Missing primary falls back to a valid .old, but .bak is never auto-promoted. */
+static void test_record_missing_primary_fallback(void)
+{
+    char old_path[256];
+    char bak_path[256];
+    char *actual;
+
+    remove_record_sidecars();
+    snprintf(old_path, sizeof(old_path), "%s.old", s_memory.records_path);
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", s_memory.records_path);
+    write_text(old_path, LEGACY_RECORD_PROJECT);
+    write_text(bak_path, LEGACY_RECORD_KEPT);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_OK);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strcmp(actual, LEGACY_RECORD_PROJECT) == 0);
+    free(actual);
+
+    remove_record_sidecars();
+    write_text(bak_path, LEGACY_RECORD_KEPT);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_ERR_INVALID_STATE);
+    CHECK(access(s_memory.records_path, F_OK) != 0);
+}
+
+/* Appending to an existing record file keeps it intact (failure rollback itself is not simulated). */
+static void test_append_keeps_existing_records(void)
+{
+    char *actual;
+
+    remove_record_sidecars();
+    write_text(s_memory.records_path, LEGACY_RECORD_KEPT);
+    CHECK(append_file_text(s_memory.records_path, LEGACY_RECORD_PROJECT) == ESP_OK);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strlen(actual) == strlen(LEGACY_RECORD_KEPT) + strlen(LEGACY_RECORD_PROJECT));
+    free(actual);
 }
 
 /* An embedded NUL cannot hide a torn JSONL tail behind a valid first record. */
@@ -633,6 +722,10 @@ int main(void)
     test_record_snapshot_recovers_interrupted_replace();
     test_record_recovery_archives_malformed_primary();
     test_record_recovery_failure_preserves_all_copies();
+    test_record_torn_tail_is_truncated();
+    test_record_invalid_middle_line_is_skipped();
+    test_record_missing_primary_fallback();
+    test_append_keeps_existing_records();
     test_record_validation_rejects_embedded_nul_tail();
     test_record_validation_accepts_legacy_schema();
     test_storage_check_reports_and_repairs_degraded_records();

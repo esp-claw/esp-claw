@@ -157,6 +157,61 @@ static esp_err_t records_validate_path(const char *path)
     return ESP_OK;
 }
 
+/*
+ * The primary is append-only, so a torn last line or a damaged middle line must not discard the
+ * other records. Returns ESP_ERR_INVALID_STATE only when the file is unusable (embedded NUL, or
+ * only invalid lines). A torn unterminated tail is cut off when fix_tail is set.
+ */
+static esp_err_t records_scan_primary(bool fix_tail, size_t *out_invalid)
+{
+    size_t valid = 0;
+    size_t invalid = 0;
+    char *raw = NULL;
+    char *cursor;
+    char *newline;
+    esp_err_t err = read_file_dup(s_memory.records_path, &raw);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (strlen(raw) != file_size_bytes(s_memory.records_path)) {
+        free(raw);
+        return ESP_ERR_INVALID_STATE;
+    }
+    cursor = raw;
+    while ((newline = strchr(cursor, '\n')) != NULL) {
+        *newline = '\0';
+        if (newline > cursor && newline[-1] == '\r') {
+            newline[-1] = '\0';
+        }
+        if (cursor[0]) {
+            cJSON *json = cJSON_ParseWithOpts(cursor, NULL, true);
+
+            if (claw_memory_record_validate_json(json, NULL, 0) == ESP_OK) {
+                valid++;
+            } else {
+                invalid++;
+            }
+            cJSON_Delete(json);
+        }
+        cursor = newline + 1;
+    }
+    if (invalid && !valid) {
+        free(raw);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (*cursor && fix_tail) {
+        ESP_LOGW(TAG, "Dropping torn last record (%u bytes)", (unsigned)strlen(cursor));
+        if (truncate(s_memory.records_path, (off_t)(cursor - raw)) != 0) {
+            free(raw);
+            return ESP_FAIL;
+        }
+    }
+    free(raw);
+    *out_invalid = invalid;
+    return ESP_OK;
+}
+
 static esp_err_t records_archive_corrupt(char *archive_path,
                                          size_t archive_path_size,
                                          bool *out_archived)
@@ -225,11 +280,13 @@ static void records_finish_backup_rotation(void)
     (void)rename(old_path, bak_path);
 }
 
+/* Looks for a complete replacement copy of a missing primary. .bak is only used when allow_bak. */
 static esp_err_t records_find_valid(char *chosen,
                                     size_t chosen_size,
-                                    bool *out_any_present)
+                                    bool *out_any_present,
+                                    bool allow_bak)
 {
-    static const char *const suffixes[] = {"", ".tmp", ".old", ".bak"};
+    static const char *const suffixes[] = {".tmp", ".old", ".bak"};
     size_t i;
 
     chosen[0] = '\0';
@@ -240,6 +297,14 @@ static esp_err_t records_find_valid(char *chosen,
 
         if (records_sidecar_path(path, sizeof(path), suffixes[i]) != ESP_OK) {
             return ESP_ERR_INVALID_SIZE;
+        }
+        if (!allow_bak && i == 2) {
+            struct stat st = {0};
+
+            if (stat(path, &st) == 0) {
+                *out_any_present = true;
+            }
+            continue;
         }
         err = records_validate_path(path);
         if (err == ESP_OK) {
@@ -260,22 +325,32 @@ esp_err_t claw_memory_records_prepare_for_read(void)
 {
     char chosen[CLAW_MEMORY_MAX_PATH + 8];
     bool any_present = false;
-    esp_err_t err = records_find_valid(chosen, sizeof(chosen), &any_present);
+    size_t invalid = 0;
+    esp_err_t err = records_scan_primary(true, &invalid);
 
+    if (err == ESP_OK) {
+        if (invalid) {
+            ESP_LOGW(TAG, "Skipping %u unreadable record line(s)", (unsigned)invalid);
+        }
+        records_finish_backup_rotation();
+        return ESP_OK;
+    }
+    /* An existing primary stays authoritative; only /storage repair may replace it. */
+    if (err != ESP_ERR_NOT_FOUND) {
+        return err;
+    }
+    err = records_find_valid(chosen, sizeof(chosen), &any_present, false);
     if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
         return err;
     }
     if (!chosen[0]) {
         return any_present ? ESP_ERR_INVALID_STATE : ESP_OK;
     }
-    if (strcmp(chosen, s_memory.records_path) != 0) {
-        esp_err_t err = records_promote(chosen);
-
-        if (err != ESP_OK) {
-            return err;
-        }
-        ESP_LOGW(TAG, "Recovered interrupted records replacement from %s", chosen);
+    err = records_promote(chosen);
+    if (err != ESP_OK) {
+        return err;
     }
+    ESP_LOGW(TAG, "Recovered interrupted records replacement from %s", chosen);
     records_finish_backup_rotation();
     return ESP_OK;
 }
@@ -287,6 +362,8 @@ esp_err_t claw_memory_records_check(bool repair,
 {
     char chosen[CLAW_MEMORY_MAX_PATH + 8];
     bool any_present = false;
+    bool primary_damaged;
+    size_t invalid = 0;
     esp_err_t err;
 
     if (!out_healthy || !output || output_size == 0) {
@@ -294,16 +371,30 @@ esp_err_t claw_memory_records_check(bool repair,
     }
     *out_healthy = false;
     output[0] = '\0';
-    err = records_find_valid(chosen, sizeof(chosen), &any_present);
-    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    err = records_scan_primary(repair, &invalid);
+    if (err == ESP_OK) {
+        *out_healthy = true;
+        if (invalid) {
+            snprintf(output, output_size, "Memory records: OK (%u unreadable line(s) skipped).",
+                     (unsigned)invalid);
+        } else {
+            snprintf(output, output_size, "Memory records: OK.");
+        }
+        return ESP_OK;
+    }
+    if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_INVALID_STATE) {
         snprintf(output, output_size, "Memory records inspection failed: %s.",
                  strerror(errno ? errno : EIO));
         return err;
     }
-    if (err == ESP_OK && strcmp(chosen, s_memory.records_path) == 0) {
-        *out_healthy = true;
-        snprintf(output, output_size, "Memory records: OK.");
-        return ESP_OK;
+    /* Explicit check/repair is the only path that may fall back to .bak. */
+    primary_damaged = err == ESP_ERR_INVALID_STATE;
+    err = records_find_valid(chosen, sizeof(chosen), &any_present, true);
+    any_present = any_present || primary_damaged;
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        snprintf(output, output_size, "Memory records inspection failed: %s.",
+                 strerror(errno ? errno : EIO));
+        return err;
     }
     if (err == ESP_OK && !repair) {
         snprintf(output, output_size,

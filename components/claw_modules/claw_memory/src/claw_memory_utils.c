@@ -850,6 +850,7 @@ esp_err_t claw_memory_recover_atomic_file(const char *path)
 esp_err_t append_file_text(const char *path, const char *text)
 {
     FILE *file = NULL;
+    size_t original_size;
 
     if (!path || !text) {
         return ESP_ERR_INVALID_ARG;
@@ -858,15 +859,20 @@ esp_err_t append_file_text(const char *path, const char *text)
         return ESP_FAIL;
     }
 
+    original_size = file_size_bytes(path);
     file = fopen(path, "ab");
     if (!file) {
         return ESP_FAIL;
     }
     if (fputs(text, file) < 0) {
         fclose(file);
+        (void)truncate(path, (off_t)original_size);
         return ESP_FAIL;
     }
-    fclose(file);
+    if (fclose(file) != 0) {
+        (void)truncate(path, (off_t)original_size);
+        return ESP_FAIL;
+    }
     return ESP_OK;
 }
 

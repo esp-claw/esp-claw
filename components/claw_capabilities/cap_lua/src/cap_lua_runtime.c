@@ -384,23 +384,41 @@ esp_err_t cap_lua_runtime_init(void)
     return ESP_OK;
 }
 
-/* Lua io.open bypasses lua_module_storage, so apply the DATA reserve here. The
- * reserve is checked once at open time for write/append/update modes, not per write. */
+/* Lua io.open and io.output(filename) bypass lua_module_storage, so apply the DATA reserve
+ * here. The reserve is checked once at open time for write/append/update modes, not per write. */
+static bool cap_lua_data_write_blocked(const char *path, const char *mode)
+{
+    const char *data_root = claw_paths_get(CLAW_PATH_DATA);
+    size_t root_len = data_root ? strlen(data_root) : 0;
+
+    return root_len > 0 && strpbrk(mode, "wa+") &&
+           strncmp(path, data_root, root_len) == 0 &&
+           (path[root_len] == '/' || path[root_len] == '\0' || data_root[root_len - 1] == '/') &&
+           claw_storage_check_write(data_root, 0) != ESP_OK;
+}
+
 static int cap_lua_io_open_guarded(lua_State *L)
 {
     const char *path = luaL_checkstring(L, 1);
     const char *mode = luaL_optstring(L, 2, "r");
-    const char *data_root = claw_paths_get(CLAW_PATH_DATA);
-    size_t root_len = data_root ? strlen(data_root) : 0;
 
-    if (root_len > 0 && strpbrk(mode, "wa+") &&
-        strncmp(path, data_root, root_len) == 0 &&
-        (path[root_len] == '/' || path[root_len] == '\0' || data_root[root_len - 1] == '/') &&
-        claw_storage_check_write(data_root, 0) != ESP_OK) {
+    if (cap_lua_data_write_blocked(path, mode)) {
         lua_pushnil(L);
         lua_pushfstring(L, "%s: insufficient storage space; cleanup reserve is protected", path);
         lua_pushinteger(L, ENOSPC);
         return 3;
+    }
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    lua_call(L, lua_gettop(L) - 1, LUA_MULTRET);
+    return lua_gettop(L);
+}
+
+static int cap_lua_io_output_guarded(lua_State *L)
+{
+    if (lua_type(L, 1) == LUA_TSTRING && cap_lua_data_write_blocked(lua_tostring(L, 1), "w")) {
+        return luaL_error(L, "%s: insufficient storage space; cleanup reserve is protected",
+                          lua_tostring(L, 1));
     }
     lua_pushvalue(L, lua_upvalueindex(1));
     lua_insert(L, 1);
@@ -461,6 +479,9 @@ esp_err_t cap_lua_runtime_execute_file(const char *path,
     lua_getfield(L, -1, "open");
     lua_pushcclosure(L, cap_lua_io_open_guarded, 1);
     lua_setfield(L, -2, "open");
+    lua_getfield(L, -1, "output");
+    lua_pushcclosure(L, cap_lua_io_output_guarded, 1);
+    lua_setfield(L, -2, "output");
     lua_pop(L, 1);
     cap_lua_load_registered_modules(L);
     cap_lua_add_script_dir_to_package_path(L, path);

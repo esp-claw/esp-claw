@@ -25,7 +25,7 @@ This module describes how to correctly use storage when writing Lua scripts.
 - `storage.mkdir(path)`, `storage.write_file(path, content)`, `storage.remove(path)`, and `storage.rename(old_path, new_path)` return `true` on success.
 - `storage.read_file(path)` returns the file contents as a string.
 - `storage.get_free_space()` returns `{ total, free, used }`.
-- Writes under the DATA root keep a 128 KiB cleanup reserve free. `storage.write_file`/`storage.mkdir` raise an error when it would be consumed; Lua `io.open` with a `w`, `a` or `+` mode returns `nil, message, errno` instead. For `io.open` the reserve is checked when the file is opened for writing, not on every write.
+- Writes under the DATA root keep a 128 KiB cleanup reserve free. `storage.write_file`/`storage.mkdir` raise an error when it would be consumed; Lua `io.open` with a `w`, `a` or `+` mode returns `nil, message, errno` instead, and `io.output("<path>")` raises an error. For `io.open` and `io.output` the reserve is checked when the file is opened for writing, not on every write.
 
 ## Path joining
 - Prefer `storage.join_path(...)` whenever building a path from `storage.get_root_dir()` and child names.
