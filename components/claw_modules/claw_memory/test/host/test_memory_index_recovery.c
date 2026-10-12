@@ -602,7 +602,7 @@ static void test_append_keeps_existing_records(void)
     free(actual);
 }
 
-/* An embedded NUL cannot hide a torn JSONL tail behind a valid first record. */
+/* NULs followed by data cannot hide a damaged JSONL tail behind a valid first record. */
 static void test_record_validation_rejects_embedded_nul_tail(void)
 {
     static const char bytes[] =
@@ -614,6 +614,31 @@ static void test_record_validation_rejects_embedded_nul_tail(void)
     write_bytes(s_memory.records_path, bytes, sizeof(bytes) - 1);
     CHECK(claw_memory_records_prepare_for_read() == ESP_ERR_INVALID_STATE);
     CHECK(file_size_bytes(s_memory.records_path) == sizeof(bytes) - 1);
+}
+
+/* A zero-filled tail after the last complete line is a torn tail and is truncated. */
+static void test_record_trailing_nul_tail_is_truncated(void)
+{
+    static const char partial[] = "{\"id\":\"two\",\"sou\0\0\0\0";
+    static const char only_nuls[] = "\0\0\0\0";
+    char bytes[512];
+    size_t kept = strlen(LEGACY_RECORD_KEPT);
+    char *actual;
+
+    remove_record_sidecars();
+    memcpy(bytes, LEGACY_RECORD_KEPT, kept);
+    memcpy(bytes + kept, only_nuls, sizeof(only_nuls) - 1);
+    write_bytes(s_memory.records_path, bytes, kept + sizeof(only_nuls) - 1);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_OK);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strcmp(actual, LEGACY_RECORD_KEPT) == 0);
+    CHECK(file_size_bytes(s_memory.records_path) == kept);
+    free(actual);
+
+    memcpy(bytes + kept, partial, sizeof(partial) - 1);
+    write_bytes(s_memory.records_path, bytes, kept + sizeof(partial) - 1);
+    CHECK(claw_memory_records_prepare_for_read() == ESP_OK);
+    CHECK(file_size_bytes(s_memory.records_path) == kept);
 }
 
 /* The original V2 record schema remains valid without later optional fields. */
@@ -727,6 +752,7 @@ int main(void)
     test_record_missing_primary_fallback();
     test_append_keeps_existing_records();
     test_record_validation_rejects_embedded_nul_tail();
+    test_record_trailing_nul_tail_is_truncated();
     test_record_validation_accepts_legacy_schema();
     test_storage_check_reports_and_repairs_degraded_records();
     test_atomic_file_stale_old_does_not_block_write();

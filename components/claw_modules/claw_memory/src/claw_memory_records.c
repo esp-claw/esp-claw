@@ -159,8 +159,8 @@ static esp_err_t records_validate_path(const char *path)
 
 /*
  * The primary is append-only, so a torn last line or a damaged middle line must not discard the
- * other records. Returns ESP_ERR_INVALID_STATE only when the file is unusable (embedded NUL, or
- * only invalid lines). A torn unterminated tail is cut off when fix_tail is set.
+ * other records. Returns ESP_ERR_INVALID_STATE only when the file is unusable (NULs followed by
+ * data, or only invalid lines). A torn tail (unterminated or zero-filled) is cut off when fix_tail.
  */
 static esp_err_t records_scan_primary(bool fix_tail, size_t *out_invalid)
 {
@@ -169,14 +169,22 @@ static esp_err_t records_scan_primary(bool fix_tail, size_t *out_invalid)
     char *raw = NULL;
     char *cursor;
     char *newline;
+    size_t size;
+    size_t text_len;
+    size_t i;
     esp_err_t err = read_file_dup(s_memory.records_path, &raw);
 
     if (err != ESP_OK) {
         return err;
     }
-    if (strlen(raw) != file_size_bytes(s_memory.records_path)) {
-        free(raw);
-        return ESP_ERR_INVALID_STATE;
+    size = file_size_bytes(s_memory.records_path);
+    text_len = strlen(raw);
+    /* A zero-filled tail (torn FAT sector) is a torn tail; NULs followed by data are not. */
+    for (i = text_len; i < size; i++) {
+        if (raw[i]) {
+            free(raw);
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     cursor = raw;
     while ((newline = strchr(cursor, '\n')) != NULL) {
@@ -200,8 +208,8 @@ static esp_err_t records_scan_primary(bool fix_tail, size_t *out_invalid)
         free(raw);
         return ESP_ERR_INVALID_STATE;
     }
-    if (*cursor && fix_tail) {
-        ESP_LOGW(TAG, "Dropping torn last record (%u bytes)", (unsigned)strlen(cursor));
+    if ((*cursor || text_len < size) && fix_tail) {
+        ESP_LOGW(TAG, "Dropping torn last record (%u bytes)", (unsigned)(size - (size_t)(cursor - raw)));
         if (truncate(s_memory.records_path, (off_t)(cursor - raw)) != 0) {
             free(raw);
             return ESP_FAIL;
