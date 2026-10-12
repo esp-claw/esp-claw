@@ -253,31 +253,36 @@ esp_err_t cap_wasm_check_updates(char *output, size_t output_size)
 
 esp_err_t cap_wasm_update(const char *name, const claw_cap_call_context_t *ctx, char *output, size_t output_size)
 {
-    upd_item_t u;
+    upd_item_t *u = heap_caps_calloc(1, sizeof(*u), CAP_WASM_PSRAM_CAPS); /* ~1 KB: not on the task stack */
+    esp_err_t ret;
 
     if (!cap_im_tg_confirm_chat(ctx)) {
         snprintf(output, output_size, "Error: updating needs a confirmation in a Telegram chat");
+        heap_caps_free(u);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (upd_read_index(name, &u, 1) == 0) {
+    if (!u) {
+        snprintf(output, output_size, "Error: out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    if (upd_read_index(name, u, 1) == 0) {
         snprintf(output, output_size, "Error: app '%s' is not installed", name);
-        return ESP_ERR_NOT_FOUND;
-    }
-    upd_lookup_app(&u);
-    if (u.err[0]) {
-        snprintf(output, output_size, "Error: %s: %s", name, u.err);
-        return ESP_FAIL;
-    }
-    if (!u.has_source) {
+        ret = ESP_ERR_NOT_FOUND;
+    } else if (upd_lookup_app(u), u->err[0]) {
+        snprintf(output, output_size, "Error: %s: %s", name, u->err);
+        ret = ESP_FAIL;
+    } else if (!u->has_source) {
         snprintf(output, output_size, "Error: %s has no source URL; /app update %s <https-url> installs from one", name,
                  name);
-        return ESP_ERR_NOT_FOUND;
+        ret = ESP_ERR_NOT_FOUND;
+    } else if (!u->newer) {
+        snprintf(output, output_size, "%s %s is up to date (index: %s)", name, u->installed, u->available);
+        ret = ESP_OK;
+    } else {
+        ret = cap_wasm_install(u->url, name, &u->entry, false, false, ctx, output, output_size);
     }
-    if (!u.newer) {
-        snprintf(output, output_size, "%s %s is up to date (index: %s)", name, u.installed, u.available);
-        return ESP_OK;
-    }
-    return cap_wasm_install(u.url, name, &u.entry, false, false, ctx, output, output_size);
+    heap_caps_free(u);
+    return ret;
 }
 
 esp_err_t cap_wasm_update_all(const claw_cap_call_context_t *ctx, char *output, size_t output_size)
