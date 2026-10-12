@@ -1655,7 +1655,11 @@ static void *cap_wasm_task(void *arg)
 /* Hands a request to the WASM thread and watches its budget until it is done. */
 static esp_err_t cap_wasm_submit(cap_wasm_req_t *req, TickType_t lock_wait)
 {
-    if (!s_call_lock || xSemaphoreTake(s_call_lock, lock_wait) != pdTRUE) {
+    if (!s_call_lock) {
+        snprintf(req->output, req->output_size, "Error: WASM apps are not running");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_call_lock, lock_wait) != pdTRUE) {
         snprintf(req->output, req->output_size, "Error: WASM apps are busy, try again");
         return ESP_ERR_TIMEOUT;
     }
@@ -2213,4 +2217,19 @@ esp_err_t cap_wasm_apps_register_group(const char *base_path)
         ESP_LOGE(TAG, "cannot start the app timer task; app timers do not run");
     }
     return ESP_OK;
+}
+
+esp_err_t cap_wasm_apps_status_json(char *out, size_t size)
+{
+    return cap_wasm_status(true, out, size);
+}
+
+esp_err_t cap_wasm_apps_set_enabled(const char *name, bool enabled, char *out, size_t size)
+{
+    /* Checked here: cap_wasm_admin() re-registers the app tool group before submitting. */
+    if (!s_call_lock) {
+        snprintf(out, size, "Error: WASM apps are not running");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return cap_wasm_admin(enabled ? CAP_WASM_REQ_ENABLE : CAP_WASM_REQ_DISABLE, name, NULL, out, size);
 }

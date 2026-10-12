@@ -80,6 +80,9 @@ esp_err_t http_server_register_routes(httpd_handle_t server)
 #if CONFIG_APP_CLAW_LUA_MODULE_HTTP_SERVER
     ESP_RETURN_ON_ERROR(http_server_register_lua_app_routes(server), TAG, "Failed to register Lua app routes");
 #endif
+#if CONFIG_APP_CLAW_CAP_WASM_APPS
+    ESP_RETURN_ON_ERROR(http_server_register_wasm_apps_routes(server), TAG, "Failed to register WASM app routes");
+#endif
     ESP_RETURN_ON_ERROR(http_server_register_wechat_routes(server), TAG, "Failed to register WeChat routes");
     ESP_RETURN_ON_ERROR(http_server_register_webdav_routes(server), TAG, "Failed to register WebDAV routes");
     if (tls) {

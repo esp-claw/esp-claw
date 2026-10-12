@@ -4,8 +4,10 @@ import {
   Bot,
   DatabaseZap,
   Folder,
+  HardDrive,
   MessageSquareCode,
   MessagesSquare,
+  Package,
   Search,
   Settings,
   SquareFunction,
@@ -29,6 +31,8 @@ const IconCaps: Component = () => <Blocks class={iconClass} />;
 const IconSkills: Component = () => <SquareFunction class={iconClass} />;
 const IconFiles: Component = () => <Folder class={iconClass} />;
 const IconWebIm: Component = () => <MessagesSquare class={iconClass} />;
+const IconWebDav: Component = () => <HardDrive class={iconClass} />;
+const IconWasm: Component = () => <Package class={iconClass} />;
 
 export type LeafNode = {
   kind: 'leaf';
@@ -39,6 +43,8 @@ export type LeafNode = {
     | 'navLlm'
     | 'navIm'
     | 'navWebReq'
+    | 'navWebDav'
+    | 'navWasmApps'
     | 'navMemory'
     | 'navCapabilities'
     | 'navLuaModules'
@@ -67,6 +73,8 @@ export const NAV_TREE: NavNode[] = [
       { kind: 'leaf', id: 'llm', labelKey: 'navLlm', icon: IconLlm },
       { kind: 'leaf', id: 'im', labelKey: 'navIm', icon: IconIm },
       { kind: 'leaf', id: 'webreq', labelKey: 'navWebReq', icon: IconSearch },
+      { kind: 'leaf', id: 'webdav', labelKey: 'navWebDav', icon: IconWebDav },
+      { kind: 'leaf', id: 'wasm', labelKey: 'navWasmApps', icon: IconWasm },
     ],
   },
   { kind: 'leaf', id: 'memory', labelKey: 'navMemory', icon: IconMemory },

@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "cap_wasm_apps.h"
 #include "cap_wasm_internal.h"
 #include "esp_log.h"
 #include "nvs.h"
@@ -23,6 +24,7 @@
 static const char *TAG = "cap_wasm_apps";
 
 #define CAP_WASM_CFG_KEYS_MAX 24 /* NVS entries looked at when pruning */
+#define CAP_WASM_CFG_RESET_ARG "--reset"
 
 int32_t cap_wasm_cfg_get(const cap_wasm_app_t *app, const cap_wasm_setting_t *s, char *out, size_t size,
                          bool *is_default)
@@ -150,7 +152,7 @@ esp_err_t cap_wasm_cfg_command(const cap_wasm_app_t *app, const char *args, bool
                  (int)(key_len < sizeof(key) ? key_len : sizeof(key) - 1), args, app->name);
         return ESP_ERR_NOT_FOUND;
     }
-    reset = strcmp(rest, "--reset") == 0;
+    reset = strcmp(rest, CAP_WASM_CFG_RESET_ARG) == 0;
     if (!reset && !cap_wasm_setting_normalize(s, rest, value, sizeof(value))) {
         snprintf(out, size, "Invalid value for `%s` (%s): %s", s->key, cap_wasm_setting_type_name(s->type),
                  s->type == CAP_WASM_SETTING_INT ? "an integer is expected" :
@@ -292,4 +294,38 @@ void cap_wasm_cfg_erase(const char *app_name)
         nvs_commit(h);
         nvs_close(h);
     }
+}
+
+esp_err_t cap_wasm_apps_settings_json(const char *name, char *out, size_t size)
+{
+    return cap_wasm_admin(CAP_WASM_REQ_CONFIG_JSON, name, NULL, out, size);
+}
+
+esp_err_t cap_wasm_apps_set_setting(const char *name, const char *key, const char *value, char *out, size_t size)
+{
+    const char *arg = value ? value : CAP_WASM_CFG_RESET_ARG;
+    size_t key_len = key ? strlen(key) : 0;
+    size_t args_size;
+    char *args;
+    esp_err_t err;
+
+    /* The request reuses the "/app config" arguments "<key> <value>|--reset". */
+    if (!key_len || key_len > CAP_WASM_SETTING_KEY_MAX || strcspn(key, " ") != key_len) {
+        snprintf(out, size, "Invalid setting key.");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (value && strcmp(value, CAP_WASM_CFG_RESET_ARG) == 0) {
+        snprintf(out, size, "Invalid value for `%s`: %s is reserved.", key, CAP_WASM_CFG_RESET_ARG);
+        return ESP_ERR_INVALID_ARG;
+    }
+    args_size = key_len + 1 + strlen(arg) + 1;
+    args = malloc(args_size);
+    if (!args) {
+        snprintf(out, size, "Error: out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(args, args_size, "%s %s", key, arg);
+    err = cap_wasm_admin(CAP_WASM_REQ_CONFIG, name, args, out, size);
+    free(args);
+    return err;
 }
