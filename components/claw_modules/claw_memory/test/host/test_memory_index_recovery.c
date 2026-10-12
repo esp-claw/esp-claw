@@ -566,6 +566,88 @@ static void test_record_invalid_middle_line_is_skipped(void)
     claw_memory_item_list_free(&list);
 }
 
+/* A damaged index plus an unreadable record line: repair keeps valid lines, archives the rest, rebuilds. */
+static void check_repair_with_bad_line(const char *bad_line)
+{
+    char corrupt_path[256];
+    char output[384];
+    claw_memory_item_list_t list = {0};
+    char *text;
+    char *archived;
+
+    remove_index_sidecars();
+    remove_record_sidecars();
+    write_text(s_memory.index_path, "{\"version\":3");
+    text = dup_printf("%s%s\n%s", LEGACY_RECORD_KEPT, bad_line, LEGACY_RECORD_PROJECT);
+    write_text(s_memory.records_path, text);
+
+    s_memory.initialized = 0;
+    s_memory.storage_degraded = true;
+    s_memory.storage_repair_required = true;
+    CHECK(claw_memory_storage_check(true, output, sizeof(output)) == ESP_OK);
+    CHECK(strstr(output, "repaired") != NULL);
+    CHECK(strstr(output, "1 unreadable line(s) archived") != NULL);
+    s_memory.storage_degraded = false;
+    s_memory.storage_repair_required = false;
+    s_memory.initialized = 1;
+
+    snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", s_memory.records_path);
+    archived = read_text(corrupt_path);
+    CHECK(archived && strcmp(archived, text) == 0);
+    free(archived);
+    free(text);
+    text = read_text(s_memory.records_path);
+    CHECK(text && strstr(text, bad_line) == NULL);
+    free(text);
+    CHECK(claw_memory_load_current_items(&list) == ESP_OK);
+    CHECK(list.count == 2);
+    CHECK(claw_memory_find_item_index(&list, "kept") >= 0);
+    CHECK(claw_memory_find_item_index(&list, "m1") >= 0);
+    claw_memory_item_list_free(&list);
+    CHECK(access(s_memory.index_path, F_OK) == 0);
+}
+
+static void test_repair_archives_invalid_record_line(void)
+{
+    check_repair_with_bad_line("not json");
+}
+
+static void test_repair_archives_oversized_record_line(void)
+{
+    char *line = malloc(CLAW_MEMORY_RECORD_LINE_SIZE + 16);
+
+    CHECK(line != NULL);
+    if (!line) {
+        return;
+    }
+    memset(line, 'x', CLAW_MEMORY_RECORD_LINE_SIZE + 8);
+    line[CLAW_MEMORY_RECORD_LINE_SIZE + 8] = '\0';
+    check_repair_with_bad_line(line);
+    free(line);
+}
+
+/* repair=false only reports; no file may change. */
+static void test_records_check_without_repair_is_read_only(void)
+{
+    char corrupt_path[256];
+    char output[384];
+    bool healthy = false;
+    char *text = dup_printf("%snot json\n%s", LEGACY_RECORD_KEPT, LEGACY_RECORD_PROJECT);
+    char *actual;
+
+    remove_record_sidecars();
+    write_text(s_memory.records_path, text);
+    CHECK(claw_memory_records_check(false, &healthy, output, sizeof(output)) == ESP_OK);
+    CHECK(healthy);
+    CHECK(strstr(output, "1 unreadable line(s) skipped") != NULL);
+    actual = read_text(s_memory.records_path);
+    CHECK(actual && strcmp(actual, text) == 0);
+    free(actual);
+    free(text);
+    snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", s_memory.records_path);
+    CHECK(access(corrupt_path, F_OK) != 0);
+}
+
 /* Missing primary falls back to a valid .old, but .bak is never auto-promoted. */
 static void test_record_missing_primary_fallback(void)
 {
@@ -749,6 +831,9 @@ int main(void)
     test_record_recovery_failure_preserves_all_copies();
     test_record_torn_tail_is_truncated();
     test_record_invalid_middle_line_is_skipped();
+    test_repair_archives_invalid_record_line();
+    test_repair_archives_oversized_record_line();
+    test_records_check_without_repair_is_read_only();
     test_record_missing_primary_fallback();
     test_append_keeps_existing_records();
     test_record_validation_rejects_embedded_nul_tail();

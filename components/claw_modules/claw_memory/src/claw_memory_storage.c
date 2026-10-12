@@ -333,7 +333,7 @@ static esp_err_t claw_memory_load_records_strict(claw_memory_item_list_t *out_it
                                                  char *reason,
                                                  size_t reason_size)
 {
-    const size_t line_size = 4096;
+    const size_t line_size = CLAW_MEMORY_RECORD_LINE_SIZE;
     claw_memory_item_list_t items = {0};
     claw_memory_item_t *item = NULL;
     char *line = NULL;
@@ -1005,7 +1005,7 @@ esp_err_t claw_memory_load_current_items(claw_memory_item_list_t *out_list)
     char *line = NULL;
     claw_memory_item_t *item = NULL;
     claw_memory_item_list_t list = {0};
-    const size_t line_size = 4096;
+    const size_t line_size = CLAW_MEMORY_RECORD_LINE_SIZE;
 
     if (!out_list) {
         return ESP_ERR_INVALID_ARG;

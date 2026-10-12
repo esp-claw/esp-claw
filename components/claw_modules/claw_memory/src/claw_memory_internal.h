@@ -26,6 +26,8 @@
 #define CLAW_MEMORY_COMPACT_SIZE_THRESHOLD       (32 * 1024)
 #define CLAW_MEMORY_SESSION_SIZE_LIMIT           (150 * 1024)
 #define CLAW_MEMORY_RECALL_DEFAULT_LIMIT         8
+/* fgets buffer size of the record loaders; a line needs room for its terminating newline. */
+#define CLAW_MEMORY_RECORD_LINE_SIZE             4096
 #define CLAW_MEMORY_RECORDS_FILE                 "memory_records.jsonl"
 #define CLAW_MEMORY_INDEX_FILE                   "memory_index.json"
 #define CLAW_MEMORY_DIGEST_FILE                  "memory_digest.log"

@@ -157,6 +157,21 @@ static esp_err_t records_validate_path(const char *path)
     return ESP_OK;
 }
 
+/* Mirrors what the strict loader accepts: a bounded line holding a valid record. */
+static bool records_line_valid(const char *line, size_t raw_len)
+{
+    cJSON *json;
+    bool ok;
+
+    if (raw_len >= CLAW_MEMORY_RECORD_LINE_SIZE - 1) {
+        return false;
+    }
+    json = cJSON_ParseWithOpts(line, NULL, true);
+    ok = claw_memory_record_validate_json(json, NULL, 0) == ESP_OK;
+    cJSON_Delete(json);
+    return ok;
+}
+
 /*
  * The primary is append-only, so a torn last line or a damaged middle line must not discard the
  * other records. Returns ESP_ERR_INVALID_STATE only when the file is unusable (NULs followed by
@@ -188,19 +203,18 @@ static esp_err_t records_scan_primary(bool fix_tail, size_t *out_invalid)
     }
     cursor = raw;
     while ((newline = strchr(cursor, '\n')) != NULL) {
+        size_t raw_len = (size_t)(newline - cursor);
+
         *newline = '\0';
         if (newline > cursor && newline[-1] == '\r') {
             newline[-1] = '\0';
         }
         if (cursor[0]) {
-            cJSON *json = cJSON_ParseWithOpts(cursor, NULL, true);
-
-            if (claw_memory_record_validate_json(json, NULL, 0) == ESP_OK) {
+            if (records_line_valid(cursor, raw_len)) {
                 valid++;
             } else {
                 invalid++;
             }
-            cJSON_Delete(json);
         }
         cursor = newline + 1;
     }
@@ -363,6 +377,8 @@ esp_err_t claw_memory_records_prepare_for_read(void)
     return ESP_OK;
 }
 
+static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_size);
+
 esp_err_t claw_memory_records_check(bool repair,
                                     bool *out_healthy,
                                     char *output,
@@ -382,7 +398,20 @@ esp_err_t claw_memory_records_check(bool repair,
     err = records_scan_primary(repair, &invalid);
     if (err == ESP_OK) {
         *out_healthy = true;
-        if (invalid) {
+        if (invalid && repair) {
+            char archive_path[CLAW_MEMORY_MAX_PATH + 20];
+
+            err = records_rewrite_valid(archive_path, sizeof(archive_path));
+            if (err != ESP_OK) {
+                *out_healthy = false;
+                snprintf(output, output_size, "Memory records repair failed: %s.",
+                         strerror(errno ? errno : EIO));
+                return err;
+            }
+            snprintf(output, output_size,
+                     "Memory records: repaired, %u unreadable line(s) archived to %s.",
+                     (unsigned)invalid, archive_path);
+        } else if (invalid) {
             snprintf(output, output_size, "Memory records: OK (%u unreadable line(s) skipped).",
                      (unsigned)invalid);
         } else {
@@ -533,6 +562,59 @@ static bool records_json_matches_item(cJSON *json, const claw_memory_item_t *ite
         }
     }
     return cJSON_IsArray(cJSON_GetObjectItem(json, "summary_labels"));
+}
+
+/* Replaces the primary with only its valid lines; the old primary is kept as archive_path. */
+static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_size)
+{
+    char tmp_path[CLAW_MEMORY_MAX_PATH + 8];
+    char *raw = NULL;
+    char *out = NULL;
+    char *cursor;
+    char *newline;
+    size_t out_len = 0;
+    size_t out_cap = 0;
+    bool archived = false;
+    esp_err_t err = records_sidecar_path(tmp_path, sizeof(tmp_path), ".tmp");
+
+    if (err == ESP_OK) {
+        err = read_file_dup(s_memory.records_path, &raw);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    cursor = raw;
+    while (err == ESP_OK && (newline = strchr(cursor, '\n')) != NULL) {
+        size_t raw_len = (size_t)(newline - cursor);
+
+        *newline = '\0';
+        if (newline > cursor && newline[-1] == '\r') {
+            newline[-1] = '\0';
+        }
+        if (cursor[0] && records_line_valid(cursor, raw_len)) {
+            err = records_buffer_append(&out, &out_len, &out_cap, cursor);
+        }
+        cursor = newline + 1;
+    }
+    free(raw);
+    if (err == ESP_OK) {
+        err = write_file_text(tmp_path, out ? out : "");
+    }
+    free(out);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = records_archive_corrupt(archive_path, archive_path_size, &archived);
+    if (err == ESP_OK && rename(tmp_path, s_memory.records_path) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (archived) {
+            (void)rename(archive_path, s_memory.records_path);
+        }
+        errno = saved_errno;
+        err = ESP_FAIL;
+    }
+    return err;
 }
 
 esp_err_t claw_memory_records_write_snapshot(const claw_memory_item_list_t *items)
