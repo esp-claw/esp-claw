@@ -464,6 +464,27 @@ bool cap_wasm_version_cmp(const char *a, const char *b, int *out)
     return true;
 }
 
+bool cap_wasm_rollback_check(const char *name, const char *version, const char *floor, bool allow_downgrade,
+                             char *err, size_t err_size)
+{
+    int cmp = 0;
+
+    if (!floor[0] || allow_downgrade) {
+        return true;
+    }
+    if (!cap_wasm_version_cmp(version, floor, &cmp)) {
+        snprintf(err, err_size, "cannot compare %s %s with the version floor %s; /app install %s <url> installs it anyway",
+                 name, version, floor, CAP_WASM_DOWNGRADE_FLAG);
+        return false;
+    }
+    if (cmp < 0) {
+        snprintf(err, err_size, "%s %s is below the version floor %s (anti-rollback); /app install %s <url> installs "
+                 "it anyway", name, version, floor, CAP_WASM_DOWNGRADE_FLAG);
+        return false;
+    }
+    return true;
+}
+
 int cap_wasm_lru_pick(const int64_t *last_used, const bool *loaded, size_t count, int skip)
 {
     int pick = -1;

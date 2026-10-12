@@ -149,5 +149,15 @@ bool cap_wasm_fw_sig_verify(const char *sig_json, const cap_wasm_key_t *keys, si
  */
 bool cap_wasm_version_cmp(const char *a, const char *b, int *out);
 
+#define CAP_WASM_DOWNGRADE_FLAG "--allow-downgrade"
+
+/*
+ * Anti-rollback: `floor` is the highest version ever installed of the app ("" when none). An
+ * install of a lower (or not comparable) version is refused with `err` naming the floor and
+ * CAP_WASM_DOWNGRADE_FLAG, unless `allow_downgrade`.
+ */
+bool cap_wasm_rollback_check(const char *name, const char *version, const char *floor, bool allow_downgrade,
+                             char *err, size_t err_size);
+
 /* Index of the least recently used loaded entry other than `skip`, or -1. */
 int cap_wasm_lru_pick(const int64_t *last_used, const bool *loaded, size_t count, int skip);

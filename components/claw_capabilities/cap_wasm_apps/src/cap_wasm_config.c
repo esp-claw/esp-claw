@@ -283,14 +283,62 @@ void cap_wasm_timer_store_last(const char *app_name, uint32_t last_unix)
     }
 }
 
+void cap_wasm_floor_load(const char *app_name, char out[CAP_WASM_VERSION_MAX + 1])
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    size_t len = CAP_WASM_VERSION_MAX + 1;
+    nvs_handle_t h;
+
+    out[0] = '\0';
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_str(h, "_floor", out, &len) != ESP_OK) {
+            out[0] = '\0';
+        }
+        nvs_close(h);
+    }
+}
+
+void cap_wasm_floor_update(const char *app_name, const char *version, bool downgrade)
+{
+    char ns[CAP_WASM_NVS_NS_LEN];
+    char floor[CAP_WASM_VERSION_MAX + 1];
+    nvs_handle_t h;
+    int cmp = 0;
+
+    cap_wasm_floor_load(app_name, floor);
+    /* Raise only; an unreadable floor is replaced. */
+    if (!downgrade && floor[0] && cap_wasm_version_cmp(version, floor, &cmp) && cmp <= 0) {
+        return;
+    }
+    cap_wasm_cfg_namespace(app_name, ns);
+    if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] cannot store the version floor %s", app_name, version);
+        return;
+    }
+    if (nvs_set_str(h, "_floor", version) != ESP_OK || nvs_commit(h) != ESP_OK) {
+        ESP_LOGW(TAG, "[%s] cannot store the version floor %s", app_name, version);
+    } else {
+        ESP_LOGI(TAG, "[%s] version floor %s -> %s%s", app_name, floor[0] ? floor : "-", version,
+                 downgrade ? " (downgrade allowed by the user)" : "");
+    }
+    nvs_close(h);
+}
+
 void cap_wasm_cfg_erase(const char *app_name)
 {
     char ns[CAP_WASM_NVS_NS_LEN];
+    char floor[CAP_WASM_VERSION_MAX + 1];
     nvs_handle_t h;
 
+    cap_wasm_floor_load(app_name, floor);
     cap_wasm_cfg_namespace(app_name, ns);
     if (nvs_open(ns, NVS_READWRITE, &h) == ESP_OK) {
         nvs_erase_all(h);
+        /* The version floor outlives the app: a later reinstall must not roll back. */
+        if (floor[0]) {
+            nvs_set_str(h, "_floor", floor);
+        }
         nvs_commit(h);
         nvs_close(h);
     }

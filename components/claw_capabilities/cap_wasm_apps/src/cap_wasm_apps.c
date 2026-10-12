@@ -1960,7 +1960,8 @@ static esp_err_t cap_wasm_command_execute(const char *input_json, const claw_cap
     }
     snprintf(output, output_size,
              "Usage:\n/apps  List WASM apps\n"
-             "/app install [--force] <https-url>  Install a signed .ecapp (--force allows a downgrade)\n"
+             "/app install [" CAP_WASM_DOWNGRADE_FLAG "] <https-url>  Install a signed .ecapp (the flag allows a "
+             "version below the installed one or the anti-rollback floor)\n"
              "/app updates  List available app and firmware updates\n"
              "/app update <name>|all [url]  Update to the latest GitHub release (or from url)\n"
              "/app remove <name>  Delete an app and its data\n"

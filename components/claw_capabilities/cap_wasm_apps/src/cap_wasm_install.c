@@ -309,8 +309,9 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     const char *chat = cap_im_tg_confirm_chat(ctx);
     const size_t html_size = 1536;
     char key_id[CAP_WASM_KEY_ID_LEN + 1];
+    char floor[CAP_WASM_VERSION_MAX + 1];
     char perms[320];
-    char err[128];
+    char err[160];
     char *manifest = NULL;
     char *sig = NULL;
     char *html = NULL;
@@ -322,7 +323,9 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     esp_err_t ret = ESP_FAIL;
     bool installed;
     bool added;
+    bool downgrade;
     int cmp = 0;
+    int floor_cmp = 0;
 
     if (!chat) {
         snprintf(output, output_size, "Error: installing needs a confirmation in a Telegram chat");
@@ -371,26 +374,39 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
     }
     installed = cap_wasm_installed_manifest(mf->name, old);
     if (installed && cap_wasm_version_cmp(mf->version, old->version, &cmp) && cmp < 0 && !force) {
-        snprintf(output, output_size, "Error: %s %s is older than the installed %s; /app install --force <url> "
-                 "downgrades", mf->name, mf->version, old->version);
+        snprintf(output, output_size, "Error: %s %s is older than the installed %s; /app install %s <url> "
+                 "downgrades", mf->name, mf->version, old->version, CAP_WASM_DOWNGRADE_FLAG);
         goto done;
     }
+    /* The floor is the highest version ever installed, also after /app remove. */
+    cap_wasm_floor_load(mf->name, floor);
+    if (!cap_wasm_rollback_check(mf->name, mf->version, floor, force, err, sizeof(err))) {
+        snprintf(output, output_size, "Error: %s", err);
+        goto done;
+    }
+    downgrade = cmp < 0 || (floor[0] && (!cap_wasm_version_cmp(mf->version, floor, &floor_cmp) || floor_cmp < 0));
 
     added = cap_wasm_perms_describe(mf, installed ? old : NULL, perms, sizeof(perms));
     if (installed) {
         len = (size_t)snprintf(html, html_size, "<b>WASM-App aktualisieren?</b>\n<b>%s</b> %s → %s%s\n", mf->name,
-                               old->version, mf->version, cmp < 0 ? " ⚠️ Downgrade" : "");
+                               old->version, mf->version, downgrade ? " ⚠️ Downgrade" : "");
     } else {
-        len = (size_t)snprintf(html, html_size, "<b>WASM-App installieren?</b>\n<b>%s</b> %s (neu)\n", mf->name,
-                               mf->version);
+        len = (size_t)snprintf(html, html_size, "<b>WASM-App installieren?</b>\n<b>%s</b> %s (neu)%s\n", mf->name,
+                               mf->version, downgrade ? " ⚠️ Downgrade" : "");
     }
     len += cap_wasm_html_escape(html + len, html_size - len, mf->description);
-    snprintf(html + len, html_size - len, "\nRechte: %s\nLimits: %u KB Speicher, %u ms pro Aufruf\n"
-             "Signiert: Schlüssel <code>%s</code>, app.wasm %u Bytes", perms, (unsigned)mf->memory_kb,
-             (unsigned)mf->call_timeout_ms, key_id, (unsigned)pkg.wasm.len);
+    len += (size_t)snprintf(html + len, html_size - len, "\nRechte: %s\nLimits: %u KB Speicher, %u ms pro Aufruf\n"
+                            "Signiert: Schlüssel <code>%s</code>, app.wasm %u Bytes", perms, (unsigned)mf->memory_kb,
+                            (unsigned)mf->call_timeout_ms, key_id, (unsigned)pkg.wasm.len);
+    if (downgrade && len < html_size) {
+        snprintf(html + len, html_size - len, "\n⚠️ Unter der Versionsuntergrenze %s: Downgrade vom Nutzer erlaubt",
+                 floor[0] ? floor : old->version);
+    }
     cap_im_tg_confirm_note(ctx, html, html_size);
-    /* An update confirmed in a list (/app update all) is asked again only for new permissions. */
-    ret = confirmed && installed && !added && cmp >= 0 ? ESP_OK : cap_wasm_ask(chat, html, html_size, "✅ Installieren");
+    /* An update confirmed in a list (/app update all) is asked again only for new permissions. A
+     * downgrade is always asked, with a button that says so. */
+    ret = confirmed && installed && !added && !downgrade ? ESP_OK :
+          cap_wasm_ask(chat, html, html_size, downgrade ? "⚠️ Downgrade installieren" : "✅ Installieren");
     if (ret != ESP_OK) {
         snprintf(output, output_size, "Not installed: %s", ret == ESP_ERR_TIMEOUT ? "the confirmation timed out" :
                  ret == ESP_ERR_INVALID_STATE ? "cancelled by the user" : esp_err_to_name(ret));
@@ -401,8 +417,12 @@ esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force,
         ret = ESP_FAIL;
         goto done;
     }
-    ESP_LOGI(TAG, "installing %s %s (key %s, was %s)", mf->name, mf->version, key_id, installed ? old->version : "-");
+    ESP_LOGI(TAG, "installing %s %s (key %s, was %s, floor %s)", mf->name, mf->version, key_id,
+             installed ? old->version : "-", floor[0] ? floor : "-");
     ret = cap_wasm_admin(CAP_WASM_REQ_INSTALL, mf->name, url, output, output_size);
+    if (ret == ESP_OK) {
+        cap_wasm_floor_update(mf->name, mf->version, downgrade);
+    }
 
 done:
     heap_caps_free(buf);
@@ -466,7 +486,7 @@ static void cap_wasm_job_task(void *arg)
     bool force;
 
     sscanf(job->command, "%15s %319s %319s", verb, a, b);
-    force = strcmp(a, "--force") == 0;
+    force = strcmp(a, CAP_WASM_DOWNGRADE_FLAG) == 0 || strcmp(a, "--force") == 0; /* --force: the old spelling */
     if (!output) {
         ESP_LOGE(TAG, "/app %s: out of memory", verb);
     } else if (strcmp(verb, "fw") == 0) {
@@ -484,8 +504,8 @@ static void cap_wasm_job_task(void *arg)
     } else if (strcmp(verb, "remove") == 0 && a[0]) {
         cap_wasm_remove(a, &ctx, output, CAP_WASM_OUTPUT_MAX);
     } else {
-        snprintf(output, CAP_WASM_OUTPUT_MAX, "Usage: /app install [--force] <https-url> | updates | update <name>|all [url] | "
-                 "remove <name>");
+        snprintf(output, CAP_WASM_OUTPUT_MAX, "Usage: /app install [%s] <https-url> | updates | update <name>|all [url] | "
+                 "remove <name>", CAP_WASM_DOWNGRADE_FLAG);
     }
     if (output && cap_im_tg_send_text(job->chat_id, output) != ESP_OK) {
         ESP_LOGW(TAG, "failed to send the /app %s result", verb);

@@ -149,6 +149,14 @@ uint32_t cap_wasm_timer_load(const char *app_name, uint32_t *last_unix);
 void cap_wasm_timer_store(const char *app_name, uint32_t interval_s);
 void cap_wasm_timer_store_last(const char *app_name, uint32_t last_unix);
 
+/*
+ * Version floor (anti-rollback) in the same namespace: the highest version ever installed, "" when
+ * none. It survives /app remove. update raises it to `version`; with `downgrade` it is set to
+ * `version` even when that is lower (an explicit --allow-downgrade install).
+ */
+void cap_wasm_floor_load(const char *app_name, char out[CAP_WASM_VERSION_MAX + 1]);
+void cap_wasm_floor_update(const char *app_name, const char *version, bool downgrade);
+
 /* ---------- Timers (cap_wasm_apps.c, WASM thread) ---------- */
 
 #define CAP_WASM_MAX_TIMERS 4 /* apps with an active timer */
@@ -221,10 +229,12 @@ esp_err_t cap_wasm_admin(cap_wasm_req_type_t type, const char *name, const char 
 
 /*
  * Downloads an .ecapp from an https URL, verifies it, asks for confirmation in the Telegram chat
- * of `ctx` and installs it. `expect_name` (update) must match the package; an older version than
- * the installed one needs `force`. `confirmed` (the update was confirmed in a list) skips the
- * question unless the new version adds permissions. Must not run on the WASM thread or the
- * Telegram poll task.
+ * of `ctx` and installs it. `expect_name` (update) must match the package; a version older than
+ * the installed one or below the app's version floor needs `force` (--allow-downgrade) and is
+ * confirmed with a "Downgrade" button. A successful install raises the floor to the new version
+ * (or lowers it to it after an allowed downgrade). `confirmed` (the update was confirmed in a
+ * list) skips the question unless the new version adds permissions. Must not run on the WASM
+ * thread or the Telegram poll task.
  */
 esp_err_t cap_wasm_install(const char *url, const char *expect_name, bool force, bool confirmed,
                            const claw_cap_call_context_t *ctx, char *output, size_t output_size);

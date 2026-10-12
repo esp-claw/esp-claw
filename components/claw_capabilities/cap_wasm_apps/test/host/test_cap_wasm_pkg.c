@@ -341,6 +341,25 @@ static void test_versions(void)
     CHECK(!cap_wasm_version_cmp("1.0", "1.0.0", &cmp));
 }
 
+static void test_rollback(void)
+{
+    /* No floor yet, same, higher and pre-release-of-higher versions pass. */
+    CHECK(cap_wasm_rollback_check("hello", "1.0.0", "", false, s_err, sizeof(s_err)));
+    CHECK(cap_wasm_rollback_check("hello", "1.2.0", "1.2.0", false, s_err, sizeof(s_err)));
+    CHECK(cap_wasm_rollback_check("hello", "1.10.0", "1.2.0", false, s_err, sizeof(s_err)));
+    CHECK(cap_wasm_rollback_check("hello", "2.0.0-rc.1", "1.2.0", false, s_err, sizeof(s_err)));
+    /* Below the floor: refused with the floor and the flag in the message, allowed with the flag. */
+    CHECK(!cap_wasm_rollback_check("hello", "1.1.9", "1.2.0", false, s_err, sizeof(s_err)));
+    CHECK_ERR(s_err, "hello 1.1.9 is below the version floor 1.2.0");
+    CHECK_ERR(s_err, CAP_WASM_DOWNGRADE_FLAG);
+    CHECK(!cap_wasm_rollback_check("hello", "1.2.0-rc.1", "1.2.0", false, s_err, sizeof(s_err)));
+    CHECK(cap_wasm_rollback_check("hello", "1.1.9", "1.2.0", true, s_err, sizeof(s_err)));
+    /* A floor that cannot be compared is not silently ignored. */
+    CHECK(!cap_wasm_rollback_check("hello", "1.0.0", "garbage", false, s_err, sizeof(s_err)));
+    CHECK_ERR(s_err, "cannot compare");
+    CHECK(cap_wasm_rollback_check("hello", "1.0.0", "garbage", true, s_err, sizeof(s_err)));
+}
+
 int main(void)
 {
     FILE *f = fopen("ecapp_vectors.json", "rb");
@@ -384,6 +403,7 @@ int main(void)
     test_packages();
     test_api();
     test_versions();
+    test_rollback();
     cJSON_Delete(s_vectors);
     if (s_failed) {
         printf("%d check(s) failed\n", s_failed);
