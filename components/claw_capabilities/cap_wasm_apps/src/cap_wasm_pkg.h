@@ -229,7 +229,7 @@ bool cap_wasm_index_url(const char *source_url, char *out, size_t size);
  * claw.time_utc (api 2) writes this record into the app's buffer: u64 little-endian unix
  * milliseconds, then u8 quality. Quality 0 (none): the wall clock was never set; 1 (synced): set
  * by SNTP or restored from the RTC; 2 (authenticated): signed time, which this firmware never
- * produces (rust-claw does, with Roughtime).
+ * produces (reserved for hosts with signed time, e.g. Roughtime).
  */
 #define CAP_WASM_TIME_UTC_LEN       9
 #define CAP_WASM_TIME_NONE          0
