@@ -31,7 +31,7 @@ Only the latest release is supported. Fixes go into `master` and the next releas
 
 ## Firmware signing key
 
-Release images are signed with Ed25519. Devices install an OTA image only if its detached signature (`edge_agent.bin.sig.json`) verifies against a key in `app_trusted_keys`.
+Release images are signed with Ed25519. Devices install an OTA image only if its detached signature (`edge_agent.bin.sig.json`) verifies against an unscoped key in `app_trusted_keys` (a key entry scoped to app name prefixes never verifies firmware).
 
 | | |
 |---|---|

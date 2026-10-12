@@ -48,12 +48,16 @@ next to it. A new image must have WiFi and Telegram working within 5 minutes and
 otherwise the device rolls back to the previous one. Moving an existing board to this layout
 keeps NVS and `/fatfs`: `tools/migrate_ota_layout.sh -p <port>`.
 
-`/updates` (or `/app updates`, the `apps_check_updates` tool) compares the firmware and every app
-installed from a GitHub release URL with the latest release of its repository; `/app update <name>`
-and `/app update all` (the `apps_update` tool) install them after a confirmation. Every day at
-`update_check_time` (local time, default `09:00`, empty turns it off) the device runs that check
-and tells the allowed Telegram users about new versions, at most once a week per version. It never
-installs anything by itself.
+`/updates` (or `/app updates`, the `apps_check_updates` tool) compares the firmware with the latest
+release of `esp-claw/esp-claw` and every installed app with the signed update index of its source
+(`index.json` + `index.sig` from `releases/latest/download/` of a GitHub release, else from the
+package's directory; signed by a trusted key, not expired, not older than the last accepted one,
+and only with a synced clock); `/app update <name>` and `/app update all` (the `apps_update` tool)
+install them after a confirmation, checking the package against the index entry's size and
+SHA-256. Every day at `update_check_time` (local time, default `09:00`, empty turns it off) the
+device runs that check and tells the allowed Telegram users about new versions, at most once a
+week per version. It never installs anything by itself. `/app install --allow-downgrade <url>` is
+the only way past an app's anti-rollback version floor (see `FORK.md`).
 
 ## Web UI access
 
