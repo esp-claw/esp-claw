@@ -19,6 +19,8 @@ static bool s_fail_tmp_close;
 static bool s_fail_tmp_promote;
 static bool s_fail_backup_promote;
 static bool s_fail_records_backup_promote;
+static bool s_fail_records_tmp_promote;
+static bool s_fail_records_rollback;
 
 static void remove_index_sidecars(void);
 
@@ -98,6 +100,18 @@ int __wrap_rename(const char *old_path, const char *new_path)
     if (s_fail_records_backup_promote && has_suffix(old_path, ".bak") &&
         strcmp(new_path, s_memory.records_path) == 0) {
         s_fail_records_backup_promote = false;
+        errno = EIO;
+        return -1;
+    }
+    if (s_fail_records_tmp_promote && has_suffix(old_path, ".tmp") &&
+        strcmp(new_path, s_memory.records_path) == 0) {
+        s_fail_records_tmp_promote = false;
+        errno = EIO;
+        return -1;
+    }
+    if (s_fail_records_rollback && strstr(old_path, ".corrupt") &&
+        strcmp(new_path, s_memory.records_path) == 0) {
+        s_fail_records_rollback = false;
         errno = EIO;
         return -1;
     }
@@ -566,6 +580,31 @@ static void test_record_invalid_middle_line_is_skipped(void)
     claw_memory_item_list_free(&list);
 }
 
+/* If archiving moved the primary away and neither promotion nor rollback worked, .tmp is the only current copy. */
+static void test_record_repair_double_rename_failure_keeps_tmp(void)
+{
+    char tmp_path[256];
+    char output[256];
+    bool healthy = false;
+    char *text;
+    char *actual;
+
+    remove_record_sidecars();
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", s_memory.records_path);
+    text = dup_printf("%s{\"id\":\"bad\"}\n%s", LEGACY_RECORD_KEPT, LEGACY_RECORD_PROJECT);
+    write_text(s_memory.records_path, text);
+    s_fail_records_tmp_promote = true;
+    s_fail_records_rollback = true;
+    CHECK(claw_memory_records_check(true, &healthy, output, sizeof(output)) != ESP_OK);
+    CHECK(access(s_memory.records_path, F_OK) != 0);
+    actual = read_text(tmp_path);
+    CHECK(actual && strstr(actual, LEGACY_RECORD_KEPT) && strstr(actual, LEGACY_RECORD_PROJECT) &&
+          !strstr(actual, "\"bad\""));
+    free(actual);
+    free(text);
+    remove_record_sidecars();
+}
+
 /* A failed repair (archive slots exhausted) must not leave a stale .tmp that find_valid could promote. */
 static void test_record_repair_failure_removes_tmp(void)
 {
@@ -868,6 +907,7 @@ int main(void)
     test_record_torn_tail_is_truncated();
     test_record_invalid_middle_line_is_skipped();
     test_record_repair_failure_removes_tmp();
+    test_record_repair_double_rename_failure_keeps_tmp();
     test_repair_archives_invalid_record_line();
     test_repair_archives_oversized_record_line();
     test_records_check_without_repair_is_read_only();

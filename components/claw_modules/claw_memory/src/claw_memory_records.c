@@ -575,6 +575,7 @@ static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_s
     size_t out_len = 0;
     size_t out_cap = 0;
     bool archived = false;
+    bool rolled_back = false;
     esp_err_t err = records_sidecar_path(tmp_path, sizeof(tmp_path), ".tmp");
 
     if (err == ESP_OK) {
@@ -608,13 +609,15 @@ static esp_err_t records_rewrite_valid(char *archive_path, size_t archive_path_s
         int saved_errno = errno ? errno : EIO;
 
         if (archived) {
-            (void)rename(archive_path, s_memory.records_path);
+            rolled_back = rename(archive_path, s_memory.records_path) == 0;
         }
         errno = saved_errno;
         err = ESP_FAIL;
     }
-    if (err != ESP_OK) {
-        /* A stale reduced .tmp could be promoted by records_find_valid() later. */
+    if (err != ESP_OK && (!archived || rolled_back)) {
+        /* A stale reduced .tmp could be promoted by records_find_valid() later.
+         * Keep it when the primary was archived and not restored: then it is
+         * the only complete current copy. */
         int saved_errno = errno;
 
         unlink(tmp_path);
